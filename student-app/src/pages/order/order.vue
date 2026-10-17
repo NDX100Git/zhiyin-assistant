@@ -71,17 +71,36 @@
         <text class="card-title">3. 打印方案</text>
         <text class="tag">共 {{ pageCount }} 页</text>
       </view>
-      <view class="plan-grid">
-        <view class="plan-item"><text class="k">单双面</text><text class="v">{{ plan.recommend.print_side === 2 ? '双面' : '单面' }}</text></view>
-        <view class="plan-item"><text class="k">颜色</text><text class="v">{{ plan.recommend.color_mode === 1 ? '彩色' : '黑白' }}</text></view>
-        <view class="plan-item"><text class="k">版式</text><text class="v">{{ layoutLabel(plan.recommend.layout) }}</text></view>
-        <view class="plan-item"><text class="k">份数</text><text class="v">
-          <text class="stepper" @click.stop="changeCopies(-1)">－</text>
-          {{ copies }}
-          <text class="stepper" @click.stop="changeCopies(1)">＋</text>
-        </text></view>
+      <text class="ai-recommend">当前方案：{{ plan.recommend.print_side === 2 ? '双面' : '单面' }} · {{ plan.recommend.color_mode === 1 ? '彩色' : '黑白' }} · {{ layoutLabel(plan.recommend.layout) }}</text>
+      <view class="opt-row">
+        <text class="opt-label">单双面</text>
+        <view class="seg">
+          <view class="seg-item" :class="{ on: printSide === 1 }" @click.stop="choose('print_side', 1)">单面</view>
+          <view class="seg-item" :class="{ on: printSide === 2 }" @click.stop="choose('print_side', 2)">双面</view>
+        </view>
       </view>
-      <text class="plan-reason">{{ plan.reason }}</text>
+      <view class="opt-row">
+        <text class="opt-label">颜色</text>
+        <view class="seg">
+          <view class="seg-item" :class="{ on: colorMode === 0 }" @click.stop="choose('color_mode', 0)">黑白</view>
+          <view class="seg-item" :class="{ on: colorMode === 1 }" @click.stop="choose('color_mode', 1)">彩色</view>
+        </view>
+      </view>
+      <view class="opt-row">
+        <text class="opt-label">版式</text>
+        <view class="seg">
+          <view v-for="item in layouts" :key="item.value" class="seg-item" :class="{ on: layout === item.value }" @click.stop="choose('layout', item.value)">{{ item.label }}</view>
+        </view>
+      </view>
+      <view class="opt-row">
+        <text class="opt-label">份数</text>
+        <view class="stepper-wrap">
+          <text class="stepper" @click.stop="changeCopies(-1)">－</text>
+          <text class="copy-num">{{ copies }}</text>
+          <text class="stepper" @click.stop="changeCopies(1)">＋</text>
+        </view>
+      </view>
+      <text class="plan-reason">AI 建议理由：{{ plan.reason }}</text>
       <view class="savings">
         <text>纸张 {{ plan.original_sheets }} → {{ plan.sheets_needed }} 张</text>
         <text class="green">省 {{ plan.saved_sheets }} 张</text>
@@ -127,6 +146,14 @@ const report = ref(null)
 const selectedIssues = ref([])
 const plan = ref(null)
 const copies = ref(1)
+const printSide = ref(null)
+const colorMode = ref(null)
+const layout = ref('')
+const layouts = [
+  { value: 'single', label: '单页' },
+  { value: 'handout_2in1', label: '2合1' },
+  { value: 'handout_4in1', label: '4合1' },
+]
 const created = ref(null)
 const ocrText = ref('')
 
@@ -169,6 +196,9 @@ function resetFlow() {
   created.value = null
   ocrText.value = ''
   copies.value = 1
+  printSide.value = null
+  colorMode.value = null
+  layout.value = ''
 }
 
 async function useUploaded(data) {
@@ -251,14 +281,29 @@ async function runCheck() {
 
 async function loadPlan() {
   try {
+    const options = { copies: copies.value }
+    if (printSide.value) options.print_side = printSide.value
+    if (colorMode.value === 0 || colorMode.value === 1) options.color_mode = colorMode.value
+    if (layout.value) options.layout = layout.value
+
     plan.value = await request('/api/ai/print-plan', {
       method: 'POST',
-      data: { file_key: fileKey.value, options: { copies: copies.value } },
+      data: { file_key: fileKey.value, options },
     })
+    printSide.value = plan.value.recommend.print_side
+    colorMode.value = plan.value.recommend.color_mode
+    layout.value = plan.value.recommend.layout
     stepIndex.value = 2
   } catch (error) {
     notifyError(error)
   }
+}
+
+async function choose(field, value) {
+  if (field === 'print_side') printSide.value = value
+  if (field === 'color_mode') colorMode.value = value
+  if (field === 'layout') layout.value = value
+  await loadPlan()
 }
 
 function toggleIssue(id) {
@@ -560,22 +605,52 @@ function goMine() {
 .issue-reason {
   color: #8b98a8;
 }
-.plan-grid {
-  display: flex;
-  flex-wrap: wrap;
-  margin-top: 16rpx;
-}
-.plan-item {
-  width: 50%;
-  margin-bottom: 16rpx;
-}
-.plan-item .k {
+.ai-recommend {
   display: block;
-  font-size: 22rpx;
+  margin-top: 14rpx;
+  font-size: 24rpx;
+  color: #6b7a90;
+}
+.opt-row {
+  display: flex;
+  align-items: center;
+  margin-top: 18rpx;
+}
+.opt-label {
+  width: 120rpx;
+  font-size: 24rpx;
   color: #9aa7b5;
 }
-.plan-item .v {
-  font-size: 28rpx;
+.seg {
+  display: flex;
+  flex: 1;
+  padding: 6rpx;
+  border-radius: 14rpx;
+  background: #f2f4f8;
+}
+.seg-item {
+  flex: 1;
+  padding: 10rpx 0;
+  border-radius: 10rpx;
+  text-align: center;
+  font-size: 24rpx;
+  color: #6b7a90;
+}
+.seg-item.on {
+  color: #fff;
+  background: #2f6bff;
+}
+.stepper-wrap {
+  display: flex;
+  align-items: center;
+  padding: 6rpx 12rpx;
+  border-radius: 14rpx;
+  background: #f2f4f8;
+}
+.stepper-wrap .copy-num {
+  min-width: 60rpx;
+  text-align: center;
+  font-size: 26rpx;
   color: #1f2d3d;
 }
 .stepper {

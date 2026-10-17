@@ -70,7 +70,7 @@ npm.cmd run dev:h5
 | 5-D | OCR + PDF 转 Word | ✅ | 多模态 OCR、pdf2docx 转换（不调大模型） |
 | 扩展 | 排版属性检查 | ✅ | 从 PDF 提取正文常见字体/字号/行距，按 `common` 口径只出建议 |
 | 6 | 文档修复 | ✅ | AI 出 actions、代码执行、序号保留、`⟨待补⟩` 占位、生成副本 |
-| 7 | 学生端 uni-app | 🔄 | 4 个页面 + auth/filePicker/notify 适配层；H5 冒烟通过；真机 plus.io 待验证 |
+| 7 | 学生端 uni-app | 🔄 | 4 个页面 + auth/filePicker/notify 适配层；H5 冒烟通过；打印方案可手动改单双面/颜色/版式/份数；真机 plus.io 待验证 |
 | 8 | 老师端 Vue3 后台 | ⬜ | 未开始 |
 | 9 | 打包与交付 | ⬜ | 未开始（HBuilderX 云打包可用） |
 

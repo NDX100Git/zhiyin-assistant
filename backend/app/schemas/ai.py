@@ -17,6 +17,10 @@ class ProofreadRequest(BaseModel):
 class PrintPlanOptions(BaseModel):
     copies: int | None = Field(default=None, ge=1, description="份数")
     color_mode: int | None = Field(default=None, description="0=黑白 1=彩色")
+    print_side: int | None = Field(default=None, description="1=单面 2=双面")
+    layout: str | None = Field(
+        default=None, description="single / handout_2in1 / handout_4in1"
+    )
     paper_size: str | None = Field(default=None, description="纸张规格")
 
 

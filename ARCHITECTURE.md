@@ -148,7 +148,7 @@ check 报告 + 用户勾选的 issue_ids
 | POST | `/api/ai/check` | AI 体检（规则 + 大模型） |
 | POST | `/api/ai/proofread` | 错别字检查，返回 `task_id` |
 | GET | `/api/ai/proofread/{task_id}` | 轮询进度与结果 |
-| POST | `/api/ai/print-plan` | 打印方案（含省纸省钱） |
+| POST | `/api/ai/print-plan` | 打印方案（含省纸省钱；`options` 可覆盖单双面/颜色/版式/份数） |
 | POST | `/api/ai/ocr` | 图片转文字（多模态） |
 | POST | `/api/ai/convert` | PDF 转 Word（pdf2docx） |
 | POST | `/api/ai/fix` | 勾选问题生成修复副本 |

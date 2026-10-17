@@ -172,7 +172,11 @@ def plan_print(db: Session, file_key: str, options: dict, force: bool = False) -
 
     final_recommend = sanitize_recommend(recommend, features)
 
-    # 用户显式指定的颜色/份数优先
+    # 用户显式指定的选项优先（学生在方案卡片上手动调整）
+    if options.get("print_side") in (1, 2):
+        final_recommend["print_side"] = int(options["print_side"])
+    if options.get("layout") in get_ai_rules()["print_plan"]["allowed_layouts"]:
+        final_recommend["layout"] = str(options["layout"])
     if options.get("color_mode") in (0, 1):
         final_recommend["color_mode"] = int(options["color_mode"])
     elif not features["has_color"]:

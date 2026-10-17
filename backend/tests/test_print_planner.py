@@ -111,3 +111,38 @@ def test_方案写入缓存且带用户偏好(db_session, monkeypatch):
 
     second = plan_print(db_session, "files/2026/10/cache.pdf", {"copies": 2})
     assert second["generated_at"] == first["generated_at"]  # 命中缓存
+
+
+def test_用户手动选择单双面颜色与版式(db_session, monkeypatch):
+    monkeypatch.setattr(
+        "app.services.print_planner.parse_document",
+        lambda db, key: _parsed(42),
+    )
+    monkeypatch.setattr(
+        "app.services.print_planner.chat_json",
+        lambda messages: {
+            "recommend": {"print_side": 2, "color_mode": 0, "layout": "handout_2in1", "scale": 100},
+            "reason": "默认推荐双面讲义",
+        },
+    )
+
+    plan = plan_print(
+        db_session,
+        "files/2026/10/manual.pptx",
+        {"copies": 1, "print_side": 1, "color_mode": 1, "layout": "handout_4in1"},
+    )
+
+    assert plan["recommend"]["print_side"] == 1
+    assert plan["recommend"]["color_mode"] == 1
+    assert plan["recommend"]["layout"] == "handout_4in1"
+    # 42 页 4 合 1 单面：11 张纸，彩色 80 分/页 × 11 页
+    assert plan["sheets_needed"] == 11
+    assert plan["amount_cents"] == 880
+
+    invalid = plan_print(
+        db_session,
+        "files/2026/10/manual2.pptx",
+        {"print_side": 9, "layout": "handout_9in1"},
+    )
+    assert invalid["recommend"]["print_side"] in (1, 2)
+    assert invalid["recommend"]["layout"] in {"single", "handout_2in1", "handout_4in1"}
