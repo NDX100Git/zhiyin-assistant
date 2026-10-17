@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+pytest-of-*/
+
+# 环境变量与密钥：绝不提交
+.env
+backend/.env
+
+# 运行时产物
+backend/runtime/
+backend/logs/
+*.log
+
+# 前端（后续阶段）
+node_modules/
+unpackage/
+dist/
+
+# 本地开发工具（MySQL 免安装版等）
+.devtools/
+
+# MinIO 本地数据目录：含大量二进制对象，绝不入库
+.minio-data/

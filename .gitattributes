@@ -1,0 +1,13 @@
+# 统一换行，避免跨平台 diff 噪声
+* text=auto eol=lf
+
+# Windows 脚本保持 CRLF（并保留 UTF-8 BOM，避免 PowerShell 5.1 中文乱码）
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+
+# 二进制资源不参与文本转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.docx binary
+*.pdf binary

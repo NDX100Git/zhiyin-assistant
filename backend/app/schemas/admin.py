@@ -1,0 +1,37 @@
+"""老师端出入参模型。"""
+
+from __future__ import annotations
+
+from pydantic import BaseModel, Field
+
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class CompleteRequest(BaseModel):
+    amount_cents: int | None = Field(
+        default=None, ge=0, description="不传则使用系统按 pricing.json 计算的值"
+    )
+
+
+class BatchCompleteRequest(BaseModel):
+    order_ids: list[int] = Field(min_length=1, description="要批量完成的订单 id")
+
+
+class AbnormalRequest(BaseModel):
+    reason: str | None = Field(default=None, description="异常原因，如卡纸、缺墨、学生有异议")
+
+
+class SessionSwitchRequest(BaseModel):
+    date: str = Field(description="日期，格式 YYYY-MM-DD")
+    session: str = Field(description="时段：am / pm")
+
+
+class NoticeCreateRequest(BaseModel):
+    content: str = Field(description="公告内容")
+
+
+class VerifyCodeRequest(BaseModel):
+    pickup_code: str = Field(description="取件码，如 B-12")

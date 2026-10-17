@@ -1,0 +1,289 @@
+"""订单核心业务逻辑：下单、查询、取消、模拟支付。
+
+铁律：订单号与取件码由服务端生成；状态只能由服务端推进；金额一律用「分」。
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime
+
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.config import get_order_rules
+from app.models.order import Order
+from app.models.payment_log import PaymentLog
+from app.models.user import User
+from app.services.notifier import get_notifier
+from app.services.order_state import (
+    STATUS_CANCELLED,
+    STATUS_PENDING_PAY,
+    STUDENT_CANCELLABLE,
+    change_status,
+    record_log,
+    status_label,
+)
+from app.services.payment import get_payment_provider
+from app.services.pricing import calc_amount_cents
+from app.services.queue_service import new_order_wait_info, order_wait_info
+from app.services.session_service import current_session_info, get_or_create_session
+from app.utils.exceptions import BusinessError
+
+logger = logging.getLogger(__name__)
+
+MAX_ORDER_NO_ATTEMPTS = 5
+
+
+def _day_start(now: datetime) -> datetime:
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _next_daily_seq(db: Session, now: datetime) -> int:
+    """当日序号：已有订单数 + 1。配合 order_no 唯一索引与失败重试保证唯一。"""
+    total = db.execute(
+        select(func.count()).select_from(Order).where(Order.created_at >= _day_start(now))
+    ).scalar_one()
+    return int(total) + 1
+
+
+def build_pickup_code(seq: int) -> str:
+    """按当日顺序生成取件码，如 A-01、B-12。"""
+    rules = get_order_rules()["pickup_code"]
+    letters = str(rules["letters"])
+    per_letter = int(rules["numbers_per_letter"])
+    letter_index, number = divmod(seq - 1, per_letter)
+    if letter_index >= len(letters):
+        raise BusinessError("今日取件码已用完，请明天再来", code=40051)
+    return f"{letters[letter_index]}-{number + 1:02d}"
+
+
+def _validate_create(payload, limits: dict) -> None:
+    if not payload.file_key or not str(payload.file_key).startswith("files/"):
+        raise BusinessError("文件标识无效，请重新上传", code=40041)
+    if payload.print_side not in (1, 2):
+        raise BusinessError("打印方式只能是单面或双面", code=40042)
+    if payload.color_mode not in (0, 1):
+        raise BusinessError("颜色模式只能是黑白或彩色", code=40043)
+    if not 1 <= int(payload.copies) <= int(limits["max_copies"]):
+        raise BusinessError(f"份数必须在 1 到 {limits['max_copies']} 之间", code=40044)
+    if not 1 <= int(payload.page_count) <= int(limits["max_page_count"]):
+        raise BusinessError(f"页数必须在 1 到 {limits['max_page_count']} 之间", code=40045)
+    if payload.paper_size not in limits["allowed_paper_sizes"]:
+        raise BusinessError(
+            f"纸张规格不支持：{payload.paper_size}，可选 {'、'.join(limits['allowed_paper_sizes'])}",
+            code=40046,
+        )
+    if payload.remark and len(payload.remark) > int(limits["max_remark_length"]):
+        raise BusinessError(f"备注最多 {limits['max_remark_length']} 个字符", code=40047)
+
+
+def create_order(db: Session, user: User, payload) -> Order:
+    """下单：状态置 pending_pay，返回带订单号与取件码的订单。"""
+    rules = get_order_rules()
+    _validate_create(payload, rules["limits"])
+
+    # 截单不拒绝下单：仅把订单排到下一个打印时段（首页会给出提示）
+    session_info = current_session_info(db)
+
+    amount_cents = calc_amount_cents(
+        payload.page_count, payload.print_side, payload.color_mode, payload.copies
+    )
+
+    now = datetime.now()  # 服务端时间
+    order: Order | None = None
+    for attempt in range(1, MAX_ORDER_NO_ATTEMPTS + 1):
+        seq = _next_daily_seq(db, now)
+        candidate = Order(
+            order_no=f"{now:%m%d}-{seq:03d}",
+            pickup_code=build_pickup_code(seq),
+            user_id=user.id,
+            status=STATUS_PENDING_PAY,
+            file_key=payload.file_key,
+            file_name=payload.file_name,
+            page_count=payload.page_count,
+            print_side=payload.print_side,
+            color_mode=payload.color_mode,
+            copies=payload.copies,
+            paper_size=payload.paper_size,
+            amount_cents=amount_cents,
+            remark=payload.remark,
+            site_id=1,
+        )
+        db.add(candidate)
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            logger.warning("订单号冲突，第 %d 次重试", attempt)
+            continue
+        order = candidate
+        break
+
+    if order is None:
+        raise BusinessError("订单号生成失败，请稍后重试", code=50020)
+
+    record_log(db, order, "state_change", None, STATUS_PENDING_PAY, "学生创建订单", "student")
+    # 仅在本时段仍收单时占用容量；截单后的订单算下一个时段
+    if session_info["session"] and session_info["is_open"]:
+        session_row = get_or_create_session(db, now.date(), session_info["session"])
+        session_row.used = session_row.used + 1
+
+    get_notifier(db).send(
+        user_id=user.id,
+        event="order_created",
+        payload={
+            "order_no": order.order_no,
+            "pickup_code": order.pickup_code,
+            "status": order.status,
+            "status_label": status_label(order.status),
+        },
+        order_id=order.id,
+    )
+
+    db.commit()
+    db.refresh(order)
+    logger.info("创建订单成功：%s 取件码 %s 金额 %s 分", order.order_no, order.pickup_code,
+                order.amount_cents)
+    return order
+
+
+def get_owned_order(db: Session, user: User, order_id: int) -> Order:
+    """取订单并校验归属，避免越权查看他人订单。"""
+    order = db.get(Order, order_id)
+    if order is None or order.user_id != user.id:
+        raise BusinessError("订单不存在", code=40400)
+    return order
+
+
+def list_orders(db: Session, user: User, status: str | None = None,
+                page: int = 1, page_size: int = 20) -> dict:
+    """我的订单列表。"""
+    condition = [Order.user_id == user.id]
+    if status:
+        condition.append(Order.status == status)
+
+    total = db.execute(select(func.count()).select_from(Order).where(*condition)).scalar_one()
+    rows = list(
+        db.execute(
+            select(Order)
+            .where(*condition)
+            .order_by(Order.created_at.desc(), Order.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        ).scalars()
+    )
+    return {
+        "total": int(total),
+        "page": page,
+        "page_size": page_size,
+        "items": [order_to_dict(db, order) for order in rows],
+    }
+
+
+def order_to_dict(db: Session, order: Order) -> dict:
+    """订单对外字段（不含任何敏感信息）。"""
+    wait = order_wait_info(db, order)
+    return {
+        "id": order.id,
+        "order_no": order.order_no,
+        "pickup_code": order.pickup_code,
+        "status": order.status,
+        "status_label": status_label(order.status),
+        "file_key": order.file_key,
+        "file_name": order.file_name,
+        "page_count": order.page_count,
+        "print_side": order.print_side,
+        "color_mode": order.color_mode,
+        "copies": order.copies,
+        "paper_size": order.paper_size,
+        "amount_cents": order.amount_cents,
+        "paid": order.paid,
+        "pay_method": order.pay_method,
+        "created_at": order.created_at.isoformat() if order.created_at else None,
+        "printed_at": order.printed_at.isoformat() if order.printed_at else None,
+        "picked_at": order.picked_at.isoformat() if order.picked_at else None,
+        "remark": order.remark,
+        "cancel_reason": order.cancel_reason,
+        "queue_position": wait["queue_position"],
+        "estimated_minutes": wait["estimated_minutes"],
+    }
+
+
+def cancel_order(db: Session, user: User, order_id: int, reason: str | None = None) -> Order:
+    """取消订单：仅 pending_pay / queuing 允许。"""
+    order = get_owned_order(db, user, order_id)
+    if order.status not in STUDENT_CANCELLABLE:
+        raise BusinessError(
+            f"订单当前状态为「{status_label(order.status)}」，不能取消", code=40901
+        )
+    order.cancel_reason = reason
+    change_status(db, order, STATUS_CANCELLED, operator="student",
+                  note=reason or "学生取消订单")
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+def pay_order(db: Session, user: User, order_id: int) -> dict:
+    """模拟支付：调用支付 Provider，成功后转 queuing（这段逻辑与支付方式无关）。"""
+    order = get_owned_order(db, user, order_id)
+    if order.status != STATUS_PENDING_PAY:
+        raise BusinessError(
+            f"订单当前状态为「{status_label(order.status)}」，不能支付", code=40902
+        )
+
+    provider = get_payment_provider()
+    params = provider.create(order)
+    if not provider.confirm(str(order.id)):
+        raise BusinessError("支付未完成，请重试", code=40060)
+
+    # ↓ 与具体支付方式无关的公共逻辑
+    order.paid = 1
+    order.pay_method = str(params.get("pay_channel") or provider.name)
+    order.pay_channel = order.pay_method
+    order.paid_at = datetime.now()  # 服务端时间
+    db.add(
+        PaymentLog(
+            order_id=order.id,
+            amount_cents=order.amount_cents,
+            method=order.pay_method,
+            operator="student",
+        )
+    )
+    change_status(db, order, "queuing", operator="student", note="支付成功，进入队列")
+    db.commit()
+    db.refresh(order)
+
+    return {
+        "order_id": order.id,
+        "order_no": order.order_no,
+        "status": order.status,
+        "status_label": status_label(order.status),
+        "paid": order.paid,
+        "payment": params,
+        "queue": order_wait_info(db, order),
+    }
+
+
+def home_summary(db: Session, user: User) -> dict:
+    """学生端首页数据。"""
+    wait = new_order_wait_info(db)
+    mine = {"pending_pay": 0, "queuing": 0, "printing": 0, "ready": 0}
+    rows = db.execute(
+        select(Order.status, func.count())
+        .where(Order.user_id == user.id)
+        .group_by(Order.status)
+    ).all()
+    for status, count in rows:
+        if status in mine:
+            mine[status] = int(count)
+
+    return {
+        "waiting_count": wait["queuing_count"],
+        "estimated_minutes": wait["estimated_minutes"],
+        "ready_count": mine["ready"],
+        "mine": mine,
+        "order_session": current_session_info(db),
+    }

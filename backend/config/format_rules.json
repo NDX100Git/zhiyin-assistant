@@ -1,0 +1,31 @@
+{
+  "structure": {
+    "required": ["摘要", "关键词", "目录", "正文", "参考文献"],
+    "order": ["摘要", "关键词", "目录", "正文", "参考文献", "致谢"],
+    "_source": "GB/T 7713.1"
+  },
+  "reference": {
+    "standard": "GB/T 7714",
+    "checks": [
+      "作者超过三人时是否使用「等」",
+      "期刊文献是否标注卷(期):页码",
+      "专著是否标注出版地:出版者,出版年",
+      "DOI 格式是否正确"
+    ],
+    "_source": "national"
+  },
+  "page": {
+    "margin_top_cm": 2.5,
+    "margin_bottom_cm": 2.5,
+    "margin_left_cm": 3.0,
+    "margin_right_cm": 2.0,
+    "_source": "common"
+  },
+  "typography": {
+    "body":     {"font": "宋体", "size_pt": 12, "line_spacing": 1.5},
+    "heading1": {"font": "黑体", "size_pt": 16},
+    "heading2": {"font": "黑体", "size_pt": 14},
+    "heading3": {"font": "楷体", "size_pt": 12},
+    "_source": "common"
+  }
+}

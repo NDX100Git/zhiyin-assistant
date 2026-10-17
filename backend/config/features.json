@@ -1,0 +1,7 @@
+{
+  "enable_online_payment": false,
+  "enable_wechat_login": false,
+  "enable_push_notification": false,
+  "enable_multi_site": false,
+  "enable_auto_print": false
+}

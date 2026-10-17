@@ -1,0 +1,33 @@
+{
+  "session": {
+    "am": {
+      "label": "上午",
+      "window": ["08:00", "12:00"],
+      "pickup_hint": "今日 14:00 后取件",
+      "closed_hint": "上午已截单，现在下单会排在下一个打印时段（今日 14:00 后取件）"
+    },
+    "pm": {
+      "label": "下午",
+      "window": ["12:00", "18:00"],
+      "pickup_hint": "次日上午 10:00 后取件",
+      "closed_hint": "下午已截单，现在下单会排在下一个打印时段（次日上午 10:00 后取件）"
+    },
+    "outside_hint": "当前不在收单时段，现在下单会排在下一个打印时段（次日上午 10:00 后取件）",
+    "default_capacity": 30
+  },
+  "wait": {
+    "recent_orders": 20,
+    "default_seconds_per_order": 60
+  },
+  "limits": {
+    "max_copies": 50,
+    "max_page_count": 1000,
+    "allowed_paper_sizes": ["A4", "A3", "B5"],
+    "max_remark_length": 255
+  },
+  "pickup_code": {
+    "letters": "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    "numbers_per_letter": 99
+  },
+  "_note": "收单时段、容量、等待时间参数与下单限制全部外置，改规则只改本文件"
+}

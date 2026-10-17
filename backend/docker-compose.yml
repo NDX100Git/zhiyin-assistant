@@ -1,0 +1,62 @@
+# 智印助手开发环境：MySQL 8 + MinIO + LibreOffice（headless 转换容器）
+#
+# 说明：本机开发也可以不用 Docker，直接用免安装版 MySQL + 本机 MinIO。
+# 在 backend/ 目录执行：docker compose up -d
+# compose 会自动读取同目录下的 .env（不存在时使用下面的默认值）。
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: zhiyin-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-zhiyin_dev_2026}
+      MYSQL_DATABASE: ${DB_NAME:-zhiyin}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+08:00
+    ports:
+      - "${DB_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${DB_PASSWORD:-zhiyin_dev_2026}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    container_name: zhiyin-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Word/Excel 等文档转 PDF 的调用入口（阶段 5-A 使用）。
+  # 容器常驻，后端通过 docker exec 调用 soffice；也可在本机安装 LibreOffice 后直接调用。
+  libreoffice:
+    build: ./docker/libreoffice
+    container_name: zhiyin-libreoffice
+    restart: unless-stopped
+    volumes:
+      - ./runtime:/workspace/runtime
+    command: ["sleep", "infinity"]
+
+volumes:
+  mysql-data:
+  minio-data:

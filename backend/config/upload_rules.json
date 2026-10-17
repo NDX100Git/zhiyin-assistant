@@ -1,0 +1,17 @@
+{
+  "max_size_mb": 50,
+  "allowed_extensions": [
+    "pdf",
+    "doc",
+    "docx",
+    "ppt",
+    "pptx",
+    "xls",
+    "xlsx",
+    "jpg",
+    "jpeg",
+    "png"
+  ],
+  "max_filename_length": 120,
+  "_note": "白名单含 PPT/Excel，用于 AI 讲义模式 2 合 1 的省纸计算；改规则只改本文件"
+}
