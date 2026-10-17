@@ -7,8 +7,19 @@
 学生端 H5 四个页面、老师端 Web 后台均已跑通并做过浏览器 E2E；APK 需按
 `docs/PACKAGING.md` 在 HBuilderX 云打包。
 
+## 先读接手说明
+
+这是一个**源码交接项目**，不是双击即可运行的成品安装包。仓库不包含 MySQL、
+MinIO、LibreOffice、`node_modules`、Python 虚拟环境、真实 `.env` 或 API Key。
+首次运行请先阅读 [PREVIOUS_AI_HANDOFF.md](PREVIOUS_AI_HANDOFF.md) 和
+[HANDOFF.md](HANDOFF.md)，安装依赖后再启动。
+
+如果页面能打开但登录或上传失败，优先检查 MySQL、MinIO 和后端服务；API Key 只影响
+AI 体检、修复建议和 OCR，不是基础上传与下单功能的必要条件。
+
 ## 交付文档
 
+- [PREVIOUS_AI_HANDOFF.md](PREVIOUS_AI_HANDOFF.md)：上一轮 AI 的接手说明、交付边界和已知问题
 - [PROJECT_STATE.md](PROJECT_STATE.md)：进度、关键决策、已知问题、下一步
 - [ARCHITECTURE.md](ARCHITECTURE.md)：目录、数据表、接口、关键文件职责
 - [docs/PACKAGING.md](docs/PACKAGING.md)：H5 / 微信小程序 / APK 打包
