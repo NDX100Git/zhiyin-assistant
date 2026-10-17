@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import date as date_type
 from datetime import datetime, time
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.config import get_order_rules
@@ -36,18 +36,28 @@ def resolve_session_name(now: datetime) -> str | None:
 
 
 def get_or_create_session(db: Session, day: date_type, name: str) -> QueueSession:
-    """取当天某时段的设置行，不存在则按默认容量创建（默认开放）。"""
-    row = db.execute(
-        select(QueueSession).where(QueueSession.date == day, QueueSession.session == name)
-    ).scalar_one_or_none()
-    if row is not None:
-        return row
+    """取当天某时段的设置行，不存在则按默认容量创建（默认开放）。
 
+    每天首批并发下单会同时发现“行不存在”，各自插同一行；(日期, 时段) 唯一键只允许一个
+    成功。用 `INSERT ... ON DUPLICATE KEY UPDATE` 变成幂等写入，没有异常可抛。
+
+    随后的读取必须加 `FOR UPDATE`：MySQL 默认 REPEATABLE READ，本请求早先查用户时已经把
+    读视图定住，普通 SELECT 看不到并发事务刚提交的那一行，会读成空。锁定读走的是最新数据。
+    """
     default_capacity = int(get_order_rules()["session"].get("default_capacity", 30))
-    row = QueueSession(date=day, session=name, is_open=1, capacity=default_capacity, used=0)
-    db.add(row)
-    db.flush()
-    return row
+    db.execute(
+        text(
+            "INSERT INTO queue_sessions (date, session, is_open, capacity, used) "
+            "VALUES (:date, :session, 1, :capacity, 0) "
+            "ON DUPLICATE KEY UPDATE date = date"
+        ),
+        {"date": day, "session": name, "capacity": default_capacity},
+    )
+    return db.execute(
+        select(QueueSession)
+        .where(QueueSession.date == day, QueueSession.session == name)
+        .with_for_update()
+    ).scalar_one()
 
 
 def current_session_info(db: Session, now: datetime | None = None) -> dict:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.models.order import Order
@@ -98,16 +99,34 @@ def change_status(
     operator: str | None = None,
     note: str | None = None,
 ) -> Order:
-    """推进订单状态：校验 -> 更新 -> 写日志 -> 记录通知事件。"""
+    """推进订单状态：校验 -> 条件更新 -> 写日志 -> 记录通知事件。
+
+    状态用条件更新落地（WHERE id = ? AND status = 当前状态），不是先读后写。
+    两个请求同时推进同一单时只有一个能改到，另一个拿到 0 行报 40904，
+    不会写出两条核销日志、也不会把同一单现场收款两次。
+    """
     from_status = order.status
     assert_transition(from_status, to_status)
 
-    order.status = to_status
     now = datetime.now()  # 服务端时间
+    values: dict = {"status": to_status}
     if to_status == STATUS_READY:
-        order.printed_at = now
+        values["printed_at"] = now
     elif to_status == STATUS_COMPLETED:
-        order.picked_at = now
+        values["picked_at"] = now
+
+    result = db.execute(
+        update(Order)
+        .where(Order.id == order.id, Order.status == from_status)
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount == 0:
+        raise BusinessError(
+            f"订单 {order.order_no} 的状态刚被其他操作改过，请刷新后重试", code=40904
+        )
+    # 只让被改的字段失效，别动调用方在这之前设置的其它字段
+    db.expire(order, list(values.keys()))
 
     record_log(db, order, "state_change", from_status, to_status, note, operator)
 
