@@ -145,10 +145,11 @@ check 报告 + 用户勾选的 issue_ids
 | POST | `/api/auth/profile` | 更新昵称 |
 | POST | `/api/file/upload` | 上传（≤50MB；白名单；文件头校验） |
 | POST | `/api/file/demo` | 载入服务端示例论文（App 选文件失败兜底） |
+| POST | `/api/file/page-count` | 只解析取页数（不调用 AI，供跳过体检直接下单） |
 | POST | `/api/ai/check` | AI 体检（规则 + 大模型） |
 | POST | `/api/ai/proofread` | 错别字检查，返回 `task_id` |
 | GET | `/api/ai/proofread/{task_id}` | 轮询进度与结果 |
-| POST | `/api/ai/print-plan` | 打印方案（含省纸省钱；`options` 可覆盖单双面/颜色/版式/份数） |
+| POST | `/api/ai/print-plan` | 打印方案（含省纸省钱；`options` 可覆盖单双面/颜色/版式/份数，`use_ai=false` 走规则方案） |
 | POST | `/api/ai/ocr` | 图片转文字（多模态） |
 | POST | `/api/ai/convert` | PDF 转 Word（pdf2docx） |
 | POST | `/api/ai/fix` | 勾选问题生成修复副本 |

@@ -22,6 +22,7 @@ class PrintPlanOptions(BaseModel):
         default=None, description="single / handout_2in1 / handout_4in1"
     )
     paper_size: str | None = Field(default=None, description="纸张规格")
+    use_ai: bool = Field(default=True, description="false 时用规则方案，不调用大模型")
 
 
 class PrintPlanRequest(BaseModel):
@@ -45,3 +46,7 @@ class FixRequest(BaseModel):
     file_key: str = Field(description="待修复文件的对象 key（docx 或 pdf）")
     issue_ids: list[str] = Field(min_length=1, description="用户勾选要修复的问题 id")
     file_name: str | None = Field(default=None, description="修复后展示的文件名")
+
+
+class PageCountRequest(BaseModel):
+    file_key: str = Field(description="上传接口返回的对象 key")

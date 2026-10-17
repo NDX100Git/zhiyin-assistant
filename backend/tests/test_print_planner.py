@@ -146,3 +146,21 @@ def test_用户手动选择单双面颜色与版式(db_session, monkeypatch):
     )
     assert invalid["recommend"]["print_side"] in (1, 2)
     assert invalid["recommend"]["layout"] in {"single", "handout_2in1", "handout_4in1"}
+
+
+def test_不使用AI时走规则方案且不调用模型(db_session, monkeypatch):
+    monkeypatch.setattr(
+        "app.services.print_planner.parse_document",
+        lambda db, key: _parsed(42),
+    )
+
+    def should_not_be_called(messages):
+        raise AssertionError("use_ai=false 时不应调用大模型")
+
+    monkeypatch.setattr("app.services.print_planner.chat_json", should_not_be_called)
+
+    plan = plan_print(db_session, "files/2026/10/basic.pdf", {"use_ai": False})
+    assert plan["from_model"] is False
+    assert "未使用 AI" in plan["reason"]
+    assert plan["recommend"]["print_side"] == 2
+    assert plan["sheets_needed"] == 21

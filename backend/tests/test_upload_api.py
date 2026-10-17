@@ -121,3 +121,18 @@ def test_载入示例论文兜底接口(client, test_storage):
 
 def test_未登录不能载入示例论文(client):
     assert client.post("/api/file/demo").json()["code"] == 40100
+
+
+def test_读取页数不调用AI(client, monkeypatch):
+    token = login(client)
+    monkeypatch.setattr(
+        "app.routers.file.parse_document", lambda db, key: {"page_count": 12}
+    )
+    body = client.post(
+        "/api/file/page-count",
+        json={"file_key": "files/2026/10/demo.pdf"},
+        headers=auth_header(token),
+    ).json()
+
+    assert body["code"] == 0
+    assert body["data"]["page_count"] == 12

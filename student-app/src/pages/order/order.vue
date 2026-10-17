@@ -17,6 +17,7 @@
         <text class="file-meta">{{ formatSize(fileSize) }}</text>
       </view>
       <view v-else class="empty">支持 PDF / Word / PPT / Excel，单文件不超过 50MB</view>
+      <text v-if="preparing" class="preparing">正在读取页数与打印参数…</text>
 
       <view class="actions">
         <button class="action" :disabled="busy" @click="pickDocument">选择文档</button>
@@ -28,6 +29,19 @@
         <text class="ocr-text">{{ ocrText }}</text>
         <text class="ocr-tip">如需体检与打印，请上传 PDF / Word 文档。</text>
       </view>
+    </view>
+
+    <view v-if="fileKey" class="card ai-entry">
+      <view class="card-head">
+        <text class="card-title">AI 体检与修复（可选）</text>
+        <text class="tag" :class="{ ok: aiChecked }">{{ aiChecked ? '已完成' : '可跳过' }}</text>
+      </view>
+      <text class="ai-entry-desc">
+        {{ aiChecked ? '已按体检结果更新打印方案，也可以重新体检。' : '检查结构、参考文献与版式，并可选择生成修复副本。着急打印可以直接在下方下单。' }}
+      </text>
+      <button class="action ghost" :disabled="checking || preparing" @click="runCheck">
+        {{ checking ? 'AI 正在体检…' : (aiChecked ? '重新体检' : '开始 AI 体检') }}
+      </button>
     </view>
 
     <view v-if="checking && !report" class="card center">
@@ -44,16 +58,25 @@
       <view v-if="report.ai_errors && report.ai_errors.length" class="warn">
         {{ report.ai_errors.join('；') }}
       </view>
+      <view class="ai-fix-row">
+        <view class="ai-fix-text">
+          <text class="ai-fix-title">AI 修复（可选）</text>
+          <text class="ai-fix-sub">{{ wantFix ? '勾选要修复的问题，会生成一个新副本，原文件保留' : '默认只给建议，不会修改原文档' }}</text>
+        </view>
+        <view class="ai-toggle" :class="{ on: wantFix }" @click="toggleWantFix">
+          <view class="ai-toggle-knob"></view>
+        </view>
+      </view>
       <view v-if="report.issues.length === 0" class="empty">未发现明确问题，太棒了。</view>
       <view
         v-for="issue in report.issues"
         :key="issue.id"
         class="issue"
         :class="[issue.severity, { selected: selectedIssues.includes(issue.id) }]"
-        @click="toggleIssue(issue.id)"
+        @click="wantFix && toggleIssue(issue.id)"
       >
         <view class="issue-head">
-          <view class="check" :class="{ on: selectedIssues.includes(issue.id) }">{{ selectedIssues.includes(issue.id) ? '✓' : '' }}</view>
+          <view v-if="wantFix" class="check" :class="{ on: selectedIssues.includes(issue.id) }">{{ selectedIssues.includes(issue.id) ? '✓' : '' }}</view>
           <text class="issue-title">{{ severityLabel(issue.severity) }} · {{ typeLabel(issue.type) }}</text>
           <text class="issue-loc">{{ issue.location }}</text>
         </view>
@@ -61,15 +84,19 @@
         <text class="issue-suggestion">建议：{{ issue.suggestion }}</text>
         <text class="issue-reason">依据：{{ issue.reason }}</text>
       </view>
-      <button v-if="selectedIssues.length" class="action ghost" :disabled="busy" @click="generateFixed">
-        生成修复版（勾选 {{ selectedIssues.length }} 项）
+      <view v-if="wantFix && highIssueIds.length" class="fix-tools">
+        <button class="mini-action" @click="selectHigh">全选高优先级</button>
+        <button class="mini-action" @click="clearSelected">清空</button>
+      </view>
+      <button v-if="wantFix" class="action ghost" :disabled="busy || selectedIssues.length === 0" @click="generateFixed">
+        {{ selectedIssues.length ? `生成修复版（勾选 ${selectedIssues.length} 项）` : '请先勾选要修复的问题' }}
       </button>
     </view>
 
     <view v-if="plan" class="card">
       <view class="card-head">
         <text class="card-title">3. 打印方案</text>
-        <text class="tag">共 {{ pageCount }} 页</text>
+        <text class="tag">{{ planUsesAi ? 'AI 优化方案' : '基础方案' }} · 共 {{ pageCount }} 页</text>
       </view>
       <text class="ai-recommend">当前方案：{{ plan.recommend.print_side === 2 ? '双面' : '单面' }} · {{ plan.recommend.color_mode === 1 ? '彩色' : '黑白' }} · {{ layoutLabel(plan.recommend.layout) }}</text>
       <view class="opt-row">
@@ -132,7 +159,7 @@ import { notify, notifyError } from '@/services/notify'
 
 const steps = [
   { key: 'upload', label: '上传' },
-  { key: 'check', label: '体检' },
+  { key: 'check', label: '体检（可选）' },
   { key: 'plan', label: '下单' },
 ]
 
@@ -144,8 +171,13 @@ const fileName = ref('')
 const fileSize = ref(0)
 const report = ref(null)
 const selectedIssues = ref([])
+const wantFix = ref(false)
 const plan = ref(null)
 const copies = ref(1)
+const pageCount = ref(1)
+const preparing = ref(false)
+const aiChecked = ref(false)
+const planUsesAi = ref(false)
 const printSide = ref(null)
 const colorMode = ref(null)
 const layout = ref('')
@@ -157,11 +189,13 @@ const layouts = [
 const created = ref(null)
 const ocrText = ref('')
 
-const pageCount = computed(() => Math.max(1, Number(report.value && report.value.page_count) || 1))
 const severitySummary = computed(() => {
   const counts = (report.value && report.value.by_severity) || {}
   return `高 ${counts['高'] || 0} · 中 ${counts['中'] || 0} · 低 ${counts['低'] || 0}`
 })
+const highIssueIds = computed(() =>
+  report.value ? report.value.issues.filter((issue) => issue.severity === 'high').map((issue) => issue.id) : []
+)
 
 function severityLabel(severity) {
   return severity === 'high' ? '高' : severity === 'medium' ? '中' : '低'
@@ -192,6 +226,10 @@ function formatMoney(cents) {
 function resetFlow() {
   report.value = null
   selectedIssues.value = []
+  wantFix.value = false
+  aiChecked.value = false
+  pageCount.value = 1
+  planUsesAi.value = false
   plan.value = null
   created.value = null
   ocrText.value = ''
@@ -207,7 +245,23 @@ async function useUploaded(data) {
   fileSize.value = data.size || 0
   resetFlow()
   stepIndex.value = 1
-  await runCheck()
+  await prepareBasicPlan()
+}
+
+async function prepareBasicPlan() {
+  preparing.value = true
+  try {
+    const pc = await request('/api/file/page-count', {
+      method: 'POST',
+      data: { file_key: fileKey.value },
+    })
+    pageCount.value = Math.max(1, Number(pc.page_count) || 1)
+    await loadPlan(false)
+  } catch (error) {
+    notifyError(error)
+  } finally {
+    preparing.value = false
+  }
 }
 
 async function pickDocument() {
@@ -262,16 +316,18 @@ async function pickImage() {
 }
 
 async function runCheck() {
+  if (checking.value) return
   checking.value = true
   try {
     report.value = await request('/api/ai/check', {
       method: 'POST',
       data: { file_key: fileKey.value },
     })
-    selectedIssues.value = report.value.issues
-      .filter((issue) => issue.severity === 'high')
-      .map((issue) => issue.id)
-    await loadPlan()
+    aiChecked.value = true
+    pageCount.value = Math.max(1, Number(report.value.page_count) || pageCount.value)
+    selectedIssues.value = []
+    wantFix.value = false
+    await loadPlan(true)
   } catch (error) {
     notifyError(error)
   } finally {
@@ -279,9 +335,9 @@ async function runCheck() {
   }
 }
 
-async function loadPlan() {
+async function loadPlan(useAi = false) {
   try {
-    const options = { copies: copies.value }
+    const options = { copies: copies.value, use_ai: useAi }
     if (printSide.value) options.print_side = printSide.value
     if (colorMode.value === 0 || colorMode.value === 1) options.color_mode = colorMode.value
     if (layout.value) options.layout = layout.value
@@ -290,6 +346,7 @@ async function loadPlan() {
       method: 'POST',
       data: { file_key: fileKey.value, options },
     })
+    planUsesAi.value = useAi
     printSide.value = plan.value.recommend.print_side
     colorMode.value = plan.value.recommend.color_mode
     layout.value = plan.value.recommend.layout
@@ -303,7 +360,7 @@ async function choose(field, value) {
   if (field === 'print_side') printSide.value = value
   if (field === 'color_mode') colorMode.value = value
   if (field === 'layout') layout.value = value
-  await loadPlan()
+  await loadPlan(planUsesAi.value)
 }
 
 function toggleIssue(id) {
@@ -313,6 +370,21 @@ function toggleIssue(id) {
   } else {
     selectedIssues.value.push(id)
   }
+}
+
+function toggleWantFix() {
+  wantFix.value = !wantFix.value
+  if (!wantFix.value) {
+    selectedIssues.value = []
+  }
+}
+
+function selectHigh() {
+  selectedIssues.value = [...highIssueIds.value]
+}
+
+function clearSelected() {
+  selectedIssues.value = []
 }
 
 async function generateFixed() {
@@ -331,6 +403,8 @@ async function generateFixed() {
     fileKey.value = fixed.file_key
     fileName.value = fixed.file_name || fileName.value
     fileSize.value = fixed.size || fileSize.value
+    wantFix.value = false
+    selectedIssues.value = []
     await runCheck()
   } catch (error) {
     notifyError(error)
@@ -343,7 +417,7 @@ async function changeCopies(delta) {
   const next = Math.max(1, Math.min(50, copies.value + delta))
   if (next === copies.value) return
   copies.value = next
-  await loadPlan()
+  await loadPlan(planUsesAi.value)
 }
 
 async function createOrder() {
@@ -462,6 +536,82 @@ function goMine() {
   margin-top: 16rpx;
   font-size: 26rpx;
   color: #9aa7b5;
+}
+.preparing {
+  display: block;
+  margin-top: 12rpx;
+  font-size: 24rpx;
+  color: #2f6bff;
+}
+.ai-entry {
+  border: 2rpx dashed #d9e2f2;
+}
+.ai-entry-desc {
+  display: block;
+  margin-top: 12rpx;
+  font-size: 24rpx;
+  line-height: 1.6;
+  color: #6b7a90;
+}
+.ai-fix-row {
+  display: flex;
+  align-items: center;
+  margin-top: 18rpx;
+  padding: 16rpx;
+  border-radius: 16rpx;
+  background: #f7f9fc;
+}
+.ai-fix-text {
+  flex: 1;
+  margin-right: 16rpx;
+}
+.ai-fix-title {
+  display: block;
+  font-size: 26rpx;
+  font-weight: 600;
+  color: #1f2d3d;
+}
+.ai-fix-sub {
+  display: block;
+  margin-top: 4rpx;
+  font-size: 22rpx;
+  color: #9aa7b5;
+}
+.ai-toggle {
+  width: 86rpx;
+  height: 48rpx;
+  padding: 4rpx;
+  border-radius: 999rpx;
+  background: #dfe5ee;
+  box-sizing: border-box;
+  transition: background 0.2s;
+}
+.ai-toggle.on {
+  background: #2f6bff;
+}
+.ai-toggle-knob {
+  width: 40rpx;
+  height: 40rpx;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.2s;
+}
+.ai-toggle.on .ai-toggle-knob {
+  transform: translateX(38rpx);
+}
+.fix-tools {
+  display: flex;
+  margin-top: 16rpx;
+}
+.mini-action {
+  margin: 0 12rpx 0 0;
+  padding: 0 20rpx;
+  height: 56rpx;
+  line-height: 56rpx;
+  border-radius: 999rpx;
+  font-size: 22rpx;
+  color: #2f6bff;
+  background: #eef3ff;
 }
 .file-info {
   display: flex;

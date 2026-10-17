@@ -7,8 +7,12 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, File, UploadFile
+from sqlalchemy.orm import Session
 
+from app.database import get_db
 from app.models.user import User
+from app.schemas.ai import PageCountRequest
+from app.services.doc_parser import parse_document
 from app.services.file_service import load_demo_document, store_upload
 from app.utils.response import ok
 from app.utils.security import get_current_user
@@ -29,3 +33,14 @@ def upload(
 def upload_demo(user: User = Depends(get_current_user)) -> dict:
     """App 端选文件不可用时，用它保证「上传 → AI 体检」链路可演示。"""
     return ok(load_demo_document(user))
+
+
+@router.post("/page-count", summary="读取页数（不调用 AI）", response_model=None)
+def page_count(
+    payload: PageCountRequest,
+    _: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """只做文档解析取页数，供「跳过 AI 体检、直接打印」的学生使用。"""
+    parsed = parse_document(db, payload.file_key)
+    return ok({"file_key": payload.file_key, "page_count": parsed.get("page_count", 1)})

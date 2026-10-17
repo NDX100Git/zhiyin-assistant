@@ -70,7 +70,7 @@ npm.cmd run dev:h5
 | 5-D | OCR + PDF 转 Word | ✅ | 多模态 OCR、pdf2docx 转换（不调大模型） |
 | 扩展 | 排版属性检查 | ✅ | 从 PDF 提取正文常见字体/字号/行距，按 `common` 口径只出建议 |
 | 6 | 文档修复 | ✅ | AI 出 actions、代码执行、序号保留、`⟨待补⟩` 占位、生成副本 |
-| 7 | 学生端 uni-app | 🔄 | 4 个页面 + auth/filePicker/notify 适配层；H5 冒烟通过；打印方案可手动改单双面/颜色/版式/份数；真机 plus.io 待验证 |
+| 7 | 学生端 uni-app | 🔄 | 4 个页面 + auth/filePicker/notify 适配层；H5 冒烟通过；**AI 体检/修复为可选项**，基础方案可直接下单；打印方案可手动改单双面/颜色/版式/份数；真机 plus.io 待验证 |
 | 8 | 老师端 Vue3 后台 | ⬜ | 未开始 |
 | 9 | 打包与交付 | ⬜ | 未开始（HBuilderX 云打包可用） |
 
@@ -94,6 +94,7 @@ npm.cmd run dev:h5
 14. **学生端先 H5**：用户是前端新手，开发期用 HBuilderX「运行到浏览器」看效果；CLI 项目（`student-app`）已本地构建通过。
 15. **接口地址可配置**：`.env.development` 用 `http://127.0.0.1:8000`（浏览器预览），`.env.production` 用局域网 IP（真机/APK）。
 16. **按文档类型选择体检口径**：`format_checker.detect_profile()` 区分 paper（pdf/doc/docx）、slide（ppt/pptx）、sheet（xls/xlsx）。论文套用结构与参考文献规则；PPT/表格只做版式检查，避免报"缺摘要/缺参考文献"这类无意义问题。报告里带 `profile` 与 `profile_note`。
+17. **AI 全程可选**：上传后先用 `POST /api/file/page-count` 取页数（不调模型），再用 `use_ai=false` 生成基础打印方案，学生可直接下单；想体检再点「开始 AI 体检」，体检完成后才出现报告与"AI 修复"开关（默认关闭、默认不勾选任何问题）。
 
 ---
 
@@ -103,6 +104,7 @@ npm.cmd run dev:h5
 |---|---|---|---|
 | 2026-10-17 | H5 上传报"参数校验失败：file 字段要求" | `uni.uploadFile` 被强行带上 `Content-Type: application/json`，浏览器无法生成 multipart boundary | 上传专用请求头只带 Authorization，交给运行时设置 Content-Type；`api.js` 已加注释警示 |
 | 2026-10-17 | PPT 体检误报"缺摘要/缺参考文献" | 所有文档都套用了论文结构规则 | 新增 paper/slide/sheet 口径；PPT 只检查版式（图片越界、空白页） |
+| 2026-10-17 | 用户不想体检也要等 AI | 上传后自动触发体检 | 新增页数接口 + 基础方案；体检与修复都改为用户主动开启 |
 
 ---
 

@@ -162,13 +162,18 @@ def plan_print(db: Session, file_key: str, options: dict, force: bool = False) -
     reason = ""
     errors: list[str] = []
     recommend: dict | None = None
-    try:
-        raw = chat_json(_messages(features, options))
-        recommend = raw.get("recommend") if isinstance(raw, dict) else None
-        reason = str(raw.get("reason") or "") if isinstance(raw, dict) else ""
-    except BusinessError as exc:
-        logger.warning("打印方案模型调用失败：%s", exc.message)
-        errors.append(f"打印方案：{exc.message}")
+    use_ai = bool(options.get("use_ai", True))
+
+    if use_ai:
+        try:
+            raw = chat_json(_messages(features, options))
+            recommend = raw.get("recommend") if isinstance(raw, dict) else None
+            reason = str(raw.get("reason") or "") if isinstance(raw, dict) else ""
+        except BusinessError as exc:
+            logger.warning("打印方案模型调用失败：%s", exc.message)
+            errors.append(f"打印方案：{exc.message}")
+    else:
+        reason = "按文档类型、页数与图片情况生成的默认方案（未使用 AI）。"
 
     final_recommend = sanitize_recommend(recommend, features)
 
@@ -190,7 +195,7 @@ def plan_print(db: Session, file_key: str, options: dict, force: bool = False) -
         "recommend": final_recommend,
         "reason": reason or "按文档特征自动选择最省纸的打印方式。",
         **numbers,
-        "from_model": recommend is not None,
+        "from_model": recommend is not None and use_ai,
         "errors": errors,
         "note": "纸张数与金额由服务端按 pricing.json 计算，模型只给推荐与理由",
         "generated_at": datetime.now().isoformat(timespec="seconds"),
