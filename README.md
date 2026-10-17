@@ -3,8 +3,18 @@
 面向高校文印室的智能化改造：学生上传文档 → AI 做格式与版式体检 → 生成修复建议和打印方案 →
 下单排队 → 文印室打印 → 学生凭取件码取件并结清。
 
-当前进度：**阶段 1（项目初始化）已完成**，后端骨架、数据模型、统一响应、配置文件、
-容器编排与开发文档就绪，业务接口从阶段 2 开始逐个实现。
+当前进度：**阶段 1-8 已完成，阶段 9 文档与打包配置就绪**。后端全部业务、
+学生端 H5 四个页面、老师端 Web 后台均已跑通并做过浏览器 E2E；APK 需按
+`docs/PACKAGING.md` 在 HBuilderX 云打包。
+
+## 交付文档
+
+- [PROJECT_STATE.md](PROJECT_STATE.md)：进度、关键决策、已知问题、下一步
+- [ARCHITECTURE.md](ARCHITECTURE.md)：目录、数据表、接口、关键文件职责
+- [docs/PACKAGING.md](docs/PACKAGING.md)：H5 / 微信小程序 / APK 打包
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)：本机与服务器部署、安全清单、排障
+- [docs/INSTALL.md](docs/INSTALL.md)：评委安装说明与演示流程
+- [docs/HANDOFF.md](docs/HANDOFF.md)：原始需求规格
 
 ---
 

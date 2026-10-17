@@ -31,6 +31,7 @@
 - 学生端 `npm run build:h5`：构建成功
 - 学生端 Edge 真浏览器冒烟：首页 / 下单 / 上传真实 PPT / AI 体检报告 / 打印方案 / 我的，**0 控制台错误**
 - 老师端 Edge 真浏览器 E2E：登录 → 完成打印并改价 → 核销 → 流水/设置，**0 控制台错误**
+- 学生端构建：H5 / 微信小程序 / App 资源均构建成功
 - DeepSeek 连通性（`backend/test_llm.py`）：普通对话 / JSON 模式 / 思考模式全部通过
 - 多模态 OCR：真实识别中文图片成功（确认 `deepseek-flash` 支持图片输入）
 
@@ -85,7 +86,7 @@ npm.cmd run dev:h5
 | 6 | 文档修复 | 后端 | ✅ | AI 出 actions、代码执行、序号保留、`⟨待补⟩` 占位、生成副本 |
 | 7 | 学生端 uni-app | 学生端 | 🔄 | 4 个页面 + auth/filePicker/notify 适配层；H5 冒烟通过；**体检/修复可选**，基础方案可直接下单；打印方案可手动改单双面/颜色/版式/份数；真机 plus.io 待验证 |
 | 8 | 老师端 Vue3 后台 | 老师端 | ✅ | 登录、工作台（今日数据/队列/下载/开始/完成改价/核销/批量完成/异常处理）、收款流水、收单开关、公告发布；Edge E2E 通过 |
-| 9 | 打包与交付 | 文档/工程 | ⬜ | 未开始（HBuilderX 云打包可用） |
+| 9 | 打包与交付 | 文档/工程 | 🟡 | 已配置 appid 占位、包名、图标、权限、minSdk 26；已写打包/部署/安装说明；H5/小程序/App 资源构建通过；**APK 待用 HBuilderX 云打包** |
 
 ---
 
@@ -129,6 +130,7 @@ npm.cmd run dev:h5
 | App 端 `plus.io.chooseFile` 未真机验证 | 手机上可能选不了文档 | 代码已按能力检测实现，失败有明确提示；**「载入示例论文」是兜底**（调 `POST /api/file/demo`）。有真机后需实测 |
 | Windows 防火墙没有 8000 入站规则 | 手机访问电脑 API 可能被拦 | 当前账号不是管理员，无法自动添加；需用户用管理员 PowerShell 执行 README 中的 `netsh` 命令 |
 | MinIO 官方已停发二进制 | 换机可能下不到 minio.exe | 当前 exe 是 GitHub 最后一个带二进制的版本（2025-09-07），**请备份该 exe** |
+| APK 尚未生成 | 云打包需要 DCloud 账号登录并手动点击；appid 仍是占位值 | 按 `docs/PACKAGING.md` 操作：换 appid → 选图标 → 云打包；安装说明见 `docs/INSTALL.md` |
 | LibreOffice 用 MSI 管理安装解包 | 非标准安装方式，个别功能可能受限 | headless 转换已实测可用；若换机能正常安装，改 `SOFFICE_PATH` 即可 |
 | 用户目录含中文导致 soffice 失败 | 转换报 `source file could not be loaded` | 已在代码中覆盖子进程 TMP/TEMP 为 ASCII 目录规避 |
 | 老师端 `npm run build/dev` 报 esbuild Access denied | esbuild 在中文 TEMP 目录清理临时文件失败 | `teacher-web/dev.cmd` / `build.cmd` 已把 TMP/TEMP 指向 `G:\deepseek\.tmp`；也可手动设置环境变量 |
@@ -143,7 +145,7 @@ npm.cmd run dev:h5
 
 ## 6. 下一步计划
 
-1. **阶段 9 打包交付**：HBuilderX 云打包 APK（需替换 manifest 的 appid 与签名证书）、部署文档、安装说明；老师端生产构建与部署。
+1. **阶段 9 打包交付**：按 `docs/PACKAGING.md` 在 HBuilderX 云打包 APK（需替换 appid、选择 `src/static/app-icon.png`、配置签名证书）；部署按 `docs/DEPLOYMENT.md`，评委安装看 `docs/INSTALL.md`。
 2. **真机验证**：V1 只验证了 H5；拿到 Android 手机后验证 `plus.io.chooseFile`，失败则继续用"载入示例论文"兜底。
 3. 收集用户试用反馈，调整文案/交互/演示数据。
 4. 可选优化：扫描件自动检测、报告 7 天清理定时任务、MinIO 对象生命周期。
