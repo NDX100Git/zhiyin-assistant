@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     db_name: str = "zhiyin"
     db_user: str = "root"
     db_password: str = ""
+    # 连接池。默认值 5 加 10 是 SQLAlchemy 的出厂设置，一万人在线轮询时会排队超时，
+    # 实测见 REVIEW 第 11 条；这里显式给足，并让等连接快失败而不是拖 30 秒
+    db_pool_size: int = 20
+    db_max_overflow: int = 30
+    db_pool_timeout: int = 10
 
     # 对象存储（阶段 2 使用）
     minio_endpoint: str = "127.0.0.1:9000"

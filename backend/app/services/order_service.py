@@ -28,7 +28,7 @@ from app.services.order_state import (
 )
 from app.services.payment import get_payment_provider
 from app.services.pricing import calc_amount_cents
-from app.services.queue_service import new_order_wait_info, order_wait_info
+from app.services.queue_service import batch_wait_info, new_order_wait_info, order_wait_info
 from app.services.session_service import current_session_info, get_or_create_session
 from app.utils.exceptions import BusinessError
 
@@ -186,17 +186,18 @@ def list_orders(db: Session, user: User, status: str | None = None,
             .limit(page_size)
         ).scalars()
     )
+    waits = batch_wait_info(db, rows)
     return {
         "total": int(total),
         "page": page,
         "page_size": page_size,
-        "items": [order_to_dict(db, order) for order in rows],
+        "items": [order_to_dict(db, order, waits.get(order.id)) for order in rows],
     }
 
 
-def order_to_dict(db: Session, order: Order) -> dict:
-    """订单对外字段（不含任何敏感信息）。"""
-    wait = order_wait_info(db, order)
+def order_to_dict(db: Session, order: Order, wait: dict | None = None) -> dict:
+    """订单对外字段（不含任何敏感信息）。wait 可由调用方批量算好后传入。"""
+    wait = wait or order_wait_info(db, order)
     return {
         "id": order.id,
         "order_no": order.order_no,

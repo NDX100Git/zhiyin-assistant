@@ -28,7 +28,7 @@ from app.services.order_state import (
 )
 from app.services.pricing import calc_amount_cents
 from app.services.printer import get_printer_provider
-from app.services.queue_service import order_wait_info
+from app.services.queue_service import batch_wait_info, order_wait_info
 from app.services.session_service import get_or_create_session
 from app.services.storage import get_storage
 from app.utils.exceptions import BusinessError
@@ -46,9 +46,9 @@ def get_order(db: Session, order_id: int) -> Order:
     return order
 
 
-def order_admin_view(db: Session, order: Order) -> dict:
-    """老师端订单视图：含打印参数与排队信息。"""
-    wait = order_wait_info(db, order)
+def order_admin_view(db: Session, order: Order, wait: dict | None = None) -> dict:
+    """老师端订单视图：含打印参数与排队信息。wait 可由调用方批量算好后传入。"""
+    wait = wait or order_wait_info(db, order)
     return {
         "id": order.id,
         "order_no": order.order_no,
@@ -97,11 +97,12 @@ def queue_list(db: Session, status: str | None = None, keyword: str | None = Non
             .limit(page_size)
         ).scalars()
     )
+    waits = batch_wait_info(db, rows)
     return {
         "total": int(total),
         "page": page,
         "page_size": page_size,
-        "items": [order_admin_view(db, order) for order in rows],
+        "items": [order_admin_view(db, order, waits.get(order.id)) for order in rows],
     }
 
 
