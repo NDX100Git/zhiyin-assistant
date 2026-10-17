@@ -26,6 +26,22 @@ function buildHeader(auth = true) {
   return header
 }
 
+/**
+ * 上传专用的请求头。
+ *
+ * 注意：不能带 Content-Type: application/json。文件上传必须由浏览器/运行时
+ * 自动生成 multipart/form-data 及 boundary，否则后端收不到 file 字段
+ * （会报「参数校验失败：file 字段要求」）。
+ */
+function buildUploadHeader() {
+  const header = {}
+  const token = getToken()
+  if (token) {
+    header.Authorization = `Bearer ${token}`
+  }
+  return header
+}
+
 function parseBody(raw) {
   if (typeof raw === 'string') {
     try {
@@ -73,7 +89,7 @@ export function uploadFile(filePath, fileName) {
       url: `${API_BASE_URL}/api/file/upload`,
       filePath,
       name: 'file',
-      header: buildHeader(true),
+      header: buildUploadHeader(),
       formData: { file_name: fileName || '' },
       timeout: 120000,
       success(response) {

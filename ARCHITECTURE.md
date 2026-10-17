@@ -189,7 +189,7 @@ check 报告 + 用户勾选的 issue_ids
 |---|---|
 | `services/doc_parser.py` | 下载文件 → Office 转 PDF → PyMuPDF 解析（页数/文本/图片/页边距/空白页/章节/参考文献/排版属性）→ `ai_reports` 缓存 |
 | `services/format_rules_engine.py` | 规则引擎：空白页、图片越界、页边距偏差、结构缺失/乱序、字体字号行距 |
-| `services/format_checker.py` | 组装提示词、调模型、合并规则与 AI 结果、排序去重、缓存 |
+| `services/format_checker.py` | 组装提示词、调模型、合并规则与 AI 结果、排序去重、缓存；按 paper/slide/sheet 选择检查口径 |
 | `services/proofreader.py` | 分块（默认 2500 字）、`asyncio.gather` 限流 3 路、进度回调、合并去重 |
 | `services/print_planner.py` | 文档特征、模型推荐、方案校验、服务端算纸张与金额 |
 | `services/doc_fixer.py` | actions 校验 + python-docx 执行 + 生成副本 + 序号保留 |
@@ -285,6 +285,7 @@ abnormal    --关闭--> cancelled（仅老师）
 
 | 现象 | 原因 | 解决 |
 |---|---|---|
+| H5 上传报 `file 字段要求` | `uni.uploadFile` 被设置了 `Content-Type: application/json`，缺 multipart boundary | 上传请求头不要手动设置 Content-Type |
 | `soffice --version` / 转换卡死 | `subprocess.PIPE` 被后台子进程占住 | 输出重定向到日志文件 |
 | 转换报 `source file could not be loaded` | `TMP/TEMP` 指向含中文的用户目录 | 子进程显式使用纯 ASCII 临时目录 |
 | 转换一夜之间"坏了" | 多个 soffice 实例/残留 profile | 每次转换独立 `-env:UserInstallation` |

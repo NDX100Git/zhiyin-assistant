@@ -15,10 +15,10 @@
 
 最近一次验证（2026-10-17）：
 
-- 后端 `pytest -q`：**78+ passed**（阶段 6 结束时 74 条，补充排版属性检查后新增 4 条）
+- 后端 `pytest -q`：**82 passed**
 - 后端 `ruff check`：全绿
 - 学生端 `npm run build:h5`：构建成功
-- 学生端 Edge 真浏览器冒烟：首页 / 下单 / AI 体检报告 / 打印方案 / 我的，**0 控制台错误**
+- 学生端 Edge 真浏览器冒烟：首页 / 下单 / 上传真实 PPT / AI 体检报告 / 打印方案 / 我的，**0 控制台错误**
 - DeepSeek 连通性（`backend/test_llm.py`）：普通对话 / JSON 模式 / 思考模式全部通过
 - 多模态 OCR：真实识别中文图片成功（确认 `deepseek-flash` 支持图片输入）
 
@@ -93,6 +93,16 @@ npm.cmd run dev:h5
 13. **LibreOffice 子进程环境**：显式把 `TMP/TEMP` 指向纯 ASCII 目录，且**不能用 `subprocess.PIPE`**（会因后台子进程继承管道而永久阻塞）。详见 `doc_parser.convert_to_pdf`。
 14. **学生端先 H5**：用户是前端新手，开发期用 HBuilderX「运行到浏览器」看效果；CLI 项目（`student-app`）已本地构建通过。
 15. **接口地址可配置**：`.env.development` 用 `http://127.0.0.1:8000`（浏览器预览），`.env.production` 用局域网 IP（真机/APK）。
+16. **按文档类型选择体检口径**：`format_checker.detect_profile()` 区分 paper（pdf/doc/docx）、slide（ppt/pptx）、sheet（xls/xlsx）。论文套用结构与参考文献规则；PPT/表格只做版式检查，避免报"缺摘要/缺参考文献"这类无意义问题。报告里带 `profile` 与 `profile_note`。
+
+---
+
+## 4.1 近期修复记录（防止回归）
+
+| 日期 | 问题 | 原因 | 修复 |
+|---|---|---|---|
+| 2026-10-17 | H5 上传报"参数校验失败：file 字段要求" | `uni.uploadFile` 被强行带上 `Content-Type: application/json`，浏览器无法生成 multipart boundary | 上传专用请求头只带 Authorization，交给运行时设置 Content-Type；`api.js` 已加注释警示 |
+| 2026-10-17 | PPT 体检误报"缺摘要/缺参考文献" | 所有文档都套用了论文结构规则 | 新增 paper/slide/sheet 口径；PPT 只检查版式（图片越界、空白页） |
 
 ---
 

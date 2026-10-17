@@ -8,6 +8,8 @@ from app.models.ai_report import AiReport
 from app.services.format_checker import (
     build_structure_messages,
     check_format,
+    detect_profile,
+    effective_rules,
     merge_issues,
 )
 from app.services.format_rules_engine import collect_facts, typography_issues
@@ -242,3 +244,45 @@ def test_排版属性符合参考值时不报问题():
 def test_正文字数不足时不做排版判断():
     parsed = {"typography": {"available": False, "sampled_chars": 20}}
     assert typography_issues(parsed, _rules()) == []
+
+
+def test_按文档类型选择检查口径():
+    assert detect_profile("files/2026/10/a.pdf") == "paper"
+    assert detect_profile("files/2026/10/a.docx") == "paper"
+    assert detect_profile("files/2026/10/a.pptx") == "slide"
+    assert detect_profile("files/2026/10/a.xlsx") == "sheet"
+
+    slide_rules = effective_rules(_rules(), "slide")
+    assert slide_rules["structure"]["required"] == []
+    assert slide_rules["page"] == {}
+    assert slide_rules["typography"] == {}
+    # 原始规则不被修改
+    assert _rules()["structure"]["required"]
+
+
+def test_演示文稿不报缺摘要缺参考文献(db_session, monkeypatch):
+    monkeypatch.setattr("app.services.format_checker.parse_document", lambda db, key: _parsed())
+    calls: list[dict] = []
+
+    def fake_chat(messages, thinking=False):
+        calls.append({"messages": messages})
+        return {
+            "issues": [
+                {
+                    "type": "layout",
+                    "severity": "medium",
+                    "location": "第 1 页",
+                    "original": "图片超出幻灯片边界",
+                    "suggestion": "建议缩小图片",
+                    "reason": "演示时可能被裁切",
+                }
+            ]
+        }
+
+    monkeypatch.setattr("app.services.format_checker.chat_json", fake_chat)
+
+    report = check_format(db_session, "files/2026/10/deck.pptx")
+    assert report["profile"] == "slide"
+    assert report["profile_note"]
+    assert len(calls) == 1  # 只跑版式诊断，不跑结构与参考文献
+    assert not any(issue["type"] in {"structure", "reference"} for issue in report["issues"])

@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -22,6 +23,7 @@ from app.services.doc_parser import get_cached_report, parse_document, save_repo
 from app.services.format_rules_engine import collect_facts
 from app.services.llm import chat_json
 from app.utils.exceptions import BusinessError
+from app.utils.filetype import normalize_ext
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,11 @@ SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 SEVERITY_LABELS = {"high": "高", "medium": "中", "low": "低"}
 MAX_REFERENCE_ITEMS = 60
 MAX_REFERENCE_CHARS = 300
+
+# 论文 / 演示文稿 / 表格使用不同的检查口径：
+# 论文套用 GB/T 7713.1 结构规则；PPT 和表格只做版式检查，不能报"缺摘要/缺参考文献"
+SLIDE_EXTS = {"ppt", "pptx"}
+SHEET_EXTS = {"xls", "xlsx"}
 
 # 模型对"整篇文档"的位置描述不固定，统一归一到「全文」，避免与规则结果重复
 GLOBAL_LOCATIONS = {"全文", "整篇", "整篇论文", "论文整体", "论文整体结构", "文档整体", "全文结构"}
@@ -238,6 +245,35 @@ def _summary_text(issues: list[dict]) -> str:
     )
 
 
+def detect_profile(file_key: str) -> str:
+    ext = normalize_ext(file_key)
+    if ext in SLIDE_EXTS:
+        return "slide"
+    if ext in SHEET_EXTS:
+        return "sheet"
+    return "paper"
+
+
+def effective_rules(rules: dict, profile: str) -> dict:
+    """按文档类型调整规则：非论文不检查结构/参考文献/页边距/正文排版。"""
+    if profile == "paper":
+        return rules
+
+    adjusted = copy.deepcopy(rules)
+    adjusted["structure"] = {"required": [], "order": [], "_source": "not_applicable"}
+    adjusted["page"] = {}
+    adjusted["typography"] = {}
+    adjusted["reference"] = {"standard": rules.get("reference", {}).get("standard"), "checks": []}
+    return adjusted
+
+
+PROFILE_NOTES = {
+    "paper": "",
+    "slide": "演示文稿按版式检查：不套用论文的结构与参考文献规范，重点看图片越界与空白页。",
+    "sheet": "表格文档按基础版式检查：不套用论文结构与参考文献规范。",
+}
+
+
 # ---------------------------------------------------------------- 对外入口
 def check_format(db: Session, file_key: str, force: bool = False) -> dict:
     """对文档做格式与版式体检，返回结构化问题清单（只作建议）。"""
@@ -249,17 +285,19 @@ def check_format(db: Session, file_key: str, force: bool = False) -> dict:
             logger.info("命中体检缓存：%s", file_key)
             return cached
 
-    rules = get_format_rules()
+    profile = detect_profile(file_key)
+    rules = effective_rules(get_format_rules(), profile)
     parsed = parse_document(db, file_key)
 
     facts = collect_facts(parsed, rules)
     ai_issues: list[dict] = []
     ai_errors: list[str] = []
 
-    tasks = (
-        ("格式合规校验", build_structure_messages(rules, parsed), "reference"),
-        ("版式问题诊断", build_layout_messages(rules, parsed, facts), "layout"),
-    )
+    tasks = []
+    if profile == "paper":
+        tasks.append(("格式合规校验", build_structure_messages(rules, parsed), "reference"))
+    if profile in {"paper", "slide"}:
+        tasks.append(("版式问题诊断", build_layout_messages(rules, parsed, facts), "layout"))
     for task_name, messages, issue_type in tasks:
         try:
             raw = chat_json(messages, thinking=True)
@@ -276,6 +314,8 @@ def check_format(db: Session, file_key: str, force: bool = False) -> dict:
     }
     report = {
         "file_key": file_key,
+        "profile": profile,
+        "profile_note": PROFILE_NOTES.get(profile, ""),
         "page_count": parsed.get("page_count"),
         "sections": parsed.get("sections", []),
         "reference_count": len(parsed.get("references", [])),
