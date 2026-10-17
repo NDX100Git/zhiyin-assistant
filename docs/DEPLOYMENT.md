@@ -8,9 +8,9 @@
 
 | 组件 | 位置 |
 |---|---|
-| MySQL 8.0.29 | `G:\deepseek\.toolchain\mysql8`（免安装） |
-| MinIO | `G:\deepseek\.toolchain\minio\minio.exe`，数据 `G:\deepseek\.minio-data` |
-| LibreOffice 26.2.6 | `G:\deepseek\.toolchain\libreoffice` |
+| MySQL 8.0.29 | `backend/.tools/mysql8`（或环境变量 `ZHIYIN_MYSQL_ROOT`） |
+| MinIO | `backend/.tools/minio/minio.exe`（或 `ZHIYIN_MINIO_EXE`），数据 `backend/.data/minio` |
+| LibreOffice | 由 `SOFFICE_PATH` 配置（本机可为解压目录） |
 | 后端 venv | `backend/.venv` |
 
 启动：

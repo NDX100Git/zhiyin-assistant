@@ -1,6 +1,7 @@
 @echo off
-set TMP=G:\deepseek\.tmp
-set TEMP=G:\deepseek\.tmp
+set "TMP=%~dp0..\.runtime\tmp"
+set "TEMP=%TMP%"
+if not exist "%TMP%" mkdir "%TMP%"
 cd /d "%~dp0"
 call npm.cmd run build
 pause

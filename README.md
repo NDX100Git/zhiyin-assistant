@@ -14,7 +14,7 @@
 - [docs/PACKAGING.md](docs/PACKAGING.md)：H5 / 微信小程序 / APK 打包
 - [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)：本机与服务器部署、安全清单、排障
 - [docs/INSTALL.md](docs/INSTALL.md)：评委安装说明与演示流程
-- [docs/HANDOFF.md](docs/HANDOFF.md)：原始需求规格
+- [docs/ORIGINAL_SPEC.md](docs/ORIGINAL_SPEC.md)：原始需求规格
 
 ---
 
@@ -72,8 +72,8 @@ zhiyin-assistant/
 
 | 组件 | 版本 | 说明 |
 |---|---|---|
-| Python | 3.11+ | 本机开发环境为 `E:\python\python.exe`（3.14.7） |
-| MySQL | 8.x | 本机使用免安装版，装在 `G:\deepseek\.toolchain\mysql8` |
+| Python | 3.11+ | 用系统 Python 创建 venv（本机验证 3.14.7） |
+| MySQL | 8.x | 免安装版默认解压到 `backend\.tools\mysql8` |
 | MinIO | 最新版 | 阶段 2 使用，可本机安装或用 docker-compose |
 | LibreOffice | 7.x+ | 阶段 5-A 使用，可本机安装或用 docker-compose |
 | Docker | 可选 | 装了就用 compose 起 MySQL + MinIO + LibreOffice |
@@ -82,7 +82,7 @@ zhiyin-assistant/
 
 ## 快速开始（本机免安装 MySQL 路线）
 
-以下命令在 `G:\deepseek\zhiyin-assistant` 目录下执行。
+以下命令在项目根目录（`zhiyin-assistant`）下执行。
 
 **1. 初始化并启动 MySQL（首次执行 init，之后只需 start）**
 
@@ -92,13 +92,13 @@ powershell -ExecutionPolicy Bypass -File backend\scripts\dev_mysql.ps1 start
 powershell -ExecutionPolicy Bypass -File backend\scripts\dev_mysql.ps1 create-db
 ```
 
-免安装版 MySQL 位于 `G:\deepseek\.toolchain\mysql8`，数据目录为其中的 `data\`，
-开发用 root 密码为 `zhiyin_dev_2026`（见 `backend/.env`，仅本机开发使用）。
+免安装版 MySQL 默认位于 `backend\.tools\mysql8`，数据目录为其中的 `data\`；
+root 密码从 `backend/.env` 的 `DB_PASSWORD` 读取（脚本不会在代码里写死）。
 
 **2. 创建虚拟环境并安装依赖**
 
 ```powershell
-E:\python\python.exe -m venv backend\.venv
+python -m venv backend\.venv
 backend\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt      # 运行依赖
 backend\.venv\Scripts\python.exe -m pip install -r backend\requirements-dev.txt  # 开发依赖（部署时不需要）
 ```
@@ -106,7 +106,7 @@ backend\.venv\Scripts\python.exe -m pip install -r backend\requirements-dev.txt 
 若 `venv` 创建时 `ensurepip` 报错、或 `pip` 命令在受限环境里不可用，改用基础解释器的 pip 直接装进 venv：
 
 ```powershell
-E:\python\python.exe -m pip --python backend\.venv\Scripts\python.exe install -r backend\requirements.txt
+python -m pip --python backend\.venv\Scripts\python.exe install -r backend\requirements.txt
 ```
 
 注意：本机 Python 装在 E 盘、venv 在 G 盘，个别受限终端里 venv 可能加载不了 `_ssl`。
@@ -150,7 +150,7 @@ powershell -ExecutionPolicy Bypass -File backend\scripts\dev_minio.ps1 status   
 powershell -ExecutionPolicy Bypass -File backend\scripts\dev_minio.ps1 stop     # 停止
 ```
 
-MinIO 控制台：<http://127.0.0.1:9001>；数据目录 `G:\deepseek\.minio-data`（已加入 .gitignore）。
+MinIO 控制台：<http://127.0.0.1:9001>；数据目录默认 `backend\.data\minio`（已加入 .gitignore）。
 
 **7. 跑测试**
 
@@ -169,7 +169,7 @@ npm.cmd install           # 只需首次
 npm.cmd run dev           # 或直接双击 teacher-web\dev.cmd
 ```
 
-打开 <http://127.0.0.1:5174>，用 `backend/.env` 里的管理员账号登录（默认 `admin` / `admin_dev_2026`）。
+打开 <http://127.0.0.1:5174>，用 `backend/.env` 里的 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 登录。
 
 > 若 `npm run dev/build` 报 esbuild `Access is denied`，请用 `dev.cmd` / `build.cmd`
 > （内部把 TMP/TEMP 指到纯英文目录）。
@@ -187,17 +187,16 @@ cd backend
 
 **9. LibreOffice（阶段 5-A 起需要）**
 
-本机当前没有管理员权限，因此用 MSI 的「管理安装」把 LibreOffice 解包到
-`G:\deepseek\.toolchain\libreoffice`，并在 `backend/.env` 配置：
+安装 LibreOffice（Windows 标准安装即可），然后在 `backend/.env` 配置：
 
 ```ini
-SOFFICE_PATH=G:\deepseek\.toolchain\libreoffice\program\soffice.exe
+SOFFICE_PATH=C:\Program Files\LibreOffice\program\soffice.exe
 SOFFICE_TIMEOUT_SECONDS=180
 ```
 
 若换机器且能正常安装，路径通常是 `C:\Program Files\LibreOffice\program\soffice.exe`。
 
-> ⚠️ 踩坑记录：本机用户目录含中文（`C:\Users\纳指GO\...`），当子进程的 `TMP`/`TEMP`
+> ⚠️ 踩坑记录：当 Windows 用户目录或项目路径含中文时，子进程的 `TMP`/`TEMP`
 > 指向该中文路径时，LibreOffice 会报 `Error: source file could not be loaded` 而无法转换。
 > `doc_parser.convert_to_pdf` 已显式把子进程的 `TMP`/`TEMP` 指向纯 ASCII 目录来规避；
 > 另外不要用 `subprocess.PIPE` 捕获 soffice 输出——它会派生后台进程占住管道导致永久阻塞，

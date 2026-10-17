@@ -25,7 +25,7 @@ VITE_API_BASE_URL=http://电脑局域网IP:8000
 
 1. 打开 HBuilderX。
 2. 菜单「文件」→「导入」→「从本地目录导入」。
-3. 选择目录：`G:\deepseek\zhiyin-assistant\student-app`。
+3. 选择目录：项目根目录下的 `student-app`。
 4. 导入后打开 `src/manifest.json`。
 
 需要确认的配置：

@@ -3,7 +3,8 @@
   智印助手本地开发用 MySQL 8（免安装版）管理脚本。
 
 .DESCRIPTION
-  免安装版 MySQL 解压在 .toolchain\mysql8 下，数据目录为 .toolchain\mysql8\data。
+  免安装版 MySQL 默认解压在 backend\.tools\mysql8，数据目录为其下的 data。
+  可通过环境变量 ZHIYIN_MYSQL_ROOT 指定其他位置。
   仅用于本机开发演示，不涉及任何线上数据。
 
 .EXAMPLE
@@ -16,13 +17,35 @@ param(
   [ValidateSet('init', 'start', 'stop', 'status', 'create-db', 'apply-schema', 'shell')]
   [string]$Action,
 
-  [string]$MysqlRoot = $(if ($env:ZHIYIN_MYSQL_ROOT) { $env:ZHIYIN_MYSQL_ROOT } else { 'G:\deepseek\.toolchain\mysql8' }),
+  [string]$MysqlRoot = '',
   [int]$Port = 3306,
-  [string]$RootPassword = 'zhiyin_dev_2026',
+  [string]$RootPassword = '',
   [string]$Database = 'zhiyin'
 )
 
 $ErrorActionPreference = 'Stop'
+
+$backendDir = Split-Path -Parent $PSScriptRoot
+if (-not $MysqlRoot) {
+  $MysqlRoot = if ($env:ZHIYIN_MYSQL_ROOT) { $env:ZHIYIN_MYSQL_ROOT } else { Join-Path $backendDir '.tools\mysql8' }
+}
+
+function Read-EnvValue([string]$key) {
+  $envFile = Join-Path $backendDir '.env'
+  if (-not (Test-Path -LiteralPath $envFile)) { return '' }
+  $line = Get-Content -LiteralPath $envFile -Encoding UTF8 |
+    Where-Object { $_ -match "^\s*$key\s*=" } |
+    Select-Object -Last 1
+  if (-not $line) { return '' }
+  return ($line -split '=', 2)[1].Trim()
+}
+
+if (-not $RootPassword) {
+  $RootPassword = if ($env:DB_PASSWORD) { $env:DB_PASSWORD } else { Read-EnvValue 'DB_PASSWORD' }
+}
+if (-not $RootPassword -and $Action -in @('create-db', 'stop', 'apply-schema', 'shell')) {
+  throw "未配置 DB_PASSWORD：请先复制 backend/.env.example 为 backend/.env 并填写 DB_PASSWORD"
+}
 
 $dataDir    = Join-Path $MysqlRoot 'data'
 $logDir     = Join-Path $MysqlRoot 'logs'

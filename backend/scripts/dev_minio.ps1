@@ -3,8 +3,9 @@
   智印助手本地开发用 MinIO 管理脚本（Windows 免安装二进制版）。
 
 .DESCRIPTION
-  MinIO 可执行文件放在 .toolchain\minio\minio.exe，数据目录默认为项目内的 .minio-data。
-  仅用于本机开发演示。
+  MinIO 默认放在 backend\.tools\minio\minio.exe，数据目录默认 backend\.data\minio。
+  可通过 ZHIYIN_MINIO_EXE / ZHIYIN_MINIO_DATA 覆盖。
+  账号密码从 backend/.env 的 MINIO_ACCESS_KEY / MINIO_SECRET_KEY 读取。
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\dev_minio.ps1 start
@@ -15,17 +16,45 @@ param(
   [ValidateSet('start', 'stop', 'status', 'bucket')]
   [string]$Action,
 
-  [string]$MinioExe = $(if ($env:ZHIYIN_MINIO_EXE) { $env:ZHIYIN_MINIO_EXE } else { 'G:\deepseek\.toolchain\minio\minio.exe' }),
-  [string]$DataDir = $(if ($env:ZHIYIN_MINIO_DATA) { $env:ZHIYIN_MINIO_DATA } else { 'G:\deepseek\.minio-data' }),
+  [string]$MinioExe = '',
+  [string]$DataDir = '',
   [int]$Port = 9000,
   [int]$ConsolePort = 9001,
-  [string]$AccessKey = 'minioadmin',
-  [string]$SecretKey = 'minioadmin',
+  [string]$AccessKey = '',
+  [string]$SecretKey = '',
   [string]$Bucket = 'zhiyin-files'
 )
 
 $ErrorActionPreference = 'Stop'
 $backendDir = Split-Path -Parent $PSScriptRoot
+
+if (-not $MinioExe) {
+  $MinioExe = if ($env:ZHIYIN_MINIO_EXE) { $env:ZHIYIN_MINIO_EXE } else { Join-Path $backendDir '.tools\minio\minio.exe' }
+}
+if (-not $DataDir) {
+  $DataDir = if ($env:ZHIYIN_MINIO_DATA) { $env:ZHIYIN_MINIO_DATA } else { Join-Path $backendDir '.data\minio' }
+}
+
+function Read-EnvValue([string]$key) {
+  $envFile = Join-Path $backendDir '.env'
+  if (-not (Test-Path -LiteralPath $envFile)) { return '' }
+  $line = Get-Content -LiteralPath $envFile -Encoding UTF8 |
+    Where-Object { $_ -match "^\s*$key\s*=" } |
+    Select-Object -Last 1
+  if (-not $line) { return '' }
+  return ($line -split '=', 2)[1].Trim()
+}
+
+if (-not $AccessKey) {
+  $AccessKey = if ($env:MINIO_ACCESS_KEY) { $env:MINIO_ACCESS_KEY } else { Read-EnvValue 'MINIO_ACCESS_KEY' }
+}
+if (-not $SecretKey) {
+  $SecretKey = if ($env:MINIO_SECRET_KEY) { $env:MINIO_SECRET_KEY } else { Read-EnvValue 'MINIO_SECRET_KEY' }
+}
+if (-not $AccessKey -or -not $SecretKey) {
+  throw "未配置 MinIO 账号：请先复制 backend/.env.example 为 backend/.env 并填写 MINIO_ACCESS_KEY / MINIO_SECRET_KEY"
+}
+
 $logFile = Join-Path $DataDir 'minio.log'
 
 function Test-ServerUp {

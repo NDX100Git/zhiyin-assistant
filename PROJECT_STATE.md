@@ -2,7 +2,7 @@
 
 > 最后更新：2026-10-17
 > 阅读顺序建议：先看本文件了解"现在到哪了"，再看 [ARCHITECTURE.md](ARCHITECTURE.md) 了解"代码怎么组织"，
-> 最后按需查阅 [docs/HANDOFF.md](docs/HANDOFF.md)（原始需求规格，唯一需求来源）。
+> 最后按需查阅 [docs/ORIGINAL_SPEC.md](docs/ORIGINAL_SPEC.md)（原始需求规格，唯一需求来源）。
 
 ---
 
@@ -41,11 +41,11 @@
 
 | 组件 | 位置 / 版本 | 说明 |
 |---|---|---|
-| Python | `E:\python\python.exe`（3.14.7） | 用户指定用本机 3.14；需求文档写 3.11+，代码保持 3.11 兼容写法 |
-| 后端 venv | `backend/.venv` | 依赖已装齐（含 PyMuPDF、pdf2docx、minio、openai、pytest、ruff） |
-| MySQL | `G:\deepseek\.toolchain\mysql8`（8.0.29 免安装版） | 数据目录在 `mysql8\data`，root 密码见 `backend/.env` |
-| MinIO | `G:\deepseek\.toolchain\minio\minio.exe`（RELEASE.2025-09-07） | 数据目录 `G:\deepseek\.minio-data`（已 gitignore）；9000 API / 9001 控制台 |
-| LibreOffice | `G:\deepseek\.toolchain\libreoffice`（26.2.6，MSI 管理安装解包） | 路径由 `SOFFICE_PATH` 配置，非硬编码 |
+| Python | Python 3.11+（本机验证 3.14.7） | 用系统 Python 创建 `backend/.venv`，路径因机器而异 |
+| 后端 venv | `backend/.venv` | 依赖版本见 `backend/requirements.txt`（已锁定） |
+| MySQL | `backend/.tools/mysql8`（可用 `ZHIYIN_MYSQL_ROOT` 覆盖） | 免安装版；数据目录在 `mysql8\data`；密码见 `backend/.env` |
+| MinIO | `backend/.tools/minio/minio.exe`（可用 `ZHIYIN_MINIO_EXE` 覆盖） | 数据目录 `backend/.data/minio`；9000 API / 9001 控制台 |
+| LibreOffice | 路径由 `SOFFICE_PATH` 配置 | Windows 默认 `C:\Program Files\LibreOffice\program\soffice.exe` |
 | H5 开发服务器 | <http://127.0.0.1:5173> | `npm run dev:h5`，当前在运行 |
 | 老师端 Web | <http://127.0.0.1:5174> | `npm.cmd run dev` 或双击 `teacher-web/dev.cmd`，当前在运行 |
 | 后端 API | <http://127.0.0.1:8000>（监听 0.0.0.0:8000） | `/docs` 可交互调试 |
@@ -133,7 +133,7 @@ npm.cmd run dev:h5
 | APK 尚未生成 | 云打包需要 DCloud 账号登录并手动点击；appid 仍是占位值 | 按 `docs/PACKAGING.md` 操作：换 appid → 选图标 → 云打包；安装说明见 `docs/INSTALL.md` |
 | LibreOffice 用 MSI 管理安装解包 | 非标准安装方式，个别功能可能受限 | headless 转换已实测可用；若换机能正常安装，改 `SOFFICE_PATH` 即可 |
 | 用户目录含中文导致 soffice 失败 | 转换报 `source file could not be loaded` | 已在代码中覆盖子进程 TMP/TEMP 为 ASCII 目录规避 |
-| 老师端 `npm run build/dev` 报 esbuild Access denied | esbuild 在中文 TEMP 目录清理临时文件失败 | `teacher-web/dev.cmd` / `build.cmd` 已把 TMP/TEMP 指向 `G:\deepseek\.tmp`；也可手动设置环境变量 |
+| 老师端 `npm run build/dev` 报 esbuild Access denied | esbuild 在中文 TEMP 目录清理临时文件失败 | `teacher-web/dev.cmd` / `build.cmd` 已把 TMP/TEMP 指向项目内 `.runtime\tmp`；也可手动设置环境变量 |
 | 页边距由文本块坐标推算 | 上边距会受标题段前距影响偏大 | 上边距容差放宽到 1cm，且标记为 `common` 非强制参考值 |
 | PDF 中图片颜色判断依赖 colorspace | 灰度扫描件可能被当成彩色/灰度误判 | 仅作打印方案特征，学生可手动改颜色 |
 | PDF 转 Word 对扫描件效果差 | 扫描版 PDF 转出的文字可能为空 | 接口 note 已提示"扫描件请先 OCR"；后续可自动检测文本层 |
@@ -173,4 +173,4 @@ cd ..\student-app
 npm.cmd run build:h5
 ```
 
-阶段验收用的真实链路脚本（一次性，未入库）在 `G:\deepseek\.tmp\acceptance_*.py`。
+阶段验收用的一次性脚本不入库，交付包中不包含。

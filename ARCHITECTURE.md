@@ -35,7 +35,7 @@ zhiyin-assistant/
 ├─ PROJECT_STATE.md              项目进度、决策、已知问题（每阶段更新）
 ├─ ARCHITECTURE.md               本文件
 ├─ README.md                     启动与工程约定
-├─ docs/HANDOFF.md               原始需求规格（唯一需求来源）
+├─ docs/ORIGINAL_SPEC.md         原始需求规格（唯一需求来源）
 ├─ docs/PACKAGING.md             APK / 小程序 / H5 打包步骤
 ├─ docs/DEPLOYMENT.md            本机与服务器部署、安全清单、排障
 ├─ docs/INSTALL.md               评委安装说明与 60 秒演示流程

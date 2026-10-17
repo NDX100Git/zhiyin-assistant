@@ -18,8 +18,8 @@ API 地址通过 `.env.development` / `.env.production` 的 `VITE_API_BASE_URL` 
 代码里没有硬编码。**真机不能填 127.0.0.1**（那指向手机自己），要填电脑的局域网 IP：
 
 ```ini
-VITE_API_BASE_URL=http://127.0.0.1:8000   # H5 在电脑浏览器预览
-VITE_API_BASE_URL=http://10.127.23.62:8000 # 真机调试时改成电脑局域网 IP
+VITE_API_BASE_URL=http://127.0.0.1:8000      # H5 在电脑浏览器预览
+VITE_API_BASE_URL=http://192.168.1.100:8000  # 真机调试：改成电脑局域网 IP（ipconfig 查看）
 ```
 
 换网络后记得同步修改，并让后端监听 `0.0.0.0`：

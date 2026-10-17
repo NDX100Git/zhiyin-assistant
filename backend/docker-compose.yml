@@ -2,7 +2,7 @@
 #
 # 说明：本机开发也可以不用 Docker，直接用免安装版 MySQL + 本机 MinIO。
 # 在 backend/ 目录执行：docker compose up -d
-# compose 会自动读取同目录下的 .env（不存在时使用下面的默认值）。
+# compose 会自动读取同目录下的 .env；数据库与 MinIO 密码必须在 .env 中设置，不提供默认值。
 
 services:
   mysql:
@@ -10,7 +10,7 @@ services:
     container_name: zhiyin-mysql
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-zhiyin_dev_2026}
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:?请先在 backend/.env 设置 DB_PASSWORD}
       MYSQL_DATABASE: ${DB_NAME:-zhiyin}
       TZ: Asia/Shanghai
     command:
@@ -23,7 +23,7 @@ services:
       - mysql-data:/var/lib/mysql
       - ./schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${DB_PASSWORD:-zhiyin_dev_2026}"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${DB_PASSWORD:?请先在 backend/.env 设置 DB_PASSWORD}"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -34,8 +34,8 @@ services:
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?请先在 backend/.env 设置 MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?请先在 backend/.env 设置 MINIO_SECRET_KEY}
     ports:
       - "9000:9000"
       - "9001:9001"

@@ -10,10 +10,7 @@ npm.cmd run dev
 
 打开 <http://127.0.0.1:5174>。
 
-默认管理员账号在 `backend/.env`：
-
-- 用户名：`admin`
-- 密码：`admin_dev_2026`
+管理员账号在 `backend/.env` 的 `ADMIN_USERNAME` / `ADMIN_PASSWORD`。
 
 接口地址通过 `.env.development` 的 `VITE_API_BASE_URL` 配置，默认 `http://127.0.0.1:8000`。
 
