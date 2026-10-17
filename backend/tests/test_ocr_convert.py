@@ -7,6 +7,7 @@ from pathlib import Path
 
 import fitz
 import pytest
+from _cjk_font import cjk_font_args
 from docx import Document
 from sqlalchemy import func, select
 
@@ -16,17 +17,12 @@ from app.services.ocr import ocr_image
 from app.services.storage import build_object_key
 from app.utils.exceptions import BusinessError
 
-CJK_FONT = Path(r"C:\Windows\Fonts\simsun.ttc")
-
 
 def _make_png(path: Path, text: str = "论文格式体检") -> Path:
     """生成一张带中文文字的图片，用于 OCR 流程测试。"""
     with fitz.open() as doc:
         page = doc.new_page(width=400, height=200)
-        if CJK_FONT.exists():
-            page.insert_text((30, 100), text, fontsize=24, fontfile=str(CJK_FONT), fontname="simsun")
-        else:
-            page.insert_text((30, 100), text, fontsize=24, fontname="china-s")
+        page.insert_text((30, 100), text, fontsize=24, **cjk_font_args())
         pix = page.get_pixmap(dpi=150)
         pix.save(str(path))
     return path
@@ -35,17 +31,13 @@ def _make_png(path: Path, text: str = "论文格式体检") -> Path:
 def _make_pdf(path: Path) -> Path:
     with fitz.open() as doc:
         page = doc.new_page()
-        if CJK_FONT.exists():
-            page.insert_text((72, 100), "摘要", fontsize=16, fontfile=str(CJK_FONT), fontname="simsun")
-            page.insert_text(
-                (72, 130),
-                "本文研究论文格式检查方法。",
-                fontsize=12,
-                fontfile=str(CJK_FONT),
-                fontname="simsun",
-            )
-        else:
-            page.insert_text((72, 100), "Abstract", fontsize=16)
+        page.insert_text((72, 100), "摘要", fontsize=16, **cjk_font_args())
+        page.insert_text(
+            (72, 130),
+            "本文研究论文格式检查方法。",
+            fontsize=12,
+            **cjk_font_args(),
+        )
         doc.save(str(path))
     return path
 

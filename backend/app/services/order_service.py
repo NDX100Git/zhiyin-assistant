@@ -6,15 +6,16 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import get_order_rules
 from app.models.order import Order
 from app.models.payment_log import PaymentLog
+from app.models.queue_session import QueueSession
 from app.models.user import User
 from app.services.notifier import get_notifier
 from app.services.order_state import (
@@ -33,30 +34,39 @@ from app.utils.exceptions import BusinessError
 
 logger = logging.getLogger(__name__)
 
-MAX_ORDER_NO_ATTEMPTS = 5
+def _next_daily_seq(db: Session, day: date) -> int:
+    """取当日的下一个序号，订单号与取件码共用它。
+
+    `INSERT ... ON DUPLICATE KEY UPDATE` 在 MySQL 上是一条语句完成的原子自增，
+    行锁持有到事务结束，同一刻的并发请求会排队，不会读到同一个数，也不需要失败重试。
+    """
+    db.execute(
+        text(
+            "INSERT INTO order_daily_seq (day, last_seq) VALUES (:day, 1) "
+            "ON DUPLICATE KEY UPDATE last_seq = last_seq + 1"
+        ),
+        {"day": day},
+    )
+    return int(
+        db.execute(
+            text("SELECT last_seq FROM order_daily_seq WHERE day = :day"), {"day": day}
+        ).scalar_one()
+    )
 
 
-def _day_start(now: datetime) -> datetime:
-    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+def build_pickup_code(seq: int, day: date) -> str:
+    """取件码：日期前缀加当日顺序，如 261017-A-01。
 
-
-def _next_daily_seq(db: Session, now: datetime) -> int:
-    """当日序号：已有订单数 + 1。配合 order_no 唯一索引与失败重试保证唯一。"""
-    total = db.execute(
-        select(func.count()).select_from(Order).where(Order.created_at >= _day_start(now))
-    ).scalar_one()
-    return int(total) + 1
-
-
-def build_pickup_code(seq: int) -> str:
-    """按当日顺序生成取件码，如 A-01、B-12。"""
+    日期必须进码。只写 A-01 则每天从头开始，跳天就撞；只写月日则每年同日还会撞，
+    唯一索引会在明年那天直接挡住下单。
+    """
     rules = get_order_rules()["pickup_code"]
     letters = str(rules["letters"])
     per_letter = int(rules["numbers_per_letter"])
     letter_index, number = divmod(seq - 1, per_letter)
     if letter_index >= len(letters):
         raise BusinessError("今日取件码已用完，请明天再来", code=40051)
-    return f"{letters[letter_index]}-{number + 1:02d}"
+    return f"{day:%y%m%d}-{letters[letter_index]}-{number + 1:02d}"
 
 
 def _validate_create(payload, limits: dict) -> None:
@@ -92,43 +102,45 @@ def create_order(db: Session, user: User, payload) -> Order:
     )
 
     now = datetime.now()  # 服务端时间
-    order: Order | None = None
-    for attempt in range(1, MAX_ORDER_NO_ATTEMPTS + 1):
-        seq = _next_daily_seq(db, now)
-        candidate = Order(
-            order_no=f"{now:%m%d}-{seq:03d}",
-            pickup_code=build_pickup_code(seq),
-            user_id=user.id,
-            status=STATUS_PENDING_PAY,
-            file_key=payload.file_key,
-            file_name=payload.file_name,
-            page_count=payload.page_count,
-            print_side=payload.print_side,
-            color_mode=payload.color_mode,
-            copies=payload.copies,
-            paper_size=payload.paper_size,
-            amount_cents=amount_cents,
-            remark=payload.remark,
-            site_id=1,
-        )
-        db.add(candidate)
-        try:
-            db.flush()
-        except IntegrityError:
-            db.rollback()
-            logger.warning("订单号冲突，第 %d 次重试", attempt)
-            continue
-        order = candidate
-        break
-
-    if order is None:
-        raise BusinessError("订单号生成失败，请稍后重试", code=50020)
+    day = now.date()
+    seq = _next_daily_seq(db, day)
+    order = Order(
+        order_no=f"{day:%y%m%d}-{seq:03d}",
+        pickup_code=build_pickup_code(seq, day),
+        user_id=user.id,
+        status=STATUS_PENDING_PAY,
+        file_key=payload.file_key,
+        file_name=payload.file_name,
+        page_count=payload.page_count,
+        print_side=payload.print_side,
+        color_mode=payload.color_mode,
+        copies=payload.copies,
+        paper_size=payload.paper_size,
+        amount_cents=amount_cents,
+        remark=payload.remark,
+        site_id=1,
+    )
+    db.add(order)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        # 序号表与订单表不同步（手工改过数据）才会走到这里，不再盲重试
+        db.rollback()
+        raise BusinessError("订单号生成失败，请稍后重试", code=50020) from exc
 
     record_log(db, order, "state_change", None, STATUS_PENDING_PAY, "学生创建订单", "student")
     # 仅在本时段仍收单时占用容量；截单后的订单算下一个时段
     if session_info["session"] and session_info["is_open"]:
-        session_row = get_or_create_session(db, now.date(), session_info["session"])
-        session_row.used = session_row.used + 1
+        session_row = get_or_create_session(db, day, session_info["session"])
+        # 带条件的原子自增：判定与加一在同一条语句里，满员不再加，不会超卖
+        db.execute(
+            update(QueueSession)
+            .where(
+                QueueSession.id == session_row.id,
+                QueueSession.used < QueueSession.capacity,
+            )
+            .values(used=QueueSession.used + 1)
+        )
 
     get_notifier(db).send(
         user_id=user.id,

@@ -168,9 +168,9 @@ function goOrder() {
 .hero .code {
   display: block;
   margin: 12rpx 0 6rpx;
-  font-size: 72rpx;
+  font-size: 44rpx;
   font-weight: 700;
-  letter-spacing: 8rpx;
+  letter-spacing: 2rpx;
 }
 .hero .code-tip {
   display: block;

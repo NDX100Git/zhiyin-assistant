@@ -28,8 +28,8 @@ CREATE TABLE IF NOT EXISTS `users` (
 -- 订单：核心表，状态机见交接文档 3.1
 CREATE TABLE IF NOT EXISTS `orders` (
   `id`             BIGINT       NOT NULL AUTO_INCREMENT,
-  `order_no`       VARCHAR(16)  NOT NULL COMMENT '如 1016-007，服务端生成',
-  `pickup_code`    VARCHAR(8)   NOT NULL COMMENT '如 B-12，服务端生成，按当日顺序',
+  `order_no`       VARCHAR(16)  NOT NULL COMMENT '如 261016-007，服务端生成，含年份',
+  `pickup_code`    VARCHAR(20)  NOT NULL COMMENT '如 261017-A-01，日期前缀加当日顺序',
   `user_id`        BIGINT       NOT NULL,
   `status`         VARCHAR(16)  NOT NULL COMMENT 'pending_pay/queuing/printing/ready/completed/cancelled/abnormal',
   `file_key`       VARCHAR(255) DEFAULT NULL COMMENT '对象存储路径',
@@ -55,8 +55,16 @@ CREATE TABLE IF NOT EXISTS `orders` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_orders_order_no` (`order_no`),
   KEY `idx_status_created` (`status`, `created_at`),
-  KEY `idx_pickup_code` (`pickup_code`)
+  UNIQUE KEY `uq_pickup_code` (`pickup_code`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='订单主表';
+
+-- 按日发号器：订单号与取件码都从这一行的 last_seq 出。
+-- INSERT ... ON DUPLICATE KEY UPDATE 一句完成原子自增，并发不会重号。
+CREATE TABLE IF NOT EXISTS `order_daily_seq` (
+  `day`      DATE  NOT NULL,
+  `last_seq` INT   NOT NULL DEFAULT 0,
+  PRIMARY KEY (`day`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='按日发号器';
 
 -- 收款记录
 CREATE TABLE IF NOT EXISTS `payment_logs` (

@@ -112,8 +112,8 @@ def test_下单返回服务端生成的订单号与取件码(client, open_sessio
     body = client.post("/api/order/create", json=ORDER_PAYLOAD, headers=auth(token)).json()
     assert body["code"] == 0, body
     data = body["data"]
-    assert re.fullmatch(r"\d{4}-\d{3}", data["order_no"])
-    assert re.fullmatch(r"[A-Z]-\d{2}", data["pickup_code"])
+    assert re.fullmatch(r"\d{6}-\d{3}", data["order_no"])
+    assert re.fullmatch(r"\d{6}-[A-Z]-\d{2}", data["pickup_code"])
     assert data["status"] == "pending_pay"
     assert data["status_label"] == "待支付"
     # 42 页 × 15 分 × 1 份 = 630 分

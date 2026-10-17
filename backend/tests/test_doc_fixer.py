@@ -6,14 +6,13 @@ import io
 
 import fitz
 import pytest
+from _cjk_font import cjk_font_args
 from docx import Document
 
 from app.services.doc_fixer import fix_document, sanitize_actions
 from app.services.doc_parser import save_report
 from app.services.storage import build_object_key
 from app.utils.exceptions import BusinessError
-
-CJK_FONT = r"C:\Windows\Fonts\simsun.ttc"
 
 
 def _make_docx(path, reference_text: str) -> None:
@@ -180,9 +179,9 @@ def test_PDF自动转Word后修复(db_session, test_storage, tmp_path, monkeypat
     pdf_path = tmp_path / "source.pdf"
     with fitz.open() as doc:
         page = doc.new_page()
-        page.insert_text((72, 100), "摘要", fontsize=16, fontfile=CJK_FONT, fontname="simsun")
+        page.insert_text((72, 100), "摘要", fontsize=16, **cjk_font_args())
         page.insert_text(
-            (72, 130), "本文研究论文格式检查方法。", fontsize=12, fontfile=CJK_FONT, fontname="simsun"
+            (72, 130), "本文研究论文格式检查方法。", fontsize=12, **cjk_font_args()
         )
         doc.save(str(pdf_path))
 

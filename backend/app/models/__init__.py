@@ -5,6 +5,7 @@ from app.models.base import Base
 from app.models.notice import Notice
 from app.models.notification import Notification
 from app.models.order import Order
+from app.models.order_daily_seq import OrderDailySeq
 from app.models.payment_log import PaymentLog
 from app.models.print_log import PrintLog
 from app.models.queue_session import QueueSession
@@ -16,6 +17,7 @@ __all__ = [
     "Notice",
     "Notification",
     "Order",
+    "OrderDailySeq",
     "PaymentLog",
     "PrintLog",
     "QueueSession",

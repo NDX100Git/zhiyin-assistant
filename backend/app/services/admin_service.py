@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import date as date_type
 from datetime import datetime, timedelta
 
@@ -33,6 +34,9 @@ from app.services.storage import get_storage
 from app.utils.exceptions import BusinessError
 
 logger = logging.getLogger(__name__)
+
+# 老师手输的当天短码：A-01。完整码是日期前缀加短码，如 261017-A-01
+PICKUP_SHORT_CODE_RE = re.compile(r"^[A-Z]-\d{2}$")
 
 
 def get_order(db: Session, order_id: int) -> Order:
@@ -220,21 +224,43 @@ def verify_pickup(db: Session, order: Order, operator: str) -> dict:
     }
 
 
+def _normalize_pickup_code(raw: str, now: datetime | None = None) -> str:
+    """规整取件码。
+
+    老师可只输当天的短码（A-01），这里按服务器当天补成完整码（261017-A-01）；
+    扫码与学生端展示的都是完整码，原样匹配。跨天的遗留单只能用完整码。
+    """
+    code = "".join((raw or "").split()).upper()
+    if not code:
+        return ""
+    if PICKUP_SHORT_CODE_RE.fullmatch(code):
+        today = (now or datetime.now()).date()
+        return f"{today:%y%m%d}-{code}"
+    return code
+
+
 def verify_by_code(db: Session, pickup_code: str, operator: str) -> dict:
     """按取件码核销（老师扫码或手动输入）。"""
-    code = (pickup_code or "").strip().upper()
+    code = _normalize_pickup_code(pickup_code)
     if not code:
         raise BusinessError("请输入取件码", code=40001)
 
-    order = db.execute(
-        select(Order)
-        .where(Order.pickup_code == code, Order.status == STATUS_READY)
-        .order_by(Order.created_at.desc(), Order.id.desc())
-        .limit(1)
-    ).scalar_one_or_none()
-    if order is None:
+    orders = list(
+        db.execute(
+            select(Order)
+            .where(Order.pickup_code == code, Order.status == STATUS_READY)
+            .order_by(Order.created_at.desc(), Order.id.desc())
+            .limit(2)
+        ).scalars()
+    )
+    if not orders:
         raise BusinessError(f"没有找到取件码 {code} 对应的待取件订单", code=40401)
-    return verify_pickup(db, order, operator)
+    if len(orders) > 1:
+        # 唯一索引下不会发生；只有历史重码数据才会走到，宁可拒绝也不能核销错单
+        raise BusinessError(
+            f"取件码 {code} 命中多张待取件单，请用完整取件码或订单号核销", code=40902
+        )
+    return verify_pickup(db, orders[0], operator)
 
 
 def mark_abnormal(db: Session, order: Order, reason: str | None, operator: str) -> dict:

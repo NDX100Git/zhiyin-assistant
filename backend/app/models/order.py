@@ -15,13 +15,14 @@ class Order(Base):
     __tablename__ = "orders"
     __table_args__ = (
         Index("idx_status_created", "status", "created_at"),
-        Index("idx_pickup_code", "pickup_code"),
+        Index("uq_pickup_code", "pickup_code", unique=True),
         {"comment": "订单主表，状态机见交接文档 3.1"},
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    order_no: Mapped[str] = mapped_column(String(16), nullable=False, unique=True)  # 1016-007
-    pickup_code: Mapped[str] = mapped_column(String(8), nullable=False)  # B-12，按当日顺序
+    # 序号日（年+日）自带，跨年不会重号，所以两张号都能上唯一索引
+    order_no: Mapped[str] = mapped_column(String(16), nullable=False, unique=True)  # 261016-007
+    pickup_code: Mapped[str] = mapped_column(String(20), nullable=False)  # 261017-A-01
     user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     file_key: Mapped[str | None] = mapped_column(String(255), nullable=True)

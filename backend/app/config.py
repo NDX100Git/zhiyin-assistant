@@ -66,8 +66,9 @@ class Settings(BaseSettings):
     signed_url_expire_minutes: int = 30
 
     # LibreOffice headless 可执行文件路径（阶段 5-A 的 Word -> PDF 使用）。
-    # 允许通过环境变量 SOFFICE_PATH 覆盖，代码中不硬编码。
-    soffice_path: str = r"C:\Program Files\LibreOffice\program\soffice.exe"
+    # 空字符串表示本机未配置，此时 Office 文档一律报 50040，不尝试启动进程。
+    # 不提供盘符默认值：Windows 与 Linux 的安装位置不同，猜错了比没配更难查。
+    soffice_path: str = ""
     soffice_timeout_seconds: int = 180
 
     # 可扩展点：V1 用简化实现，V2 换实现只改环境变量
@@ -93,6 +94,19 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [item.strip() for item in self.cors_origins.split(",") if item.strip()]
+
+    @property
+    def soffice_binary(self) -> Path | None:
+        """LibreOffice 可执行文件；未配置或不是一个文件时返回 None。
+
+        不能把空值交给 Path() 再加 exists() 判断：Path("") 就是当前目录，
+        exists() 会认为它存在，后续去执行目录才报权限错。全仓只在这里做一次判断。
+        """
+        raw = (self.soffice_path or "").strip()
+        if not raw:
+            return None
+        candidate = Path(raw).expanduser()
+        return candidate if candidate.is_file() else None
 
 
 settings = Settings()

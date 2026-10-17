@@ -8,6 +8,7 @@ from pathlib import Path
 
 import fitz
 import pytest
+from _cjk_font import cjk_font_args
 from sqlalchemy import func, select
 
 from app.config import settings
@@ -21,14 +22,9 @@ from app.services.doc_parser import (
 )
 from app.services.storage import build_object_key
 
-CJK_FONT = Path(r"C:\Windows\Fonts\simsun.ttc")
-
 
 def _write_text(page: fitz.Page, point: tuple[float, float], text: str, size: int = 12) -> None:
-    if CJK_FONT.exists():
-        page.insert_text(point, text, fontsize=size, fontfile=str(CJK_FONT), fontname="simsun")
-    else:  # 兜底：PyMuPDF 自带的简体中文字体
-        page.insert_text(point, text, fontsize=size, fontname="china-s")
+    page.insert_text(point, text, fontsize=size, **cjk_font_args())
 
 
 def _make_sample_pdf(path: Path) -> None:
@@ -160,8 +156,8 @@ def test_解析结果写入缓存且不重复解析(db_session, test_storage, sa
 
 
 @pytest.mark.skipif(
-    not Path(settings.soffice_path).exists(),
-    reason="本机未安装 LibreOffice，跳过 Office 转换测试",
+    settings.soffice_binary is None,
+    reason="本机未配置可用的 LibreOffice，跳过 Office 转换测试",
 )
 def test_docx经LibreOffice转换后可解析(db_session, test_storage, tmp_path):
     from docx import Document

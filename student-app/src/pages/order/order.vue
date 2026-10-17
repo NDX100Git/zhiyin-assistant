@@ -852,8 +852,8 @@ function goMine() {
   color: #1f2d3d;
 }
 .code-item .code {
-  font-size: 44rpx;
-  letter-spacing: 4rpx;
+  font-size: 28rpx;
+  letter-spacing: 1rpx;
   color: #2f6bff;
 }
 .hint {

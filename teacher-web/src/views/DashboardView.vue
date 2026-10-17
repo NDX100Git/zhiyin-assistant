@@ -37,8 +37,8 @@
       <div class="right">
         <el-input
           v-model="verifyCodeValue"
-          placeholder="输入取件码核销，如 A-01"
-          style="width: 220px"
+          placeholder="取件码：扫码用完整码，手输当天短码如 A-01"
+          style="width: 300px"
           clearable
           @keyup.enter="submitVerifyCode"
         />
@@ -70,7 +70,7 @@
       >
         <el-table-column type="selection" width="46" />
         <el-table-column prop="order_no" label="订单号" width="110" />
-        <el-table-column prop="pickup_code" label="取件码" width="90">
+        <el-table-column prop="pickup_code" label="取件码" width="150">
           <template #default="{ row }">
             <el-tag effect="plain">{{ row.pickup_code }}</el-tag>
           </template>

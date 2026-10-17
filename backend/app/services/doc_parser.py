@@ -121,7 +121,7 @@ def _subprocess_temp_dir(out_dir: Path) -> Path:
         candidate.mkdir(parents=True, exist_ok=True)
         return candidate
 
-    fallback = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Temp" / f"zhiyin-lo-{os.getpid()}"
+    fallback = Path(tempfile.gettempdir()) / f"zhiyin-lo-{os.getpid()}"
     fallback.mkdir(parents=True, exist_ok=True)
     logger.warning("项目路径含非 ASCII 字符，LibreOffice 临时目录回退到 %s", fallback)
     return fallback
@@ -129,10 +129,13 @@ def _subprocess_temp_dir(out_dir: Path) -> Path:
 
 def convert_to_pdf(input_path: Path, out_dir: Path) -> Path:
     """用 LibreOffice headless 把 Office 文档转成 PDF。路径读配置，不硬编码。"""
-    soffice = Path(settings.soffice_path)
-    if not soffice.exists():
+    soffice = settings.soffice_binary
+    if soffice is None:
+        configured = (settings.soffice_path or "").strip() or "空"
         raise BusinessError(
-            f"未找到 LibreOffice：{soffice}，请在 .env 中配置 SOFFICE_PATH", code=50040
+            f"本机未配置可用的 LibreOffice（SOFFICE_PATH={configured}），"
+            "Word、Excel、PPT 转 PDF 暂不可用，请上传 PDF",
+            code=50040,
         )
 
     # 每次转换用独立的 UserInstallation，避免多请求互相转发到一个实例
