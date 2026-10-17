@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+from datetime import date
 
 from sqlalchemy import select
 
@@ -199,6 +200,9 @@ def test_核销取件并现场收款(client, db_session):
 def test_已在线支付订单核销时不重复记流水(client, db_session):
     token = admin_token(client)
     order = _make_order(db_session, status="ready", paid=1, pickup_code="D-08")
+    # 已支付订单应当有一条足额支付流水（核销只补差额，不重复记账）
+    db_session.add(PaymentLog(order_id=order.id, amount_cents=630, method="mock", operator="student"))
+    db_session.commit()
 
     body = client.post(f"/api/admin/order/{order.id}/verify", headers=auth(token)).json()
     assert body["code"] == 0
@@ -206,7 +210,8 @@ def test_已在线支付订单核销时不重复记流水(client, db_session):
     payments = list(
         db_session.execute(select(PaymentLog).where(PaymentLog.order_id == order.id)).scalars()
     )
-    assert payments == []
+    assert len(payments) == 1
+    assert payments[0].amount_cents == 630
 
 
 def test_按取件码核销(client, db_session):
@@ -324,3 +329,74 @@ def test_发布公告后学生端可见(client, db_session):
 
     rows = list(db_session.execute(select(Notice)).scalars())
     assert len(rows) == 1
+
+
+def test_系统报价供完成弹窗预填(client, db_session):
+    token = admin_token(client)
+    order = _make_order(db_session, status="printing")
+
+    body = client.get(f"/api/admin/order/{order.id}/quote", headers=auth(token)).json()
+    assert body["code"] == 0
+    assert body["data"]["system_amount_cents"] == 630
+    assert body["data"]["current_amount_cents"] == 630
+
+
+def test_收单时段总览返回上午下午(client):
+    token = admin_token(client)
+    body = client.get(
+        "/api/admin/sessions", params={"date": "2026-10-17"}, headers=auth(token)
+    ).json()
+
+    assert body["code"] == 0
+    assert [item["session"] for item in body["data"]["items"]] == ["am", "pm"]
+    assert body["data"]["items"][0]["label"] == "上午"
+
+
+def test_收款流水按日期汇总(client, db_session):
+    token = admin_token(client)
+    order = _make_order(db_session, status="completed", paid=1)
+    db_session.add(PaymentLog(order_id=order.id, amount_cents=630, method="mock", operator="student"))
+    db_session.add(PaymentLog(order_id=order.id, amount_cents=100, method="onsite", operator="admin"))
+    db_session.commit()
+
+    body = client.get(
+        "/api/admin/transactions",
+        params={"date": date.today().isoformat()},
+        headers=auth(token),
+    ).json()["data"]
+
+    assert body["count"] == 2
+    assert body["total_cents"] == 730
+    assert {item["method"] for item in body["items"]} == {"mock", "onsite"}
+
+
+def test_改价上调后核销只补收差额(client, db_session):
+    token = admin_token(client)
+    order = _make_order(db_session, status="printing", paid=1)
+    db_session.add(PaymentLog(order_id=order.id, amount_cents=75, method="mock", operator="student"))
+    db_session.commit()
+
+    completed = client.post(
+        f"/api/admin/order/{order.id}/complete",
+        json={"amount_cents": 800},
+        headers=auth(token),
+    ).json()
+    assert completed["code"] == 0
+    assert completed["data"]["order"]["paid"] == 0  # 已付金额不足，标记需补款
+
+    db_session.expire_all()
+    logs = list(
+        db_session.execute(select(PrintLog).where(PrintLog.order_id == order.id)).scalars()
+    )
+    assert any("需补收 725 分" in (log.note or "") for log in logs)
+
+    verified = client.post(f"/api/admin/order/{order.id}/verify", headers=auth(token)).json()
+    assert verified["data"]["collected_onsite"] is True
+    assert verified["data"]["collected_cents"] == 725
+
+    db_session.expire_all()
+    payments = list(
+        db_session.execute(select(PaymentLog).where(PaymentLog.order_id == order.id)).scalars()
+    )
+    assert sorted(p.amount_cents for p in payments) == [75, 725]
+    assert db_session.get(Order, order.id).paid == 1

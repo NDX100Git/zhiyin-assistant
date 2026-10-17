@@ -10,7 +10,7 @@
 | 层 | 技术 | 目录 |
 |---|---|---|
 | 学生端 | uni-app（Vue3 + Vite） | `student-app/` |
-| 老师端 | Vue3 + Element Plus（阶段 8，未开始） | 预留 `teacher-web/` |
+| 老师端 | Vue3 + Element Plus | `teacher-web/` |
 | 后端 | Python + FastAPI | `backend/app/` |
 | 数据库 | MySQL 8 + SQLAlchemy 2.x | `backend/app/models/`、`schema.sql` |
 | 对象存储 | MinIO（抽象层可换云存储） | `backend/app/services/storage/` |
@@ -52,7 +52,7 @@ zhiyin-assistant/
 │  ├─ schema.sql                 与 ORM 等价的建表脚本
 │  ├─ test_llm.py                DeepSeek 连通性自检（独立运行）
 │  └─ requirements*.txt          运行 / 开发依赖
-└─ student-app/                  学生端 uni-app
+├─ student-app/                  学生端 uni-app
    ├─ src/pages/                 首页、下单、我的、订单详情
    ├─ src/services/              api / auth / filePicker / notify 适配层
    ├─ src/config/index.js        API 地址、轮询间隔（来自 .env）
@@ -60,6 +60,13 @@ zhiyin-assistant/
    ├─ src/manifest.json          App 名称、权限、Android minSdk=26
    ├─ .env.development           H5 调试 → http://127.0.0.1:8000
    └─ .env.production            真机/APK → 电脑局域网 IP
+└─ teacher-web/                  老师端 Vue3 + Element Plus
+   ├─ src/views/                 登录、工作台、收款流水、收单与公告
+   ├─ src/layout/AdminLayout.vue 侧边栏 + 顶栏布局
+   ├─ src/api/                   axios 封装与 admin 接口
+   ├─ src/router/index.js        hash 路由 + 登录守卫
+   ├─ dev.cmd / build.cmd        双击启动（内部把 TMP/TEMP 指到英文目录）
+   └─ .env.development           后端地址
 ```
 
 ---
@@ -81,7 +88,7 @@ zhiyin-assistant/
 ```
 老师登录（环境变量账号）→ 队列 → 下载签名 URL → 开始打印（printing）
    → 打印完成（自动计价预填，可改价并留痕）→ ready
-   → 按订单/取件码核销 → completed（未付款则现场收款写 payment_logs）
+   → 按订单/取件码核销 → completed（未付或改价差额现场收款写 payment_logs）
 ```
 
 ### 3.3 AI 体检内部流程（5-B）
@@ -170,6 +177,7 @@ check 报告 + 用户勾选的 issue_ids
 | GET | `/api/admin/order/{id}/download` | 30 分钟签名下载链接 |
 | POST | `/api/admin/order/{id}/start` | 开始打印 → printing |
 | POST | `/api/admin/order/{id}/complete` | 打印完成 → ready（可改价，留痕） |
+| GET | `/api/admin/order/{id}/quote` | 系统报价（完成弹窗预填） |
 | POST | `/api/admin/order/batch-complete` | 批量完成（逐单返回成功/失败） |
 | POST | `/api/admin/order/{id}/verify` | 核销 → completed（未付款现场收款） |
 | POST | `/api/admin/order/verify-code` | 按取件码核销 |
@@ -177,8 +185,10 @@ check 报告 + 用户勾选的 issue_ids
 | POST | `/api/admin/order/{id}/recover` | 异常恢复排队 |
 | POST | `/api/admin/order/{id}/cancel` | 关闭异常单 |
 | POST | `/api/admin/session/close` / `open` | 关闭/恢复时段收单 |
+| GET | `/api/admin/sessions` | 某天上午/下午收单状态 |
 | GET | `/api/admin/summary` | 今日接单数/收款额/待取件/异常 |
 | POST | `/api/admin/notice` | 发布公告 |
+| GET | `/api/admin/transactions` | 按日期查收款流水 |
 
 ---
 
@@ -225,6 +235,19 @@ check 报告 + 用户勾选的 issue_ids
 | `pages/order/order.vue` | 选文件 → 上传 → 体检 → 勾选修复 → 打印方案 → 下单 → 支付 |
 | `pages/mine/mine.vue` | 我的订单：状态筛选、昵称、支付/取消 |
 | `pages/mine/detail.vue` | 订单详情：取件码大字、排队进度、时间线、取消/支付 |
+
+### 6.3 老师端
+
+| 文件 | 职责 |
+|---|---|
+| `src/api/http.js` | axios 封装：自动带管理员 token、统一解析 `{code,message,data}`、登录失效跳转 |
+| `src/api/admin.js` | 全部后台接口函数（队列、报价、完成、核销、流水、收单、公告等） |
+| `src/router/index.js` | hash 路由 + 登录守卫 |
+| `src/layout/AdminLayout.vue` | 左侧菜单、顶栏、退出登录 |
+| `src/views/LoginView.vue` | 管理员账号密码登录 |
+| `src/views/DashboardView.vue` | 今日数据、队列表格、下载、开始打印、完成改价弹窗、核销、批量完成、异常处理、5 秒轮询 |
+| `src/views/TransactionsView.vue` | 按日期查询收款流水与合计 |
+| `src/views/SettingsView.vue` | 上午/下午收单开关、发布公告 |
 
 ---
 
@@ -287,6 +310,7 @@ abnormal    --关闭--> cancelled（仅老师）
 | 现象 | 原因 | 解决 |
 |---|---|---|
 | H5 上传报 `file 字段要求` | `uni.uploadFile` 被设置了 `Content-Type: application/json`，缺 multipart boundary | 上传请求头不要手动设置 Content-Type |
+| 老师端 `npm run dev/build` 报 esbuild `Access is denied` | esbuild 在中文 TEMP 目录清理临时文件失败 | 用 `teacher-web/dev.cmd` / `build.cmd`（内部把 TMP/TEMP 指到英文目录） |
 | `soffice --version` / 转换卡死 | `subprocess.PIPE` 被后台子进程占住 | 输出重定向到日志文件 |
 | 转换报 `source file could not be loaded` | `TMP/TEMP` 指向含中文的用户目录 | 子进程显式使用纯 ASCII 临时目录 |
 | 转换一夜之间"坏了" | 多个 soffice 实例/残留 profile | 每次转换独立 `-env:UserInstallation` |

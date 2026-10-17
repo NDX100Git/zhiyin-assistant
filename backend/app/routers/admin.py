@@ -88,6 +88,16 @@ def complete(
     return ok(admin_service.complete_print(db, order, operator, amount))
 
 
+@router.get("/order/{order_id}/quote", summary="系统报价（弹窗预填）", response_model=None)
+def quote(
+    order_id: int,
+    _: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict:
+    order = admin_service.get_order(db, order_id)
+    return ok(admin_service.quote_amount(order))
+
+
 @router.post("/order/batch-complete", summary="批量标记完成", response_model=None)
 def batch_complete(
     payload: BatchCompleteRequest,
@@ -179,6 +189,28 @@ def open_session(
     return ok(
         admin_service.switch_session(db, _parse_day(payload.date), payload.session, True, operator)
     )
+
+
+@router.get("/sessions", summary="某天收单时段状态", response_model=None)
+def sessions(
+    date: str | None = Query(default=None, description="YYYY-MM-DD，默认今天"),
+    _: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict:
+    day = _parse_day(date) if date else datetime.now().date()
+    return ok({"items": admin_service.session_overview(db, day)})
+
+
+@router.get("/transactions", summary="收款流水（按日期）", response_model=None)
+def transactions(
+    date: str | None = Query(default=None, description="YYYY-MM-DD，默认今天"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+    _: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict:
+    day = _parse_day(date) if date else datetime.now().date()
+    return ok(admin_service.transactions(db, day, page, page_size))
 
 
 @router.get("/summary", summary="今日数据", response_model=None)

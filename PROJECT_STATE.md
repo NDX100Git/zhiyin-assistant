@@ -26,10 +26,11 @@
 
 最近一次验证（2026-10-17）：
 
-- 后端 `pytest -q`：**85 passed**
+- 后端 `pytest -q`：**89 passed**
 - 后端 `ruff check`：全绿
 - 学生端 `npm run build:h5`：构建成功
 - 学生端 Edge 真浏览器冒烟：首页 / 下单 / 上传真实 PPT / AI 体检报告 / 打印方案 / 我的，**0 控制台错误**
+- 老师端 Edge 真浏览器 E2E：登录 → 完成打印并改价 → 核销 → 流水/设置，**0 控制台错误**
 - DeepSeek 连通性（`backend/test_llm.py`）：普通对话 / JSON 模式 / 思考模式全部通过
 - 多模态 OCR：真实识别中文图片成功（确认 `deepseek-flash` 支持图片输入）
 
@@ -45,6 +46,7 @@
 | MinIO | `G:\deepseek\.toolchain\minio\minio.exe`（RELEASE.2025-09-07） | 数据目录 `G:\deepseek\.minio-data`（已 gitignore）；9000 API / 9001 控制台 |
 | LibreOffice | `G:\deepseek\.toolchain\libreoffice`（26.2.6，MSI 管理安装解包） | 路径由 `SOFFICE_PATH` 配置，非硬编码 |
 | H5 开发服务器 | <http://127.0.0.1:5173> | `npm run dev:h5`，当前在运行 |
+| 老师端 Web | <http://127.0.0.1:5174> | `npm.cmd run dev` 或双击 `teacher-web/dev.cmd`，当前在运行 |
 | 后端 API | <http://127.0.0.1:8000>（监听 0.0.0.0:8000） | `/docs` 可交互调试 |
 
 启动命令：
@@ -82,7 +84,7 @@ npm.cmd run dev:h5
 | 扩展 | 排版属性检查 | 后端 | ✅ | 从 PDF 提取正文常见字体/字号/行距，按 `common` 口径只出建议 |
 | 6 | 文档修复 | 后端 | ✅ | AI 出 actions、代码执行、序号保留、`⟨待补⟩` 占位、生成副本 |
 | 7 | 学生端 uni-app | 学生端 | 🔄 | 4 个页面 + auth/filePicker/notify 适配层；H5 冒烟通过；**体检/修复可选**，基础方案可直接下单；打印方案可手动改单双面/颜色/版式/份数；真机 plus.io 待验证 |
-| 8 | 老师端 Vue3 后台 | 老师端 | ⬜ | 未开始 |
+| 8 | 老师端 Vue3 后台 | 老师端 | ✅ | 登录、工作台（今日数据/队列/下载/开始/完成改价/核销/批量完成/异常处理）、收款流水、收单开关、公告发布；Edge E2E 通过 |
 | 9 | 打包与交付 | 文档/工程 | ⬜ | 未开始（HBuilderX 云打包可用） |
 
 ---
@@ -106,6 +108,7 @@ npm.cmd run dev:h5
 15. **接口地址可配置**：`.env.development` 用 `http://127.0.0.1:8000`（浏览器预览），`.env.production` 用局域网 IP（真机/APK）。
 16. **按文档类型选择体检口径**：`format_checker.detect_profile()` 区分 paper（pdf/doc/docx）、slide（ppt/pptx）、sheet（xls/xlsx）。论文套用结构与参考文献规则；PPT/表格只做版式检查，避免报"缺摘要/缺参考文献"这类无意义问题。报告里带 `profile` 与 `profile_note`。
 17. **AI 全程可选**：上传后先用 `POST /api/file/page-count` 取页数（不调模型），再用 `use_ai=false` 生成基础打印方案，学生可直接下单；想体检再点「开始 AI 体检」，体检完成后才出现报告与"AI 修复"开关（默认关闭、默认不勾选任何问题）。
+18. **老师改价后补差**：学生已支付但老师上调金额时，订单 `paid` 置 0 表示需补款；核销时按"最终金额 − 已支付流水合计"只收差额，并写一条 `onsite` 流水。不会重复收全款，也不会漏收差额。
 
 ---
 
@@ -128,6 +131,7 @@ npm.cmd run dev:h5
 | MinIO 官方已停发二进制 | 换机可能下不到 minio.exe | 当前 exe 是 GitHub 最后一个带二进制的版本（2025-09-07），**请备份该 exe** |
 | LibreOffice 用 MSI 管理安装解包 | 非标准安装方式，个别功能可能受限 | headless 转换已实测可用；若换机能正常安装，改 `SOFFICE_PATH` 即可 |
 | 用户目录含中文导致 soffice 失败 | 转换报 `source file could not be loaded` | 已在代码中覆盖子进程 TMP/TEMP 为 ASCII 目录规避 |
+| 老师端 `npm run build/dev` 报 esbuild Access denied | esbuild 在中文 TEMP 目录清理临时文件失败 | `teacher-web/dev.cmd` / `build.cmd` 已把 TMP/TEMP 指向 `G:\deepseek\.tmp`；也可手动设置环境变量 |
 | 页边距由文本块坐标推算 | 上边距会受标题段前距影响偏大 | 上边距容差放宽到 1cm，且标记为 `common` 非强制参考值 |
 | PDF 中图片颜色判断依赖 colorspace | 灰度扫描件可能被当成彩色/灰度误判 | 仅作打印方案特征，学生可手动改颜色 |
 | PDF 转 Word 对扫描件效果差 | 扫描版 PDF 转出的文字可能为空 | 接口 note 已提示"扫描件请先 OCR"；后续可自动检测文本层 |
@@ -139,9 +143,9 @@ npm.cmd run dev:h5
 
 ## 6. 下一步计划
 
-1. **阶段 7 收尾**：用户用 HBuilderX 打开 `student-app` 预览四个页面；根据反馈调整文案/交互；有真机后验证 `plus.io.chooseFile`。
-2. **阶段 8 老师端**：Vue3 + Element Plus 后台（登录、工作台队列、完成改价弹窗、核销、收单开关、公告、流水）。
-3. **阶段 9 打包交付**：HBuilderX 云打包 APK（需替换 manifest 的 appid 与签名证书）、部署文档、安装说明。
+1. **阶段 9 打包交付**：HBuilderX 云打包 APK（需替换 manifest 的 appid 与签名证书）、部署文档、安装说明；老师端生产构建与部署。
+2. **真机验证**：V1 只验证了 H5；拿到 Android 手机后验证 `plus.io.chooseFile`，失败则继续用"载入示例论文"兜底。
+3. 收集用户试用反馈，调整文案/交互/演示数据。
 4. 可选优化：扫描件自动检测、报告 7 天清理定时任务、MinIO 对象生命周期。
 
 **更新规则**：每完成一个阶段，更新本文件的「已完成模块 / 已知问题 / 下一步」，并做一次 git commit。

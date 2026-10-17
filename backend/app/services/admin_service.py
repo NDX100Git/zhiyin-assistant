@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date as date_type
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -140,6 +140,18 @@ def complete_print(db: Session, order: Order, operator: str,
     else:
         note = f"打印完成，老师改价：系统 {system_amount} 分 → 实收 {final_amount} 分"
 
+    paid_total = int(
+        db.execute(
+            select(func.coalesce(func.sum(PaymentLog.amount_cents), 0)).where(
+                PaymentLog.order_id == order.id
+            )
+        ).scalar_one()
+    )
+    if order.paid and final_amount > paid_total:
+        # 学生已在线支付，但老师改价上调：标记为待补款，核销时只收差额
+        order.paid = 0
+        note += f"；已付 {paid_total} 分，需补收 {final_amount - paid_total} 分"
+
     order.amount_cents = final_amount
     change_status(db, order, STATUS_READY, operator=operator, note=note)
     db.commit()
@@ -171,29 +183,41 @@ def batch_complete(db: Session, order_ids: list[int], operator: str) -> dict:
 
 
 def verify_pickup(db: Session, order: Order, operator: str) -> dict:
-    """核销取件：ready -> completed；未付款的在此现场收款。"""
+    """核销取件：ready -> completed；未付或改价差额在此现场收款。"""
     change_status(db, order, "completed", operator=operator, note="核销取件")
 
-    collected = False
-    if not order.paid:
-        order.paid = 1
-        order.pay_method = "onsite"
-        order.pay_channel = "onsite"
-        order.paid_at = datetime.now()  # 服务端时间
+    paid_total = int(
+        db.execute(
+            select(func.coalesce(func.sum(PaymentLog.amount_cents), 0)).where(
+                PaymentLog.order_id == order.id
+            )
+        ).scalar_one()
+    )
+    owed = max(0, order.amount_cents - paid_total)
+    collected = owed > 0
+    if collected:
         db.add(
             PaymentLog(
                 order_id=order.id,
-                amount_cents=order.amount_cents,
+                amount_cents=owed,
                 method="onsite",
                 operator=operator,
             )
         )
-        record_log(db, order, "note", note=f"取件时现场收款 {order.amount_cents} 分", operator=operator)
-        collected = True
+        record_log(db, order, "note", note=f"取件时现场收款 {owed} 分", operator=operator)
+
+    order.paid = 1
+    order.pay_method = "onsite" if collected else order.pay_method
+    order.pay_channel = order.pay_method
+    order.paid_at = datetime.now()  # 服务端时间
 
     db.commit()
     db.refresh(order)
-    return {"order": order_admin_view(db, order), "collected_onsite": collected}
+    return {
+        "order": order_admin_view(db, order),
+        "collected_onsite": collected,
+        "collected_cents": owed,
+    }
 
 
 def verify_by_code(db: Session, pickup_code: str, operator: str) -> dict:
@@ -272,6 +296,82 @@ def today_summary(db: Session) -> dict:
         "abnormal_count": counts.get(STATUS_ABNORMAL, 0),
         "queuing_count": counts.get(STATUS_QUEUING, 0),
         "printing_count": counts.get(STATUS_PRINTING, 0),
+    }
+
+
+def quote_amount(order: Order) -> dict:
+    """打印完成前的系统报价（老师端弹窗预填用）。"""
+    system_amount = calc_amount_cents(
+        order.page_count or 1, order.print_side or 2, order.color_mode or 0, order.copies or 1
+    )
+    return {
+        "order_id": order.id,
+        "system_amount_cents": system_amount,
+        "current_amount_cents": order.amount_cents,
+    }
+
+
+def session_overview(db: Session, day: date_type) -> list[dict]:
+    """某天上午/下午两个时段的当前状态（不存在时按默认值创建）。"""
+    labels = {"am": "上午", "pm": "下午"}
+    result = []
+    for name in ("am", "pm"):
+        row = get_or_create_session(db, day, name)
+        result.append(
+            {
+                "date": row.date.isoformat(),
+                "session": row.session,
+                "label": labels[name],
+                "is_open": bool(row.is_open),
+                "capacity": row.capacity,
+                "used": row.used,
+                "closed_at": row.closed_at.isoformat() if row.closed_at else None,
+            }
+        )
+    db.commit()
+    return result
+
+
+def transactions(db: Session, day: date_type, page: int = 1, page_size: int = 50) -> dict:
+    """按日期查收款流水。"""
+    start = datetime.combine(day, datetime.min.time())
+    end = start + timedelta(days=1)
+    condition = [PaymentLog.created_at >= start, PaymentLog.created_at < end]
+
+    total = db.execute(
+        select(func.count()).select_from(PaymentLog).where(*condition)
+    ).scalar_one()
+    total_cents = db.execute(
+        select(func.coalesce(func.sum(PaymentLog.amount_cents), 0)).where(*condition)
+    ).scalar_one()
+
+    rows = db.execute(
+        select(PaymentLog, Order.order_no)
+        .outerjoin(Order, Order.id == PaymentLog.order_id)
+        .where(*condition)
+        .order_by(PaymentLog.created_at.desc(), PaymentLog.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    ).all()
+
+    return {
+        "date": day.isoformat(),
+        "count": int(total),
+        "total_cents": int(total_cents),
+        "page": page,
+        "page_size": page_size,
+        "items": [
+            {
+                "id": payment.id,
+                "order_id": payment.order_id,
+                "order_no": order_no,
+                "amount_cents": payment.amount_cents,
+                "method": payment.method,
+                "operator": payment.operator,
+                "created_at": payment.created_at.isoformat() if payment.created_at else None,
+            }
+            for payment, order_no in rows
+        ],
     }
 
 

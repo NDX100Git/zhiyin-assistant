@@ -1,0 +1,33 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  background: #f5f7fb;
+  color: #1f2d3d;
+}
+
+.page-card {
+  background: #fff;
+  border-radius: 12px;
+  padding: 18px;
+  box-shadow: 0 4px 16px rgba(31, 45, 61, 0.06);
+}
+
+.money {
+  font-weight: 600;
+  color: #2f6bff;
+}
+
+.muted {
+  color: #8b98a8;
+  font-size: 12px;
+}

@@ -151,6 +151,19 @@ cd backend
 
 测试会使用独立的 `zhiyin_test` 库与 `zhiyin-files-test` 桶，不污染开发数据。
 
+**7.1 老师端（Web 后台）**
+
+```powershell
+cd teacher-web
+npm.cmd install           # 只需首次
+npm.cmd run dev           # 或直接双击 teacher-web\dev.cmd
+```
+
+打开 <http://127.0.0.1:5174>，用 `backend/.env` 里的管理员账号登录（默认 `admin` / `admin_dev_2026`）。
+
+> 若 `npm run dev/build` 报 esbuild `Access is denied`，请用 `dev.cmd` / `build.cmd`
+> （内部把 TMP/TEMP 指到纯英文目录）。
+
 **8. AI 连通性测试（阶段 5）**
 
 先在 `backend/.env` 填好 `LLM_API_KEY`，然后：
