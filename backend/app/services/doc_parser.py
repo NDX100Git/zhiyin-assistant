@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from app.config import BACKEND_DIR, settings
 from app.models.ai_report import AiReport
+from app.services.spreadsheet import normalize_spreadsheet
 from app.services.storage import get_storage
 from app.utils.exceptions import BusinessError
 from app.utils.filetype import normalize_ext
@@ -37,6 +38,7 @@ PT_TO_CM = 2.54 / 72
 RUNTIME_TMP_DIR = BACKEND_DIR / "runtime" / "tmp"
 
 OFFICE_EXTS = {"doc", "docx", "ppt", "pptx", "xls", "xlsx"}
+SPREADSHEET_EXTS = {"xls", "xlsx"}
 IMAGE_EXTS = {"jpg", "jpeg", "png"}
 
 # 章节识别：标准结构名 + “第X章 / 1.1” 式标题
@@ -127,35 +129,77 @@ def _subprocess_temp_dir(out_dir: Path) -> Path:
     return fallback
 
 
-def convert_to_pdf(input_path: Path, out_dir: Path) -> Path:
-    """用 LibreOffice headless 把 Office 文档转成 PDF。路径读配置，不硬编码。"""
+def _container_path(path: Path) -> str:
+    """把后端 runtime 下的路径翻成容器内路径。转换容器只挂了这一个目录。"""
+    runtime_dir = RUNTIME_TMP_DIR.parent
+    try:
+        relative = path.resolve().relative_to(runtime_dir.resolve())
+    except ValueError:
+        raise BusinessError(
+            f"转换容器只挂载了 {runtime_dir}，{path} 不在其中，无法转换", code=50040
+        ) from None
+    return f"{settings.soffice_container_dir.rstrip('/')}/{relative.as_posix()}"
+
+
+def _soffice_command(
+    input_path: Path, out_dir: Path, profile_dir: Path, target: str
+) -> list[str]:
+    """本机装了 LibreOffice 就直接调；没装就用常驻转换容器，走 docker exec。"""
+    tail = [
+        "--headless",
+        "--norestore",
+        "--nolockcheck",
+        "--nologo",
+        "--convert-to",
+        target,
+    ]
+    container = (settings.soffice_container or "").strip()
+    if container:
+        container_out = _container_path(out_dir)
+        return [
+            "docker",
+            "exec",
+            # 用当前用户身份写文件，否则容器里是 root，宿主机的临时目录清理会失败
+            "--user",
+            f"{os.getuid()}:{os.getgid()}" if hasattr(os, "getuid") else "1000:1000",
+            "-e",
+            f"HOME={_container_path(profile_dir.parent)}",
+            container,
+            "soffice",
+            *tail,
+            f"-env:UserInstallation={_file_url(Path(_container_path(profile_dir)))}",
+            "--outdir",
+            container_out,
+            _container_path(input_path),
+        ]
+
     soffice = settings.soffice_binary
     if soffice is None:
         configured = (settings.soffice_path or "").strip() or "空"
         raise BusinessError(
             f"本机未配置可用的 LibreOffice（SOFFICE_PATH={configured}），"
+            "也没有指定转换容器（SOFFICE_CONTAINER），"
             "Word、Excel、PPT 转 PDF 暂不可用，请上传 PDF",
             code=50040,
         )
-
-    # 每次转换用独立的 UserInstallation，避免多请求互相转发到一个实例
-    profile_dir = out_dir / "lo-profile"
-    stdout_log = out_dir / "soffice.out.log"
-    stderr_log = out_dir / "soffice.err.log"
-    cmd = [
+    return [
         str(soffice),
-        "--headless",
-        "--norestore",
-        "--nolockcheck",
-        "--nologo",
+        *tail,
         f"-env:UserInstallation={_file_url(profile_dir)}",
-        "--convert-to",
-        "pdf",
         "--outdir",
         str(out_dir),
         str(input_path),
     ]
-    logger.info("调用 LibreOffice 转换：%s", input_path.name)
+
+
+def convert_document(input_path: Path, out_dir: Path, target: str = "pdf") -> Path:
+    """用 LibreOffice headless 转换文档。路径与容器都读配置，不硬编码。"""
+    # 每次转换用独立的 UserInstallation，避免多请求互相转发到一个实例
+    profile_dir = out_dir / f"lo-profile-{target}"
+    stdout_log = out_dir / f"soffice-{target}.out.log"
+    stderr_log = out_dir / f"soffice-{target}.err.log"
+    cmd = _soffice_command(input_path, out_dir, profile_dir, target)
+    logger.info("调用 LibreOffice 转换：%s -> %s", input_path.name, target)
 
     # 注意：不能用 subprocess.PIPE 捕获输出。LibreOffice 会派生后台子进程并继承管道句柄，
     # 导致父进程已退出但管道不关闭、读取永久阻塞。改为重定向到日志文件。
@@ -171,7 +215,7 @@ def convert_to_pdf(input_path: Path, out_dir: Path) -> Path:
             proc.kill()
             raise BusinessError("文档转换超时，请稍后重试", code=50041) from exc
 
-    output = out_dir / f"{input_path.stem}.pdf"
+    output = out_dir / f"{input_path.stem}.{target}"
     if not output.exists():
         detail = stderr_log.read_text(encoding="utf-8", errors="ignore").strip()
         if not detail:
@@ -181,10 +225,22 @@ def convert_to_pdf(input_path: Path, out_dir: Path) -> Path:
     return output
 
 
+def convert_to_pdf(input_path: Path, out_dir: Path) -> Path:
+    """把 Office 文档转成 PDF。"""
+    return convert_document(input_path, out_dir, target="pdf")
+
+
 def _ensure_pdf(local_path: Path, ext: str, work_dir: Path) -> tuple[Path, str | None]:
     """把上传文件变成可解析的 PDF，返回 (pdf 路径, 转换来源)。"""
     if ext == "pdf":
         return local_path, None
+    if ext in SPREADSHEET_EXTS:
+        # 表格先归一版式再转，页数才是确定值：见 spreadsheet.py 里的说明
+        sheet_path = local_path
+        if ext == "xls":
+            sheet_path = convert_document(local_path, work_dir, target="xlsx")
+        prepared = normalize_spreadsheet(sheet_path, work_dir)
+        return convert_to_pdf(prepared, work_dir), ext
     if ext in OFFICE_EXTS:
         return convert_to_pdf(local_path, work_dir), ext
     if ext in IMAGE_EXTS:

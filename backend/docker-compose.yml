@@ -50,7 +50,12 @@ services:
   # Word/Excel 等文档转 PDF 的调用入口（阶段 5-A 使用）。
   # 容器常驻，后端通过 docker exec 调用 soffice；也可在本机安装 LibreOffice 后直接调用。
   libreoffice:
-    build: ./docker/libreoffice
+    build:
+      context: ./docker/libreoffice
+      args:
+        # 国内网络可用镜像站加速：在 .env 里设 APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+        APT_MIRROR: ${APT_MIRROR:-deb.debian.org}
+    image: zhiyin-libreoffice:local
     container_name: zhiyin-libreoffice
     restart: unless-stopped
     volumes:

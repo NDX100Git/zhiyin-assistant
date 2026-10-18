@@ -75,6 +75,10 @@ class Settings(BaseSettings):
     # 不提供盘符默认值：Windows 与 Linux 的安装位置不同，猜错了比没配更难查。
     soffice_path: str = ""
     soffice_timeout_seconds: int = 180
+    # 也可以不装本机 LibreOffice，改用常驻转换容器（编排文件里的 libreoffice 服务）。
+    # 填容器名即走 docker exec，容器内把后端的 runtime 目录挂成 soffice_container_dir。
+    soffice_container: str = ""
+    soffice_container_dir: str = "/workspace/runtime"
 
     # 可扩展点：V1 用简化实现，V2 换实现只改环境变量
     auth_provider: str = "device"  # device | wechat | cas
@@ -147,6 +151,11 @@ def get_feature_flags() -> dict[str, Any]:
 def get_upload_rules() -> dict[str, Any]:
     """上传校验规则（大小上限、扩展名白名单）。"""
     return read_json_config("upload_rules.json")
+
+
+def get_spreadsheet_rules() -> dict[str, Any]:
+    """表格归一版式的口径（缩放、方向、边距）。改口径只改配置文件。"""
+    return read_json_config("spreadsheet_rules.json")
 
 
 def get_order_rules() -> dict[str, Any]:
