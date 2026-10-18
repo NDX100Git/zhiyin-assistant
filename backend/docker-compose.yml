@@ -1,7 +1,10 @@
-# 智印助手开发环境：MySQL 8 + MinIO + LibreOffice（headless 转换容器）
+# 智印助手开发环境：MySQL 8 + MinIO + LibreOffice（headless 转换容器）+ 后端服务
 #
-# 说明：本机开发也可以不用 Docker，直接用免安装版 MySQL + 本机 MinIO。
-# 在 backend/ 目录执行：docker compose up -d
+# 一条命令起全套：在 backend/ 目录执行 docker compose up -d --build
+# 起来后探活：http://127.0.0.1:8000/api/health
+#
+# 说明：本机开发也可以不用 Docker，直接用免安装版 MySQL + 本机 MinIO 再手工跑 uvicorn；
+# 两条路读的是同一份 backend/.env。
 # compose 会自动读取同目录下的 .env；数据库与 MinIO 密码必须在 .env 中设置，不提供默认值。
 
 services:
@@ -49,6 +52,8 @@ services:
 
   # Word/Excel 等文档转 PDF 的调用入口（阶段 5-A 使用）。
   # 容器常驻，后端通过 docker exec 调用 soffice；也可在本机安装 LibreOffice 后直接调用。
+  # 注意：同一个宿主机目录 ./runtime 同时挂给本容器（/workspace/runtime）和后端容器
+  # （/app/runtime），后端算出的容器内路径才能落到这里，两边不要改成不同的卷。
   libreoffice:
     build:
       context: ./docker/libreoffice
@@ -61,6 +66,76 @@ services:
     volumes:
       - ./runtime:/workspace/runtime
     command: ["sleep", "infinity"]
+
+  # 后端应用（FastAPI + uvicorn）。
+  # 依赖关系：mysql、minio 必须 healthy 才启动（启动时会建表、连对象存储）；
+  # libreoffice 只要被创建出来即可（普通 depends_on），它不是启动必需，
+  # 缺了它只影响 Office 文档转 PDF，PDF 上传链路照常。
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # 国内直连 PyPI 常断：在 backend/.env 里设 PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+        # 即可换源，不设就是官方源
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
+        # 同理，装 LibreOffice 走系统源，国内换源能省下几分钟甚至避免中断
+        APT_MIRROR: ${APT_MIRROR:-deb.debian.org}
+    image: zhiyin-backend:local
+    container_name: zhiyin-backend
+    restart: unless-stopped
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    env_file:
+      - .env
+    # env_file 里的 DB_HOST=127.0.0.1、MINIO_ENDPOINT=127.0.0.1:9000 是给「宿主机直接跑
+    # uvicorn」用的；进了容器，127.0.0.1 指向容器自己，必须按服务名覆盖。
+    # environment 优先级高于 env_file，所以这里只写容器内需要改正的项。
+    environment:
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      MINIO_ENDPOINT: minio:9000
+      # 统一容器时区，日志时间与 MySQL 的 +08:00 对齐（镜像自带 tzdata，实测 TZ 生效）
+      TZ: Asia/Shanghai
+      # LibreOffice 装在后端镜像里，容器内直接调 /usr/bin/soffice。
+      # 不挂 docker.sock、不装 docker CLI，原因见下方说明。
+      SOFFICE_CONTAINER: ""
+      SOFFICE_PATH: /usr/bin/soffice
+    volumes:
+      # 与 libreoffice 服务挂同一个宿主机目录：后端写 /app/runtime/tmp，
+      # 换算成 /workspace/runtime/tmp 交给转换容器，两边必须同源。
+      - ./runtime:/app/runtime
+    depends_on:
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      # 镜像里没有 curl，用 Python 标准库探活，避免为健康检查多装一个包
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import sys, urllib.request;
+          sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).status == 200 else 1)
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      # 启动时可能在建表、连 MinIO，给足冷启动时间再判定失败
+      start_period: 40s
+
+# 关于 LibreOffice 放在哪（结论：装进后端镜像）。
+# 代码里转换有两条路：本机可执行文件 SOFFICE_PATH，或 docker exec 常驻容器 SOFFICE_CONTAINER。
+# 编排模式选第一条，原因：
+#   1) 挂 /var/run/docker.sock 等于把宿主机 root 交给一个会解析用户上传文件的 Web 服务，
+#      泄露面从单个容器扩大到整台机器；
+#   2) 容器内进程是 root，经 docker exec 产出的临时文件属主也是 root，会污染宿主机 ./runtime；
+#   3) 装 docker CLI 要额外的软件源，国内构建更易断。
+# 代价是镜像大几百兆，换来 Word、Excel、PPT 转 PDF 在编排模式下直接可用。
+# 独立的 libreoffice 服务保留给宿主机模式：在宿主机跑 uvicorn 时用
+# SOFFICE_CONTAINER=zhiyin-libreoffice 即可，两边不冲突。
 
 volumes:
   mysql-data:

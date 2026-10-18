@@ -7,8 +7,20 @@ V2 换云对象存储时，只需新增一个实现类 + 改一行配置。
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO
+
+
+@dataclass(frozen=True)
+class StoredObject:
+    """对象存储中的一个对象快照，供定时清理判断文件年龄。"""
+
+    key: str
+    size: int
+    # 对象最后一次写入的时间，由对象存储返回
+    last_modified: datetime
 
 
 class FileStorage(ABC):
@@ -38,3 +50,7 @@ class FileStorage(ABC):
     @abstractmethod
     def read_bytes(self, key: str) -> bytes:
         """读取对象字节（阶段 5 图片 OCR 内联 base64 使用）。"""
+
+    @abstractmethod
+    def list_objects(self, prefix: str = "") -> list[StoredObject]:
+        """递归列出指定前缀下的全部对象（定时清理过期文件使用）。"""

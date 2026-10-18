@@ -1,0 +1,224 @@
+"""定时清理：过期上传文件与体检报告缓存。
+
+规则：
+1. 上传文件：对象存储中超过 FILE_EXPIRE_HOURS 的文件会被删除，但只要还有
+   未完结订单引用该文件就跳过。未完结指状态不是「已完成」也不是「已取消」，
+   包含待支付 / 排队中 / 打印中 / 待取件 / 异常，宁可少删也不能删掉在途文件。
+2. 体检报告：ai_reports 中超过 REPORT_RETENTION_DAYS 的缓存行会被删除。
+
+对外入口是 run_cleanup(db, storage, now=None, dry_run=False)，纯函数式、便于单测；
+后台调度由 cleanup_loop() 负责，单轮异常只记日志，不让任务静默死掉。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+
+from sqlalchemy import delete, func, select
+from sqlalchemy.orm import Session
+
+from app.config import settings
+from app.database import SessionLocal
+from app.models.ai_report import AiReport
+from app.models.order import Order
+from app.services.order_state import STATUS_CANCELLED, STATUS_COMPLETED
+from app.services.storage import FileStorage, get_storage
+
+logger = logging.getLogger(__name__)
+
+# 上传文件统一落在 files/ 前缀下（见 storage.keys.build_object_key）
+OBJECT_PREFIX = "files/"
+# 已完结状态：只有这些状态引用的过期文件可以删
+FINISHED_STATUSES = frozenset({STATUS_COMPLETED, STATUS_CANCELLED})
+# 按 file_key 批量查订单时每批的数量，避免 IN 列表过长
+ORDER_QUERY_CHUNK = 500
+# 启动后先等一小会儿再跑第一轮，给数据库与对象存储留出就绪时间
+FIRST_RUN_DELAY_SECONDS = 60
+
+
+@dataclass
+class CleanupStats:
+    """一轮清理的统计结果。dry_run 时 deleted 表示「将会删除」的数量。"""
+
+    scanned: int = 0           # 列出并检查的上传文件数
+    deleted: int = 0           # 成功删除（或演练时将会删除）的文件数
+    skipped: int = 0           # 因未完结订单引用而跳过的文件数
+    failed: int = 0            # 删除失败的文件数，下一轮会重新扫到
+    not_expired: int = 0       # 仍在保留期内、本轮不处理的文件数
+    reports_deleted: int = 0   # 删除（或将会删除）的体检报告缓存行数
+    dry_run: bool = False
+
+    def as_dict(self) -> dict[str, int | bool]:
+        """转成可直接写日志或返回的字典。"""
+        return {
+            "scanned": self.scanned,
+            "deleted": self.deleted,
+            "skipped": self.skipped,
+            "failed": self.failed,
+            "not_expired": self.not_expired,
+            "reports_deleted": self.reports_deleted,
+            "dry_run": self.dry_run,
+        }
+
+
+def _as_local_naive(value: datetime) -> datetime:
+    """把时间统一成本地时间且不带时区，与数据库 DATETIME 列的口径一致。
+
+    MinIO 返回带时区的 UTC 时间，直接拿它和 datetime.now() 比较会差出整个时区。
+    """
+    if value.tzinfo is None:
+        return value
+    return value.astimezone().replace(tzinfo=None)
+
+
+def _load_order_statuses(db: Session, keys: list[str]) -> dict[str, set[str]]:
+    """按 file_key 汇总引用该文件的订单状态。"""
+    statuses: dict[str, set[str]] = {}
+    for start in range(0, len(keys), ORDER_QUERY_CHUNK):
+        chunk = keys[start:start + ORDER_QUERY_CHUNK]
+        rows = db.execute(
+            select(Order.file_key, Order.status).where(Order.file_key.in_(chunk))
+        ).all()
+        for file_key, status in rows:
+            if file_key:
+                statuses.setdefault(file_key, set()).add(status)
+    return statuses
+
+
+def _cleanup_files(
+    db: Session,
+    storage: FileStorage,
+    now: datetime,
+    dry_run: bool,
+    stats: CleanupStats,
+) -> None:
+    """删除超过保留期且没有未完结订单引用的上传文件。"""
+    cutoff = now - timedelta(hours=settings.file_expire_hours)
+    try:
+        objects = storage.list_objects(OBJECT_PREFIX)
+    except Exception:
+        # 列不出来就无法判断谁过期，计入失败并跳过本轮文件清理，下一轮重试
+        stats.failed += 1
+        logger.exception("列出对象存储文件失败，本轮跳过文件清理")
+        return
+
+    stats.scanned = len(objects)
+    expired = [obj for obj in objects if _as_local_naive(obj.last_modified) <= cutoff]
+    stats.not_expired = stats.scanned - len(expired)
+    if not expired:
+        return
+
+    references = _load_order_statuses(db, [obj.key for obj in expired])
+
+    for obj in expired:
+        statuses = references.get(obj.key, set())
+        blocking = sorted(statuses - FINISHED_STATUSES)
+        if blocking:
+            stats.skipped += 1
+            logger.info(
+                "跳过文件 %s：仍被未完结订单引用（状态 %s）", obj.key, "、".join(blocking)
+            )
+            continue
+
+        if dry_run:
+            stats.deleted += 1
+            logger.info("[演练] 将删除过期文件 %s", obj.key)
+            continue
+
+        try:
+            storage.delete(obj.key)
+        except Exception:
+            # 不吞异常：计入失败并保留日志，对象没删掉，下一轮还能扫到
+            stats.failed += 1
+            logger.exception("删除文件失败，下一轮重试：%s", obj.key)
+            continue
+
+        stats.deleted += 1
+        logger.info("已删除过期文件 %s", obj.key)
+
+
+def _cleanup_reports(
+    db: Session,
+    now: datetime,
+    dry_run: bool,
+    stats: CleanupStats,
+) -> None:
+    """删除超过保留天数的体检报告缓存行。"""
+    cutoff = now - timedelta(days=settings.report_retention_days)
+
+    if dry_run:
+        count = db.execute(
+            select(func.count())
+            .select_from(AiReport)
+            .where(AiReport.created_at < cutoff)
+        ).scalar_one()
+        stats.reports_deleted = int(count)
+        logger.info("[演练] 将删除 %d 条过期体检报告缓存", count)
+        return
+
+    result = db.execute(
+        delete(AiReport)
+        .where(AiReport.created_at < cutoff)
+        .execution_options(synchronize_session=False)
+    )
+    stats.reports_deleted = int(result.rowcount or 0)
+    if stats.reports_deleted:
+        logger.info("已删除 %d 条过期体检报告缓存", stats.reports_deleted)
+
+
+def run_cleanup(
+    db: Session,
+    storage: FileStorage,
+    now: datetime | None = None,
+    dry_run: bool = False,
+) -> CleanupStats:
+    """执行一轮清理，返回统计。
+
+    now 可注入便于测试；不传时取服务端本地时间。dry_run 只统计不真正删除。
+    不提交事务，由调用方决定事务边界。
+    """
+    reference = _as_local_naive(now or datetime.now())
+    stats = CleanupStats(dry_run=dry_run)
+
+    _cleanup_files(db, storage, reference, dry_run, stats)
+    _cleanup_reports(db, reference, dry_run, stats)
+
+    logger.info("清理完成：%s", stats.as_dict())
+    return stats
+
+
+def run_cleanup_once(dry_run: bool = False) -> CleanupStats | None:
+    """使用独立会话跑一轮清理并提交。异常记日志后返回 None，交给下一轮重试。"""
+    db = SessionLocal()
+    try:
+        stats = run_cleanup(db, get_storage(), dry_run=dry_run)
+        db.commit()
+        return stats
+    except Exception:
+        db.rollback()
+        logger.exception("定时清理本轮失败，下一轮会自动重试")
+        return None
+    finally:
+        db.close()
+
+
+async def cleanup_loop(
+    interval_minutes: int | None = None,
+    first_delay_seconds: float = FIRST_RUN_DELAY_SECONDS,
+) -> None:
+    """后台清理循环：定期跑一轮，任何单轮异常都只记日志，任务本身不退出。"""
+    interval = max(1, interval_minutes or settings.cleanup_interval_minutes)
+    await asyncio.sleep(first_delay_seconds)
+
+    while True:
+        try:
+            # 清理是阻塞 IO（数据库 + 对象存储），放线程里跑，别卡住事件循环
+            await asyncio.to_thread(run_cleanup_once)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("定时清理出现未预期异常，后台任务继续运行")
+        await asyncio.sleep(interval * 60)

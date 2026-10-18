@@ -25,6 +25,9 @@ from app.services import storage as storage_module  # noqa: E402
 TEST_DB_NAME = f"{settings.db_name}_test"
 TEST_BUCKET = f"{settings.minio_bucket}-test"
 
+# 单测不启动定时清理：TestClient 会触发 lifespan，后台任务会去扫真实数据库与对象存储
+settings.cleanup_enabled = False
+
 
 @pytest.fixture(scope="session")
 def engine():

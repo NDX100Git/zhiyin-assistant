@@ -1,0 +1,24 @@
+# 构建上下文黑名单：镜像里只需要 app/ 与 config/，其余噪声与密钥一律不进上下文
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+
+# 运行时临时目录由宿主机卷提供，不打进镜像
+runtime/
+
+# 测试、脚本、开发依赖不参与镜像构建
+tests/
+scripts/
+requirements-dev.txt
+ruff.toml
+test_llm.py
+schema.sql
+docker/
+docker-compose.yml
+Dockerfile

@@ -10,7 +10,7 @@ from typing import BinaryIO
 from minio import Minio
 
 from app.config import settings
-from app.services.storage.base import FileStorage
+from app.services.storage.base import FileStorage, StoredObject
 
 logger = logging.getLogger(__name__)
 
@@ -77,3 +77,17 @@ class MinioStorage(FileStorage):
             if response is not None:
                 response.close()
                 response.release_conn()
+
+    def list_objects(self, prefix: str = "") -> list[StoredObject]:
+        """递归列出对象。MinIO 返回的 last_modified 是带时区的 UTC 时间。"""
+        self.ensure_bucket()
+        return [
+            StoredObject(
+                key=obj.object_name,
+                size=int(obj.size or 0),
+                last_modified=obj.last_modified,
+            )
+            for obj in self._client.list_objects(
+                self._bucket, prefix=prefix, recursive=True
+            )
+        ]

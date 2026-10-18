@@ -75,7 +75,13 @@ class Settings(BaseSettings):
     jwt_secret: str = "change_me"
     jwt_expire_minutes: int = 720
     file_expire_hours: int = 24
+    # 体检报告缓存（ai_reports）的保留天数，过期由定时任务清理
+    report_retention_days: int = 7
     signed_url_expire_minutes: int = 30
+
+    # 定时清理。默认开启；测试环境通过 CLEANUP_ENABLED=false 关掉，避免后台任务干扰用例
+    cleanup_enabled: bool = True
+    cleanup_interval_minutes: int = 60
 
     # LibreOffice headless 可执行文件路径（阶段 5-A 的 Word -> PDF 使用）。
     # 空字符串表示本机未配置，此时 Office 文档一律报 50040，不尝试启动进程。

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.database import init_db
 from app.routers import admin, ai, auth, file, home, notice, order
+from app.services.cleanup import cleanup_loop
 from app.utils.exceptions import register_exception_handlers
 from app.utils.response import ok
 
@@ -24,14 +26,34 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    """启动时按配置决定是否自动建表。"""
+    """启动时按配置建表，并按开关启动定时清理后台任务。"""
     if settings.auto_create_tables:
         try:
             init_db()
         except Exception:
             logger.exception("数据库初始化失败，请检查 MySQL 是否已启动以及 .env 中的连接配置")
             raise
-    yield
+
+    cleanup_task: asyncio.Task | None = None
+    if settings.cleanup_enabled:
+        cleanup_task = asyncio.create_task(cleanup_loop(), name="cleanup-loop")
+        logger.info(
+            "定时清理已启用，间隔 %d 分钟，文件保留 %d 小时，报告保留 %d 天",
+            settings.cleanup_interval_minutes,
+            settings.file_expire_hours,
+            settings.report_retention_days,
+        )
+    else:
+        logger.info("定时清理已关闭（CLEANUP_ENABLED=false）")
+
+    try:
+        yield
+    finally:
+        # 关闭服务时取消后台任务，避免留下悬空协程
+        if cleanup_task is not None:
+            cleanup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await cleanup_task
 
 
 app = FastAPI(
