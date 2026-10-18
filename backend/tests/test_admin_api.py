@@ -284,7 +284,7 @@ def test_收单开关影响学生端提示(client, db_session, monkeypatch):
 
     closed = client.post(
         "/api/admin/session/close",
-        json={"date": "2026-10-17", "session": "pm"},
+        json={"date": date.today().isoformat(), "session": "pm"},
         headers=auth(admin),
     ).json()
     assert closed["code"] == 0, closed
@@ -297,7 +297,7 @@ def test_收单开关影响学生端提示(client, db_session, monkeypatch):
 
     opened = client.post(
         "/api/admin/session/open",
-        json={"date": "2026-10-17", "session": "pm"},
+        json={"date": date.today().isoformat(), "session": "pm"},
         headers=auth(admin),
     ).json()
     assert opened["data"]["is_open"] is True
@@ -351,7 +351,7 @@ def test_系统报价供完成弹窗预填(client, db_session):
 def test_收单时段总览返回上午下午(client):
     token = admin_token(client)
     body = client.get(
-        "/api/admin/sessions", params={"date": "2026-10-17"}, headers=auth(token)
+        "/api/admin/sessions", params={"date": date.today().isoformat()}, headers=auth(token)
     ).json()
 
     assert body["code"] == 0

@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from app.config import get_order_rules
 from app.models.notice import Notice
 from app.models.order import Order
 from app.models.payment_log import PaymentLog
@@ -35,8 +36,20 @@ from app.utils.exceptions import BusinessError
 
 logger = logging.getLogger(__name__)
 
-# 老师手输的当天短码：A-01。完整码是日期前缀加短码，如 261017-A-01
-PICKUP_SHORT_CODE_RE = re.compile(r"^[A-Z]-\d{2}$")
+def _short_code_pattern() -> re.Pattern[str]:
+    """老师手输的当天短码，如 0-01。按取件码配置生成，改进制与长度不用改这里。"""
+    rules = get_order_rules()["pickup_code"]
+    alphabet = re.escape(str(rules["alphabet"]))
+    length = int(rules["length"])
+    separator_after = int(rules.get("separator_after", 1))
+    if 0 < separator_after < length:
+        return re.compile(
+            rf"^[{alphabet}]{{{separator_after}}}-[{alphabet}]{{{length - separator_after}}}$"
+        )
+    return re.compile(rf"^[{alphabet}]{{{length}}}$")
+
+
+PICKUP_SHORT_CODE_RE = _short_code_pattern()
 
 
 def get_order(db: Session, order_id: int) -> Order:

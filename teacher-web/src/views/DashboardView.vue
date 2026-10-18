@@ -37,7 +37,7 @@
       <div class="right">
         <el-input
           v-model="verifyCodeValue"
-          placeholder="取件码：扫码用完整码，手输当天短码如 A-01"
+          placeholder="取件码：扫码用完整码，手输当天短码如 0-01"
           style="width: 300px"
           clearable
           @keyup.enter="submitVerifyCode"

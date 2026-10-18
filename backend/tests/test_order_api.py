@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 
 import pytest
 from sqlalchemy import select
@@ -39,7 +40,7 @@ def open_session(monkeypatch):
     _patch_session(
         monkeypatch,
         {
-            "date": "2026-10-17",
+            "date": date.today().isoformat(),
             "session": "pm",
             "label": "下午",
             "is_open": True,
@@ -59,7 +60,7 @@ def closed_session(monkeypatch):
     _patch_session(
         monkeypatch,
         {
-            "date": "2026-10-17",
+            "date": date.today().isoformat(),
             "session": "pm",
             "label": "下午",
             "is_open": False,
@@ -79,7 +80,7 @@ def outside_window(monkeypatch):
     _patch_session(
         monkeypatch,
         {
-            "date": "2026-10-17",
+            "date": date.today().isoformat(),
             "session": None,
             "label": "",
             "is_open": False,
@@ -113,7 +114,7 @@ def test_下单返回服务端生成的订单号与取件码(client, open_sessio
     assert body["code"] == 0, body
     data = body["data"]
     assert re.fullmatch(r"\d{6}-\d{3}", data["order_no"])
-    assert re.fullmatch(r"\d{6}-[A-Z]-\d{2}", data["pickup_code"])
+    assert re.fullmatch(r"\d{6}-[0-9A-Z]-[0-9A-Z]{2}", data["pickup_code"])
     assert data["status"] == "pending_pay"
     assert data["status_label"] == "待支付"
     # 42 页 × 15 分 × 1 份 = 630 分

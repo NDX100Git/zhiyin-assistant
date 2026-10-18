@@ -2,13 +2,19 @@
   "session": {
     "am": {
       "label": "上午",
-      "window": ["08:00", "12:00"],
+      "window": [
+        "08:00",
+        "12:00"
+      ],
       "pickup_hint": "今日 14:00 后取件",
       "closed_hint": "上午已截单，现在下单会排在下一个打印时段（今日 14:00 后取件）"
     },
     "pm": {
       "label": "下午",
-      "window": ["12:00", "18:00"],
+      "window": [
+        "12:00",
+        "18:00"
+      ],
       "pickup_hint": "次日上午 10:00 后取件",
       "closed_hint": "下午已截单，现在下单会排在下一个打印时段（次日上午 10:00 后取件）"
     },
@@ -22,12 +28,18 @@
   "limits": {
     "max_copies": 50,
     "max_page_count": 1000,
-    "allowed_paper_sizes": ["A4", "A3", "B5"],
+    "allowed_paper_sizes": [
+      "A4",
+      "A3",
+      "B5"
+    ],
     "max_remark_length": 255
   },
   "pickup_code": {
-    "letters": "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-    "numbers_per_letter": 99
+    "alphabet": "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    "length": 3,
+    "separator_after": 1,
+    "_note": "短码是三位三十六进制（数字加大小写不敏感的字母），中间插一个短横便于人念；容量 36 的三次方 46656 个每天每站点。改容量只改 length。"
   },
   "_note": "收单时段、容量、等待时间参数与下单限制全部外置，改规则只改本文件"
 }

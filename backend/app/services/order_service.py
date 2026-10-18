@@ -55,18 +55,36 @@ def _next_daily_seq(db: Session, day: date) -> int:
 
 
 def build_pickup_code(seq: int, day: date) -> str:
-    """取件码：日期前缀加当日顺序，如 261017-A-01。
+    """取件码：日期前缀加当日序号，如 261017-0-01。
 
-    日期必须进码。只写 A-01 则每天从头开始，跳天就撞；只写月日则每年同日还会撞，
+    日期必须进码。不带日期的话每天从头开始，跳天就撞；只带月日则每年同日还会撞，
     唯一索引会在明年那天直接挡住下单。
+
+    短码是三十六进制（数字加大小写不敏感的字母），三位给到 46656 个每天每站点，
+    中间插一个短横只是为了让老师念得清，不参与进制。
     """
     rules = get_order_rules()["pickup_code"]
-    letters = str(rules["letters"])
-    per_letter = int(rules["numbers_per_letter"])
-    letter_index, number = divmod(seq - 1, per_letter)
-    if letter_index >= len(letters):
-        raise BusinessError("今日取件码已用完，请明天再来", code=40051)
-    return f"{day:%y%m%d}-{letters[letter_index]}-{number + 1:02d}"
+    alphabet = str(rules["alphabet"])
+    length = int(rules["length"])
+    separator_after = int(rules.get("separator_after", 1))
+    base = len(alphabet)
+
+    capacity = base**length
+    if seq < 1 or seq > capacity:
+        raise BusinessError(
+            f"今日取件码 {capacity} 个已用完，请明天再来", code=40051
+        )
+
+    digits = []
+    value = seq - 1
+    for _ in range(length):
+        value, remainder = divmod(value, base)
+        digits.append(alphabet[remainder])
+    short = "".join(reversed(digits))
+
+    if 0 < separator_after < length:
+        short = f"{short[:separator_after]}-{short[separator_after:]}"
+    return f"{day:%y%m%d}-{short}"
 
 
 def _validate_create(payload, limits: dict) -> None:
