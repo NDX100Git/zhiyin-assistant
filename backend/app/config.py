@@ -59,6 +59,13 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_base_url: str = "https://api.deepseek.com"
     llm_model: str = "deepseek-flash"
+    # AI 调用的隔离参数。模型接口慢，一次请求能占住线程几十秒，
+    # 不设上限时几十个人同时点体检会把登录与下单一起拖死，所以并发要卡住、
+    # 排队要短、超时要早失败。
+    llm_timeout_seconds: int = 30
+    llm_max_attempts: int = 2
+    llm_max_concurrency: int = 4
+    llm_queue_wait_seconds: float = 3.0
 
     # 管理员（阶段 4 使用）
     admin_username: str = "admin"

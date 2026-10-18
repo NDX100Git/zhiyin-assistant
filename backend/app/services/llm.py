@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from typing import Any
 
 from openai import AsyncOpenAI, OpenAI
@@ -19,11 +20,23 @@ from app.utils.exceptions import BusinessError
 
 logger = logging.getLogger(__name__)
 
-REQUEST_TIMEOUT = 60
-MAX_ATTEMPTS = 3
-
 _client: OpenAI | None = None
 _async_client: AsyncOpenAI | None = None
+
+# 并发闸门：模型调用慢，必须限流，否则几十个人同时点体检会占满线程池，
+# 登录、下单这些快接口跟着排队。闸门大小随配置变化自动重建，改配置不用重启也行。
+_gate_guard = threading.Lock()
+_gate: tuple[int, threading.BoundedSemaphore] | None = None
+_in_flight = 0
+
+
+def _semaphore() -> threading.BoundedSemaphore:
+    global _gate
+    size = max(1, int(settings.llm_max_concurrency))
+    with _gate_guard:
+        if _gate is None or _gate[0] != size:
+            _gate = (size, threading.BoundedSemaphore(size))
+        return _gate[1]
 
 
 def is_configured() -> bool:
@@ -40,7 +53,7 @@ def get_client() -> OpenAI:
         _client = OpenAI(
             api_key=settings.llm_api_key,
             base_url=settings.llm_base_url,
-            timeout=REQUEST_TIMEOUT,
+            timeout=settings.llm_timeout_seconds,
         )
     return _client
 
@@ -54,7 +67,7 @@ def get_async_client() -> AsyncOpenAI:
         _async_client = AsyncOpenAI(
             api_key=settings.llm_api_key,
             base_url=settings.llm_base_url,
-            timeout=REQUEST_TIMEOUT,
+            timeout=settings.llm_timeout_seconds,
         )
     return _async_client
 
@@ -87,15 +100,37 @@ def chat(
     thinking=True 用于版式诊断、格式校验等需要推理的复杂任务。
     """
     kwargs = _build_kwargs(messages, json_mode, thinking, temperature)
+    client = get_client()
 
+    wait_seconds = float(settings.llm_queue_wait_seconds)
+    if not _semaphore().acquire(timeout=wait_seconds):
+        # 队列里等太久说明此刻排满了，早失败比让请求占着线程干等更好
+        logger.warning("AI 并发已满，等待 %.1f 秒未拿到名额，直接拒绝", wait_seconds)
+        raise BusinessError("当前使用 AI 的人较多，请稍后重试", code=50034)
+
+    global _in_flight
+    with _gate_guard:
+        _in_flight += 1
+        current = _in_flight
+    try:
+        logger.info("AI 调用开始，当前并发 %d", current)
+        return _chat_with_retry(client, kwargs)
+    finally:
+        with _gate_guard:
+            _in_flight -= 1
+        _semaphore().release()
+
+
+def _chat_with_retry(client: OpenAI, kwargs: dict[str, Any]) -> str:
+    attempts = max(1, int(settings.llm_max_attempts))
     last_error: Exception | None = None
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    for attempt in range(1, attempts + 1):
         try:
-            response = get_client().chat.completions.create(**kwargs)
+            response = client.chat.completions.create(**kwargs)
             return response.choices[0].message.content or ""
         except Exception as exc:  # 需要把各类 SDK 异常统一成重试
             last_error = exc
-            logger.warning("模型调用失败（第 %d/%d 次）：%s", attempt, MAX_ATTEMPTS, exc)
+            logger.warning("模型调用失败（第 %d/%d 次）：%s", attempt, attempts, exc)
 
     raise BusinessError("AI 服务暂时不可用，请稍后重试", code=50031) from last_error
 
@@ -165,14 +200,15 @@ async def achat(
     """异步版 chat，供 asyncio.gather 并发调用。"""
     kwargs = _build_kwargs(messages, json_mode, thinking, temperature)
 
+    attempts = max(1, int(settings.llm_max_attempts))
     last_error: Exception | None = None
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    for attempt in range(1, attempts + 1):
         try:
             response = await get_async_client().chat.completions.create(**kwargs)
             return response.choices[0].message.content or ""
         except Exception as exc:  # 统一重试
             last_error = exc
-            logger.warning("异步模型调用失败（第 %d/%d 次）：%s", attempt, MAX_ATTEMPTS, exc)
+            logger.warning("异步模型调用失败（第 %d/%d 次）：%s", attempt, attempts, exc)
 
     raise BusinessError("AI 服务暂时不可用，请稍后重试", code=50031) from last_error
 
