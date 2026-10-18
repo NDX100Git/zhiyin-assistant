@@ -17,6 +17,10 @@ export function notify(message, type = 'info') {
 }
 
 export function notifyError(error) {
+  // 用户在选文件面板点了取消，不算错误，不该弹提示
+  if (error && error.canceled) {
+    return
+  }
   notify((error && error.message) || String(error || '操作失败'))
 }
 

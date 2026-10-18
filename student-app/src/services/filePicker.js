@@ -1,15 +1,71 @@
 /**
- * 选文件适配层（页面里禁止直接调用 uni.chooseFile / plus API）。
+ * 选文件适配层（页面里禁止直接调用平台 API）。
  *
- * - H5 / 小程序：uni.chooseFile
+ * - 微信小程序：wx.chooseMessageFile（从聊天记录里选，小程序没有文件管理器）
+ * - H5：uni.chooseFile（浏览器弹文件选择框）
  * - App：优先尝试 5+ 的 plus.io.chooseFile，不可用时明确报错
  * - 图片/拍照：uni.chooseImage（全端支持）
  * - 任何平台都有「载入示例论文」兜底（服务端直接返回已上传的示例文档）
+ *
+ * 用户在选文件面板点取消不算错误，抛出的 Error 带 canceled 标记，页面据此静默返回。
  */
 
 import { request } from './api'
 
 const DOC_EXTENSIONS = ['.pdf', '.doc', '.docx', '.ppt', '.pptx', '.xls', '.xlsx']
+// 微信的文件筛选参数不带点
+const WEIXIN_EXTENSIONS = DOC_EXTENSIONS.map((item) => item.slice(1))
+
+/** 用户自己点了取消：抛出带 canceled 标记的错误，notify 层据此静默。 */
+function canceledError() {
+  const error = new Error('已取消选择')
+  error.canceled = true
+  return error
+}
+
+function checkExtension(name) {
+  const lower = String(name || '').toLowerCase()
+  const suffix = lower.slice(lower.lastIndexOf('.'))
+  if (!DOC_EXTENSIONS.includes(suffix)) {
+    throw new Error(`只支持 PDF、Word、PPT、Excel，当前选的是 ${suffix || '未知格式'}`)
+  }
+}
+
+/** 微信小程序：只能从聊天记录里选文件，选完得到临时路径与原始文件名。 */
+function chooseWithWeixinMessage() {
+  return new Promise((resolve, reject) => {
+    if (typeof wx === 'undefined' || typeof wx.chooseMessageFile !== 'function') {
+      reject(new Error('当前微信版本不支持选择文档，请升级微信或改用「载入示例论文」'))
+      return
+    }
+
+    wx.chooseMessageFile({
+      count: 1,
+      type: 'file',
+      extension: WEIXIN_EXTENSIONS,
+      success(result) {
+        const file = (result.tempFiles || [])[0]
+        const path = file && (file.path || file.tempFilePath)
+        if (!path) {
+          reject(new Error('没有选择文件'))
+          return
+        }
+        const name = file.name || path.split('/').pop() || 'document.pdf'
+        try {
+          checkExtension(name)
+        } catch (error) {
+          reject(error)
+          return
+        }
+        resolve({ path, name })
+      },
+      fail(error) {
+        const message = (error && error.errMsg) || '选择文件失败'
+        reject(message.includes('cancel') ? canceledError() : new Error(message))
+      },
+    })
+  })
+}
 
 export function chooseImage() {
   return new Promise((resolve, reject) => {
@@ -54,7 +110,8 @@ function chooseWithUniFile() {
         resolve({ path, name })
       },
       fail(error) {
-        reject(new Error(error.errMsg || '选择文件失败'))
+        const message = (error && error.errMsg) || '选择文件失败'
+        reject(message.includes('cancel') ? canceledError() : new Error(message))
       },
     })
   })
@@ -90,12 +147,21 @@ function chooseWithPlus() {
 }
 
 export function chooseDocument() {
+  // #ifdef MP-WEIXIN
+  return chooseWithWeixinMessage()
+  // #endif
+
   // #ifdef APP-PLUS
   return chooseWithPlus()
   // #endif
 
-  // #ifndef APP-PLUS
+  // #ifdef H5
   return chooseWithUniFile()
+  // #endif
+
+  // 兜底：其他小程序平台没有通用的文件选择能力
+  // #ifndef MP-WEIXIN || APP-PLUS || H5
+  return Promise.reject(new Error('当前平台不支持选择文档，请使用「载入示例论文」或拍照上传'))
   // #endif
 }
 
