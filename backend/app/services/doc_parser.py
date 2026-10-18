@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 
 from app.config import BACKEND_DIR, settings
 from app.models.ai_report import AiReport
-from app.services.spreadsheet import normalize_spreadsheet
+from app.services.spreadsheet import render_pdf
 from app.services.storage import get_storage
 from app.utils.exceptions import BusinessError
 from app.utils.filetype import normalize_ext
@@ -239,8 +239,7 @@ def _ensure_pdf(local_path: Path, ext: str, work_dir: Path) -> tuple[Path, str |
         sheet_path = local_path
         if ext == "xls":
             sheet_path = convert_document(local_path, work_dir, target="xlsx")
-        prepared = normalize_spreadsheet(sheet_path, work_dir)
-        return convert_to_pdf(prepared, work_dir), ext
+        return render_pdf(sheet_path, work_dir, convert_to_pdf), ext
     if ext in OFFICE_EXTS:
         return convert_to_pdf(local_path, work_dir), ext
     if ext in IMAGE_EXTS:

@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import pymupdf
 from openpyxl import load_workbook
 from openpyxl.worksheet.page import PageMargins
 from openpyxl.worksheet.pagebreak import ColBreak, RowBreak
@@ -54,14 +55,16 @@ def _content_bounds(worksheet) -> tuple[int, int, int, int] | None:
     return 1, 1, max_row, last_col
 
 
-def _apply_page_setup(worksheet, bounds: tuple[int, int, int, int], rules: dict) -> None:
+def _apply_page_setup(
+    worksheet, bounds: tuple[int, int, int, int], rules: dict, fit_to_width: int
+) -> None:
     from openpyxl.utils import get_column_letter
 
     first_row, first_col, last_row, last_col = bounds
     worksheet.print_area = f"{get_column_letter(first_col)}{first_row}:{get_column_letter(last_col)}{last_row}"
 
     worksheet.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
-    worksheet.page_setup.fitToWidth = int(rules.get("fit_to_width", 1))
+    worksheet.page_setup.fitToWidth = fit_to_width
     worksheet.page_setup.fitToHeight = 0  # 纵向不限，按内容往下分页
     worksheet.page_setup.orientation = str(rules.get("orientation", "landscape"))
     worksheet.page_setup.paperSize = worksheet.PAPERSIZE_A4
@@ -82,10 +85,15 @@ def _apply_page_setup(worksheet, bounds: tuple[int, int, int, int], rules: dict)
     worksheet.row_breaks = RowBreak()
     worksheet.col_breaks = ColBreak()
     worksheet.print_title_rows = None
+    # 横向分成多页时把第一列当标签列重复，否则第二页起不知道每行是谁
+    worksheet.print_title_cols = "A:A" if fit_to_width > 1 else None
 
 
-def normalize_spreadsheet(source: Path, work_dir: Path) -> Path:
-    """按统一版式重存一份表格，返回新文件路径。原文件不动。"""
+def normalize_spreadsheet(source: Path, work_dir: Path, fit_to_width: int = 1) -> Path:
+    """按统一版式重存一份表格，返回新文件路径。原文件不动。
+
+    fit_to_width 是横向占用几页：默认 1（缩到一页宽），列太多看不清时由调用方放宽。
+    """
     rules = get_spreadsheet_rules()
     try:
         workbook = load_workbook(source, data_only=False)
@@ -103,7 +111,7 @@ def normalize_spreadsheet(source: Path, work_dir: Path) -> Path:
             worksheet.sheet_state = "hidden"  # 空表不出纸，也不占页
             logger.info("工作表「%s」没有任何内容，跳过", worksheet.title)
             continue
-        _apply_page_setup(worksheet, bounds, rules)
+        _apply_page_setup(worksheet, bounds, rules, fit_to_width)
         kept += 1
 
     if kept == 0:
@@ -119,3 +127,60 @@ def normalize_spreadsheet(source: Path, work_dir: Path) -> Path:
         len(workbook.worksheets) - kept,
     )
     return target
+
+
+def _print_font_percentile(pdf_path: Path) -> float | None:
+    """转换结果里的中位字号。用中位数而不是最小值：少数脚注不该绑架整表版式。"""
+    sizes: list[float] = []
+    document = pymupdf.open(pdf_path)
+    try:
+        for page in document:
+            for block in page.get_text("dict")["blocks"]:
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        if span["text"].strip():
+                            sizes.append(float(span["size"]))
+    finally:
+        document.close()
+    if not sizes:
+        return None
+    sizes.sort()
+    return sizes[len(sizes) // 2]
+
+
+def render_pdf(source: Path, work_dir: Path, convert) -> Path:
+    """把表格渲染成 PDF，并保证字不至于小到看不清。
+
+    缩到一页宽是最省纸也最合直觉的做法，但列一多，缩放会把字压到五六号，
+    出纸等于白印。所以先按一页宽试，中位字号低于阈值就把横向页数放宽一页重来，
+    直到字够大或到上限。首列会作为标签列重复，横向分页也不会丢行头。
+    """
+    rules = get_spreadsheet_rules()
+    min_pt = float(rules.get("min_readable_font_pt", 8.0))
+    max_width = max(1, int(rules.get("max_width_pages", 4)))
+
+    pdf_path: Path | None = None
+    for width_pages in range(1, max_width + 1):
+        attempt_dir = work_dir / f"fit{width_pages}"
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        prepared = normalize_spreadsheet(source, attempt_dir, fit_to_width=width_pages)
+        pdf_path = convert(prepared, attempt_dir)
+        font_pt = _print_font_percentile(pdf_path)
+        if font_pt is None or font_pt >= min_pt:
+            logger.info(
+                "表格渲染完成：%s，横向 %d 页，中位字号 %.1f pt",
+                source.name,
+                width_pages,
+                font_pt or 0.0,
+            )
+            return pdf_path
+        logger.info(
+            "表格缩到横向 %d 页后中位字号只有 %.1f pt，低于 %.1f pt，放宽一页重试",
+            width_pages,
+            font_pt,
+            min_pt,
+        )
+
+    logger.warning("表格横向已放宽到 %d 页仍偏小，按最大宽度出纸：%s", max_width, source.name)
+    return pdf_path
+

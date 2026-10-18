@@ -8,11 +8,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pymupdf
 import pytest
 from openpyxl import Workbook, load_workbook
 from openpyxl.worksheet.pagebreak import Break
 
-from app.services.spreadsheet import normalize_spreadsheet
+from app.services.spreadsheet import normalize_spreadsheet, render_pdf
 from app.utils.exceptions import BusinessError
 
 
@@ -98,3 +99,46 @@ def test_损坏文件给出人话提示(tmp_path: Path) -> None:
     with pytest.raises(BusinessError) as excinfo:
         normalize_spreadsheet(source, tmp_path / "work")
     assert "打不开" in str(excinfo.value)
+
+
+def test_横向分成两页时首列作为标签列重复(tmp_path: Path) -> None:
+    source = _wide_sheet(tmp_path / "宽表.xlsx")
+    target = normalize_spreadsheet(source, tmp_path / "work", fit_to_width=2)
+
+    sheet = load_workbook(target).active
+    assert sheet.page_setup.fitToWidth == 2
+    assert sheet.print_title_cols == "$A:$A"
+
+
+def _fake_convert(font_pt: float, calls: list[int]):
+    """替身转换器：产出一份指定字号的 PDF，省掉真跑 LibreOffice。"""
+
+    def convert(prepared: Path, out_dir: Path) -> Path:
+        calls.append(1)
+        document = pymupdf.open()
+        page = document.new_page()
+        page.insert_text((72, 72), "表格样例", fontsize=font_pt)
+        target = out_dir / f"{prepared.stem}.pdf"
+        document.save(target)
+        document.close()
+        return target
+
+    return convert
+
+
+def test_字号够大就停在一页宽(tmp_path: Path) -> None:
+    source = _wide_sheet(tmp_path / "正常表.xlsx")
+    calls: list[int] = []
+
+    render_pdf(source, tmp_path / "work", _fake_convert(11.0, calls))
+    assert len(calls) == 1
+
+
+def test_字号太小自动放宽横向页数(tmp_path: Path) -> None:
+    source = _wide_sheet(tmp_path / "超宽表.xlsx")
+    calls: list[int] = []
+
+    pdf = render_pdf(source, tmp_path / "work", _fake_convert(5.9, calls))
+    # 一直小：放宽到上限（默认 4 页宽）后仍交出一份 PDF，不抛错
+    assert len(calls) == 4
+    assert pdf.exists()

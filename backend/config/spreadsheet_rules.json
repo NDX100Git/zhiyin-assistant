@@ -2,5 +2,7 @@
   "fit_to_width": 1,
   "orientation": "landscape",
   "margin_cm": 1.0,
-  "_note": "Excel 转 PDF 前统一版式，让页数只由内容决定；改口径只改本文件"
+  "_note": "Excel 转 PDF 前统一版式，让页数只由内容决定；列太多缩到一页宽会看不清，因此设最小可读字号，缩过头就改成横向多页并重复首列。改口径只改本文件",
+  "min_readable_font_pt": 8.0,
+  "max_width_pages": 4
 }
