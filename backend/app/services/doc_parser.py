@@ -48,6 +48,18 @@ CHAPTER_PATTERN = re.compile(
     r"^\s*(第[一二三四五六七八九十百]+章|[0-9]{1,2}(\.[0-9]{1,2})*\s+\S)", re.MULTILINE
 )
 REFERENCE_ITEM_PATTERN = re.compile(r"^\s*[\[［](\d+)[\]］]\s*(.*)$")
+# PDF 提取器可能输出 NBSP 和非 ASCII 连字符，统一后再做页码与文本判断
+REFERENCE_TEXT_TRANSLATION = str.maketrans(
+    {
+        "\u00a0": " ",
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2212": "-",
+    }
+)
 BLANK_TEXT_THRESHOLD = 10  # 少于该字符且无图，视为空白页
 MIN_TYPOGRAPHY_CHARS = 200  # 正文样本少于该字数时不做排版属性判断
 # Word 的"单倍行距"基线间距约为字号的 1.2 倍，用它把实测间距换算成行距倍数
@@ -340,7 +352,7 @@ def extract_references(full_text: str) -> list[dict]:
     items: list[dict] = []
     current: dict | None = None
     for raw_line in body.splitlines():
-        line = raw_line.strip()
+        line = raw_line.translate(REFERENCE_TEXT_TRANSLATION).strip()
         if not line:
             continue
         match = REFERENCE_ITEM_PATTERN.match(line)
