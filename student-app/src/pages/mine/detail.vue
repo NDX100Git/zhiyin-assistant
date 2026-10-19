@@ -1,5 +1,5 @@
 <template>
-  <view class="page" :class="uiThemeClass">
+  <view class="page" :class="[uiThemeClass, uiSchemeClass]">
     <!-- #ifdef H5 -->
     <view class="pull-refresh" :style="{ height: pullOffset + 'px' }">
       <text class="pull-refresh-text">
@@ -119,7 +119,7 @@ import { useUiTheme } from '@/ui/theme'
 
 const order = ref(null)
 const orderId = ref('')
-const { uiThemeClass } = useUiTheme()
+const { uiThemeClass, uiSchemeClass } = useUiTheme()
 let visible = false
 
 const isActive = computed(() => order.value && ['queuing', 'printing'].includes(order.value.status))
@@ -669,6 +669,10 @@ function goOrder() {
 }
 
 /* ---------- 方向二：纸面工单 ---------- */
+/*
+ * 这一块是「订单里的纸面工单」：打印出来的那张单子长什么样，深色模式下也不改，
+ * 所以颜色走 --zi-print-paper / --zi-print-ink（深浅两套配色里都是同一个值）。
+ */
 .zi-theme-press .hero {
   border-left-width: 14rpx;
   border-left-color: var(--zi-accent);
@@ -692,8 +696,12 @@ function goOrder() {
 .zi-theme-press .code-block {
   margin-top: 24rpx;
   padding: 18rpx 22rpx;
-  border: 4rpx solid var(--zi-ink);
+  background: var(--zi-print-paper);
+  border: 4rpx solid var(--zi-print-ink);
   border-left: 14rpx solid var(--zi-accent);
+}
+.zi-theme-press .code-block .code {
+  color: var(--zi-print-ink);
 }
 .zi-theme-press .code {
   font-size: 64rpx;
@@ -765,7 +773,7 @@ function goOrder() {
   height: 20rpx;
   border: none;
   border-radius: 50%;
-  background: #dfe5ee;
+  background: var(--zi-line);
 }
 .zi-theme-classic .dot.on {
   background: var(--zi-accent);

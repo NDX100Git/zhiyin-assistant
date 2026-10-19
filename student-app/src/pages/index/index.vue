@@ -1,5 +1,5 @@
 <template>
-  <view class="page" :class="uiThemeClass">
+  <view class="page" :class="[uiThemeClass, uiSchemeClass]">
     <view class="hero">
       <view class="hero-title">智印助手</view>
       <view class="hero-sub">自助打印 · AI 论文体检可选</view>
@@ -66,7 +66,7 @@ const session = reactive({
   can_order: true,
 })
 const notices = ref([])
-const { uiThemeClass } = useUiTheme()
+const { uiThemeClass, uiSchemeClass } = useUiTheme()
 
 async function load() {
   const data = await request('/api/home/summary')
@@ -325,7 +325,7 @@ function goOrder() {
   letter-spacing: 0;
 }
 .zi-theme-classic .card.closed {
-  border: 2rpx solid #ffd8a8;
+  border: 2rpx solid var(--zi-warn);
 }
 .zi-theme-classic .badge {
   border: none;

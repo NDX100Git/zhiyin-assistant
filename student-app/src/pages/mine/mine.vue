@@ -1,5 +1,5 @@
 <template>
-  <view class="page" :class="uiThemeClass">
+  <view class="page" :class="[uiThemeClass, uiSchemeClass]">
     <!-- #ifdef H5 -->
     <view class="pull-refresh" :style="{ height: pullOffset + 'px' }">
       <text class="pull-refresh-text">
@@ -114,7 +114,7 @@ const saving = ref(false)
 const nickname = ref('')
 
 const initial = computed(() => (nickname.value || '同').slice(0, 1))
-const { uiTheme, uiThemeClass, changeUiTheme } = useUiTheme()
+const { uiTheme, uiThemeClass, uiSchemeClass, changeUiTheme } = useUiTheme()
 
 /** 皮肤面板的三选一选项，选中项在面板里会标出来。 */
 const themeOptions = UI_THEME_OPTIONS
@@ -356,7 +356,7 @@ function openDetail(id) {
   z-index: 999;
   display: flex;
   align-items: flex-end;
-  background: rgba(23, 22, 26, 0.42);
+  background: var(--zi-overlay);
 }
 .theme-sheet {
   width: 100%;
@@ -676,7 +676,7 @@ function openDetail(id) {
 }
 .zi-theme-classic .tab.active {
   background: var(--zi-accent);
-  color: #ffffff;
+  color: var(--zi-accent-ink);
 }
 .zi-theme-classic .order {
   border-left: none;
@@ -716,7 +716,7 @@ function openDetail(id) {
 }
 .zi-theme-classic .mini.primary {
   background: var(--zi-accent);
-  color: #ffffff;
+  color: var(--zi-accent-ink);
 }
 .zi-theme-classic .mini.ghost {
   background: var(--zi-soft-2);

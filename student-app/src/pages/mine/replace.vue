@@ -1,5 +1,5 @@
 <template>
-  <view class="page" :class="uiThemeClass">
+  <view class="page" :class="[uiThemeClass, uiSchemeClass]">
     <view v-if="!order" class="card center loading">加载中…</view>
 
     <template v-else>
@@ -155,7 +155,7 @@ const BLOCKED_TEXT = {
   cancelled: '订单已取消，不能再换文件。',
 }
 
-const { uiThemeClass } = useUiTheme()
+const { uiThemeClass, uiSchemeClass } = useUiTheme()
 
 const orderId = ref('')
 const order = ref(null)

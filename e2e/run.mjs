@@ -22,6 +22,7 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -789,6 +790,178 @@ async function waitBodyTheme(page, themeClass, timeout = 20000) {
   )
 }
 
+// ---------------------------------------------------------------- 深色模式
+/**
+ * 把系统深浅设置改成 light 或 dark。
+ *
+ * 页面里没有任何手动开关，深浅只认 prefers-color-scheme；
+ * 这里改的就是浏览器模拟的系统设置，等同于用户改系统外观。
+ */
+async function setColorScheme(page, scheme) {
+  // 后台标签页会被浏览器节流：媒体查询的 change 事件不派发，页面也就不会跟着换色。
+  // 真机上用户在看的那个窗口永远不会被节流，这里先切到前台，再改系统深浅。
+  await page.bringToFront()
+  await page.emulateMediaFeatures([{ name: 'prefers-color-scheme', value: scheme }])
+}
+
+/** 读一次页面外观：根节点类名 + 根节点与关键区块的实际颜色。 */
+async function readAppearance(page, rootSelector, blockSelectors = []) {
+  return page.evaluate(
+    ({ rootSelector, blockSelectors }) => {
+      // uni H5 的页面栈会把旧页面留在文档里，量和截都只认当前可见的那个
+      const visible = (selector) =>
+        [...document.querySelectorAll(selector)].filter((node) => node.getClientRects().length > 0).pop() || null
+      const root = visible(rootSelector)
+      const read = (node) => {
+        if (!node) return null
+        const style = getComputedStyle(node)
+        return {
+          background: style.backgroundColor,
+          color: style.color,
+          image: style.backgroundImage === 'none' ? '' : 'image',
+        }
+      }
+      return {
+        classes: root ? [...root.classList] : [],
+        root: read(root),
+        blocks: blockSelectors.map((selector) => ({ selector, style: read(visible(selector)) })),
+      }
+    },
+    { rootSelector, blockSelectors },
+  )
+}
+
+/**
+ * 量一段文字与它身下背景的对比度（WCAG 相对亮度公式）。
+ *
+ * 背景按祖先链逐层叠加真实色值算，不看虚拟背景图；
+ * 半透明文字先与背景混合再算，眯掉视觉上被刻意调淡的装饰文字（opacity < 0.9）。
+ */
+async function measureTextContrast(page, rootSelector, label) {
+  return page.evaluate(
+    ({ rootSelector, label }) => {
+      const parse = (value) => {
+        const match = String(value).match(/rgba?\(([^)]+)\)/)
+        if (!match) return null
+        const parts = match[1].split(/[,/\s]+/).filter(Boolean).map(Number)
+        if (parts.length < 3 || parts.some((item) => Number.isNaN(item))) return null
+        return { r: parts[0], g: parts[1], b: parts[2], a: parts.length > 3 ? parts[3] : 1 }
+      }
+      const channel = (value) => {
+        const c = value / 255
+        return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4
+      }
+      const luminance = (color) =>
+        0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
+      const ratio = (a, b) => {
+        const la = luminance(a)
+        const lb = luminance(b)
+        return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05)
+      }
+      const blend = (front, back) => ({
+        r: front.r * front.a + back.r * (1 - front.a),
+        g: front.g * front.a + back.g * (1 - front.a),
+        b: front.b * front.a + back.b * (1 - front.a),
+        a: 1,
+      })
+      const backgroundOf = (node) => {
+        const chain = []
+        let current = node
+        while (current) {
+          const parsed = parse(getComputedStyle(current).backgroundColor)
+          if (parsed && parsed.a > 0.01) {
+            chain.push(parsed)
+            if (parsed.a >= 1) break
+          }
+          current = current.parentElement
+        }
+        let background = { r: 255, g: 255, b: 255, a: 1 }
+        for (let index = chain.length - 1; index >= 0; index -= 1) {
+          background = blend(chain[index], background)
+        }
+        return background
+      }
+      const dimmed = (node, root) => {
+        let current = node
+        while (current && current !== root.parentElement) {
+          if (Number(getComputedStyle(current).opacity) < 0.9) return true
+          current = current.parentElement
+        }
+        return false
+      }
+
+      const root =
+        [...document.querySelectorAll(rootSelector)]
+          .filter((node) => node.getClientRects().length > 0)
+          .pop() || null
+      if (!root) return { label, error: `找不到可见的 ${rootSelector}` }
+      const items = []
+      for (const node of root.querySelectorAll('*')) {
+        const tag = node.tagName.toLowerCase()
+        if (['input', 'textarea', 'select', 'option', 'script', 'style'].includes(tag)) continue
+        const text = [...node.childNodes]
+          .filter((child) => child.nodeType === 3)
+          .map((child) => child.textContent.trim())
+          .join('')
+        if (text.length < 2) continue
+        if (!node.getClientRects().length) continue
+        if (dimmed(node, root)) continue
+        const style = getComputedStyle(node)
+        const front = parse(style.color)
+        if (!front || front.a < 0.99) continue
+        const background = backgroundOf(node)
+        items.push({
+          text: text.slice(0, 18),
+          className: String(node.className || tag).slice(0, 40),
+          ratio: Number(ratio(front, background).toFixed(2)),
+          color: style.color,
+          background: `rgb(${Math.round(background.r)}, ${Math.round(background.g)}, ${Math.round(background.b)})`,
+        })
+      }
+      items.sort((a, b) => a.ratio - b.ratio)
+      return {
+        label,
+        checked: items.length,
+        worst: items.slice(0, 3),
+        failures: items.filter((item) => item.ratio < 4.5).slice(0, 5),
+      }
+    },
+    { rootSelector, label },
+  )
+}
+
+/**
+ * 等某个「可见」元素的 class 变成预期值。
+ *
+ * uni H5 的页面栈里旧页面还留在文档中（拿不到布局），waitThemeClass 只看第一个，
+ * 深色阶段会量到旧页面的旧类名，所以这里只认有布局的那个。
+ */
+async function waitVisibleClass(page, selector, className, timeout = 20000) {
+  await page.waitForFunction(
+    (selector, className) =>
+      [...document.querySelectorAll(selector)].some(
+        (node) => node.getClientRects().length > 0 && node.classList.contains(className),
+      ),
+    { timeout, polling: 150 },
+    selector,
+    className,
+  )
+}
+
+/**
+ * 截一张图到本次回归产物目录。
+ *
+ * 同时算一份内容摘要：深浅两张图必须真的不一样，
+ * 只比字节数会在两张图恰好压缩后同长时误判。
+ */
+async function shoot(page, name) {
+  const file = path.join(ARTIFACTS, `${name}.png`)
+  await page.screenshot({ path: file })
+  const buffer = fs.readFileSync(file)
+  if (!buffer.length) throw new Error(`截图 ${name}.png 是空文件`)
+  return { file, size: buffer.length, digest: createHash('sha256').update(buffer).digest('hex') }
+}
+
 /** 页面上目前有几个可见的确认弹框（ElMessageBox）。 */
 function visibleMessageBoxes(page) {
   return page.evaluate(
@@ -1108,6 +1281,13 @@ async function runViewport(browser, viewport) {
     const fourFile = await runFourFilePhase({ student, teacher, viewport, step })
     const theme = await runThemePhase({ student, teacher, viewport, step })
     const startGuard = await runStartGuardPhase({ student, teacher, viewport, step })
+    const darkMode = await runDarkModePhase({
+      student,
+      teacher,
+      viewport,
+      step,
+      orderId: startGuard.id,
+    })
 
     if (problems.length) {
       throw Object.assign(new Error(`页面/接口有 ${problems.length} 条异常记录`), {
@@ -1123,6 +1303,7 @@ async function runViewport(browser, viewport) {
       fourFile,
       theme,
       startGuard,
+      darkMode,
     }
   } finally {
     await context.close()
@@ -1825,7 +2006,360 @@ async function runStartGuardPhase({ student, teacher, viewport, step }) {
     }
   }, teacher)
 
-  return { orderNo: order.orderNo, pickup: order.pickup, ...result }
+  return { orderNo: order.orderNo, pickup: order.pickup, id: order.id, ...result }
+}
+
+// ---------------------------------------------------------------- 深色模式
+/**
+ * 深色模式验收。
+ *
+ * 不新增皮肤、不加手动开关：深浅只看系统设置（prefers-color-scheme）。
+ * 浅色 → 深色 → 浅色 回切，断言根节点状态、关键区块背景色确实变了；
+ * 深色下 390 宽无横向溢出、老师端按钮不小于 44 像素；
+ * 深色与纸面工单 / 信号牌两套皮肤交叉看一遍；最后量一遍正文对比度。
+ */
+async function runDarkModePhase({ student, teacher, viewport, step, orderId }) {
+  const result = {
+    student: {},
+    teacher: {},
+    skins: {},
+    pages: {},
+    contrast: [],
+    screenshots: [],
+  }
+
+  await step('深色：学生端跟随系统切深色，根节点与卡片背景跟着变', async () => {
+    await setColorScheme(student, 'light')
+    await gotoFresh(student, `${STUDENT_URL}/#/pages/mine/mine`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    })
+    await waitBody(student, '全部', 60000)
+    await waitVisibleClass(student, '.page', 'zi-scheme-light')
+    const light = await readAppearance(student, '.page', ['.card', '.page-head'])
+    result.student.light = light
+
+    // 只改系统设置，不刷新页面：页面自己就要跟着换
+    await setColorScheme(student, 'dark')
+    await waitVisibleClass(student, '.page', 'zi-scheme-dark')
+    const dark = await readAppearance(student, '.page', ['.card', '.page-head'])
+    result.student.dark = dark
+
+    const skinOf = (classes) => classes.filter((name) => name.startsWith('zi-theme-'))
+    const lightSkin = skinOf(light.classes)
+    const darkSkin = skinOf(dark.classes)
+    if (lightSkin.length !== 1 || darkSkin.length !== 1) {
+      throw new Error(`根节点应该正好一套皮肤：浅色 ${lightSkin.join(',')} / 深色 ${darkSkin.join(',')}`)
+    }
+    if (lightSkin[0] !== darkSkin[0]) {
+      throw new Error(`切深浅不该换皮肤：浅色 ${lightSkin[0]} / 深色 ${darkSkin[0]}`)
+    }
+    if (!dark.classes.includes('zi-scheme-dark') || !light.classes.includes('zi-scheme-light')) {
+      throw new Error(`根节点深浅状态不对：浅色 ${light.classes.join(' ')} / 深色 ${dark.classes.join(' ')}`)
+    }
+    const darkBackground = dark.root && dark.root.background
+    if (!darkBackground || darkBackground === (light.root && light.root.background)) {
+      throw new Error(`切深色后页面底色没变：浅色 ${light.root && light.root.background} / 深色 ${darkBackground}`)
+    }
+    const lightBlock = light.blocks[0].style && light.blocks[0].style.background
+    const darkBlock = dark.blocks[0].style && dark.blocks[0].style.background
+    if (!darkBlock || darkBlock === lightBlock) {
+      throw new Error(`切深色后卡片底色没变：浅色 ${lightBlock} / 深色 ${darkBlock}`)
+    }
+  })
+
+  await step('深色：学生端五个页面都是深色，390 无横向溢出', async () => {
+    const pages = [
+      { name: '首页', url: `${STUDENT_URL}/#/pages/index/index`, text: '智印助手' },
+      { name: '下单', url: `${STUDENT_URL}/#/pages/order/order`, text: '选择要打印的文件' },
+      { name: '我的', url: `${STUDENT_URL}/#/pages/mine/mine`, text: '全部' },
+      {
+        name: '订单详情',
+        url: `${STUDENT_URL}/#/pages/mine/detail?id=${orderId}`,
+        text: '取件码 · 凭此码到文印室取件',
+      },
+      { name: '换文件', url: `${STUDENT_URL}/#/pages/mine/replace?id=${orderId}`, text: '当前订单' },
+    ]
+    for (const item of pages) {
+      await gotoFresh(student, item.url, { waitUntil: 'domcontentloaded', timeout: 60000 })
+      await waitBody(student, item.text, 60000)
+      await waitVisibleClass(student, '.page', 'zi-scheme-dark')
+      const appearance = await readAppearance(student, '.page', ['.page'])
+      const background = appearance.root && appearance.root.background
+      const match = background && background.match(/rgba?\(([^)]+)\)/)
+      const channels = match ? match[1].split(/[,/\s]+/).filter(Boolean).map(Number) : []
+      const brightness = channels.length >= 3 ? (channels[0] + channels[1] + channels[2]) / 3 : 255
+      if (brightness > 90) {
+        throw new Error(`学生端${item.name}页深色下底色仍然偏亮：${background}`)
+      }
+      if (viewport.mobile) await assertNoOverflow(student, `学生端${item.name}页（深色）`)
+      result.pages[`student-${item.name}`] = background
+    }
+    if (viewport.mobile) {
+      await gotoFresh(student, `${STUDENT_URL}/#/pages/mine/detail?id=${orderId}`, {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+      })
+      await waitBody(student, '取件码 · 凭此码到文印室取件', 60000)
+      result.contrast.push(await measureTextContrast(student, '.page', '学生端订单详情（深色）'))
+    }
+  })
+
+  await step('深色：老师端四屏深色，390 无横向溢出且按钮不小于 44 像素', async () => {
+    // 登录屏：带着 token 会被路由直接送去工作台，先摘下来，看完再装回去
+    const adminToken = await teacher.evaluate(() => localStorage.getItem('zhiyin_admin_token'))
+    await teacher.evaluate(() => localStorage.removeItem('zhiyin_admin_token'))
+    await setColorScheme(teacher, 'light')
+    await teacher.goto(`${TEACHER_URL}/#/login`, { waitUntil: 'domcontentloaded', timeout: 60000 })
+    await waitBodyTheme(teacher, 'zi-scheme-light', 30000)
+    await waitVisible(teacher, '.card', 30000)
+    // 卡片底色有过渡动画，等它停稳再量，否则会读到过渡帧
+    await sleep(600)
+    const loginLight = await readAppearance(teacher, 'body', ['.card'])
+    await setColorScheme(teacher, 'dark')
+    await waitBodyTheme(teacher, 'zi-scheme-dark', 30000)
+    await sleep(600)
+    const loginDark = await readAppearance(teacher, 'body', ['.card'])
+    if (!loginDark.blocks[0].style || loginDark.blocks[0].style.background === loginLight.blocks[0].style.background) {
+      throw new Error('老师端登录页深色下卡片底色没变')
+    }
+    result.teacher.login = loginDark.blocks[0].style.background
+    await teacher.evaluate((token) => localStorage.setItem('zhiyin_admin_token', token), adminToken || '')
+
+    // 深色下一路看完工作台、流水、设置
+    await gotoFresh(teacher, `${TEACHER_URL}/#/dashboard`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    })
+    await waitBody(teacher, '接单队列', 60000)
+    await waitBodyTheme(teacher, 'zi-scheme-dark', 30000)
+    const dashboard = await readAppearance(teacher, 'body', ['.page-card', '.stats'])
+    result.teacher.dashboard = dashboard
+    await waitVisible(teacher, '.page-card', 20000)
+    if (viewport.mobile) {
+      await teacher.waitForSelector('.order-card', { timeout: 30000 })
+      await assertNoOverflow(teacher, '老师端工作台（深色）')
+      await assertTouchButtons(teacher, '老师端工作台（深色）', '.order-card')
+      await assertTouchButtons(teacher, '老师端工作台工具栏（深色）', '.main')
+    }
+    result.contrast.push(await measureTextContrast(teacher, '.main', '老师端工作台（深色）'))
+
+    for (const item of [
+      { name: '收款流水', path: '/transactions', text: '共' },
+      { name: '收单与公告', path: '/settings', text: '收单管理' },
+    ]) {
+      await gotoFresh(teacher, `${TEACHER_URL}/#${item.path}`, {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+      })
+      await waitBody(teacher, item.text, 60000)
+      await waitBodyTheme(teacher, 'zi-scheme-dark', 30000)
+      const appearance = await readAppearance(teacher, 'body', ['.page-card'])
+      const background = appearance.blocks[0].style && appearance.blocks[0].style.background
+      const match = background && background.match(/rgba?\(([^)]+)\)/)
+      const channels = match ? match[1].split(/[,/\s]+/).filter(Boolean).map(Number) : []
+      const brightness = channels.length >= 3 ? (channels[0] + channels[1] + channels[2]) / 3 : 255
+      if (brightness > 90) throw new Error(`老师端${item.name}屏深色下卡片底色仍然偏亮：${background}`)
+      if (viewport.mobile) await assertNoOverflow(teacher, `老师端${item.name}屏（深色）`)
+      result.pages[`teacher-${item.name}`] = background
+    }
+  }, teacher)
+
+  await step('深色：与纸面工单、信号牌两套皮肤交叉显示', async () => {
+    // 学生端：面板仍是三选一，没有深色开关，选中项变了底色也跟着变
+    await gotoFresh(student, `${STUDENT_URL}/#/pages/mine/mine`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    })
+    await waitBody(student, '全部', 60000)
+    await waitVisibleClass(student, '.page', 'zi-scheme-dark')
+    await clickSelector(student, '.theme-entry')
+    await waitVisible(student, '.theme-sheet', 20000)
+    const sheet = await student.evaluate(() => ({
+      options: [...document.querySelectorAll('.theme-sheet .theme-option')].map((node) =>
+        node.getAttribute('data-theme'),
+      ),
+      schemeSwitches: [...document.querySelectorAll('.theme-sheet button')].filter((node) =>
+        (node.innerText || '').includes('深色'),
+      ).length,
+    }))
+    if (sheet.options.length !== 3) {
+      throw new Error(`皮肤面板被改成了 ${sheet.options.length} 项：${sheet.options.join('、')}`)
+    }
+    if (sheet.schemeSwitches !== 0) {
+      throw new Error('皮肤面板里多出了手动深色开关')
+    }
+    // 纸面工单（面板选完会自己收起，量之前按需重新打开）
+    await clickSelector(student, '.theme-option[data-theme="press"]', '.theme-sheet')
+    await waitVisibleClass(student, '.page', 'zi-theme-press')
+    await sleep(400)
+    const pressAppearance = await readAppearance(student, '.page', ['.card'])
+    const pressBackground = pressAppearance.blocks[0].style.background
+    result.skins.studentPress = pressBackground
+    if (!pressAppearance.classes.includes('zi-scheme-dark')) {
+      throw new Error(`学生端纸面工单深色下丢了深浅状态：${pressAppearance.classes.join(' ')}`)
+    }
+    // 订单里的纸面工单：深色下这张单子的纸面颜色不变（打印观感不受深浅影响）
+    await gotoFresh(student, `${STUDENT_URL}/#/pages/mine/detail?id=${orderId}`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    })
+    await waitBody(student, '取件码 · 凭此码到文印室取件', 60000)
+    await waitVisibleClass(student, '.page', 'zi-theme-press')
+    await waitVisibleClass(student, '.page', 'zi-scheme-dark')
+    const ticket = await student.evaluate(() => {
+      const visible = (selector) =>
+        [...document.querySelectorAll(selector)].filter((node) => node.getClientRects().length > 0).pop() || null
+      const block = visible('.code-block')
+      const page = visible('.page')
+      return {
+        paper: block ? getComputedStyle(block).backgroundColor : '',
+        ink: block ? getComputedStyle(block.querySelector('.code')).color : '',
+        page: page ? getComputedStyle(page).backgroundColor : '',
+      }
+    })
+    result.skins.printPaper = ticket
+    if (ticket.paper !== 'rgb(248, 244, 233)') {
+      throw new Error(`深色下纸面工单的纸面颜色被改成了 ${ticket.paper}（应为浅色的 rgb(248, 244, 233)）`)
+    }
+    if (ticket.page === ticket.paper) {
+      throw new Error('深色下纸面工单与页面底色一样，深浅没生效')
+    }
+    await gotoFresh(student, `${STUDENT_URL}/#/pages/mine/mine`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    })
+    await waitBody(student, '全部', 60000)
+    await waitVisibleClass(student, '.page', 'zi-theme-press')
+    await waitVisibleClass(student, '.page', 'zi-scheme-dark')
+    await clickSelector(student, '.theme-entry')
+    await waitVisible(student, '.theme-sheet', 20000)
+    await clickSelector(student, '.theme-option[data-theme="signal"]', '.theme-sheet')
+    await waitVisibleClass(student, '.page', 'zi-theme-signal')
+    await waitVisibleClass(student, '.page', 'zi-scheme-dark')
+    await sleep(400)
+    const signalAppearance = await readAppearance(student, '.page', ['.card'])
+    const signalBackground = signalAppearance.blocks[0].style.background
+    result.skins.studentSignal = signalBackground
+    if (!signalAppearance.classes.includes('zi-scheme-dark')) {
+      throw new Error(`学生端信号牌深色下丢了深浅状态：${signalAppearance.classes.join(' ')}`)
+    }
+    if (signalBackground === pressBackground) {
+      throw new Error(`学生端两套皮肤在深色下卡片底色一样：${signalBackground}`)
+    }
+    if (viewport.mobile) await assertNoOverflow(student, '学生端我的页（信号牌 · 深色）')
+
+    // 老师端：侧边栏（手机在抽屉里）切到信号牌，深色状态保持
+    const root = viewport.mobile ? '.drawer-body' : '.aside'
+    if (viewport.mobile) {
+      await clickSelector(teacher, '.menu-trigger')
+      await waitVisible(teacher, '.drawer-body', 20000)
+    }
+    await waitVisible(teacher, `${root} .theme-option`, 20000)
+    await clickSelector(teacher, '.theme-option[data-theme="signal"]', root)
+    await waitBodyTheme(teacher, 'zi-theme-signal', 20000)
+    await waitBodyTheme(teacher, 'zi-scheme-dark', 20000)
+    if (viewport.mobile) {
+      await teacher.keyboard.press('Escape')
+      await sleep(600)
+    }
+    const teacherSignal = await readAppearance(teacher, 'body', ['.page-card'])
+    result.skins.teacherSignal = teacherSignal.blocks[0].style.background
+    if (viewport.mobile) await assertNoOverflow(teacher, '老师端工作台（信号牌 · 深色）')
+  })
+
+  await step('深色：浅色与深色各截一份学生端我的与老师端工作台', async () => {
+    // 回到默认皮肤（纸面工单），先截深色
+    await gotoFresh(student, `${STUDENT_URL}/#/pages/mine/mine`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    })
+    await waitBody(student, '全部', 60000)
+    await clickSelector(student, '.theme-entry')
+    await waitVisible(student, '.theme-sheet', 20000)
+    await clickSelector(student, '.theme-option[data-theme="press"]', '.theme-sheet')
+    await waitVisibleClass(student, '.page', 'zi-theme-press')
+    await waitVisibleClass(student, '.page', 'zi-scheme-dark')
+    await student.bringToFront()
+    // 换肤轻提示会盖在页面中间，等它自己消失再截
+    await waitGone(student, '界面皮肤已切换', 8000).catch(() => {})
+    await sleep(400)
+    const darkStudent = await shoot(student, `dark-student-mine-${viewport.name}`)
+
+    await gotoFresh(teacher, `${TEACHER_URL}/#/dashboard`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    })
+    await waitBody(teacher, '接单队列', 60000)
+    await waitBodyTheme(teacher, 'zi-scheme-dark', 30000)
+    if (viewport.mobile) {
+      const root = '.drawer-body'
+      await clickSelector(teacher, '.menu-trigger')
+      await waitVisible(teacher, root, 20000)
+      await clickSelector(teacher, '.theme-option[data-theme="press"]', root)
+      await waitBodyTheme(teacher, 'zi-theme-press', 20000)
+      await teacher.keyboard.press('Escape')
+      await sleep(600)
+    } else {
+      await clickSelector(teacher, '.theme-option[data-theme="press"]', '.aside')
+      await waitBodyTheme(teacher, 'zi-theme-press', 20000)
+    }
+    await waitVisible(teacher, '.page-card', 20000)
+    await teacher.bringToFront()
+    await sleep(400)
+    const darkTeacher = await shoot(teacher, `dark-teacher-dashboard-${viewport.name}`)
+
+    result.contrast.push(await measureTextContrast(student, '.page', '学生端我的（深色）'))
+
+    // 系统回浅色：界面自己回浅色，不用刷新
+    await setColorScheme(student, 'light')
+    await waitVisibleClass(student, '.page', 'zi-scheme-light')
+    await sleep(400)
+    const lightStudent = await shoot(student, `light-student-mine-${viewport.name}`)
+    await setColorScheme(teacher, 'light')
+    await waitBodyTheme(teacher, 'zi-scheme-light', 20000)
+    await sleep(400)
+    const lightTeacher = await shoot(teacher, `light-teacher-dashboard-${viewport.name}`)
+
+    if (darkStudent.digest === lightStudent.digest) {
+      throw new Error('学生端深色与浅色截图一模一样，深浅没生效')
+    }
+    if (darkTeacher.digest === lightTeacher.digest) {
+      throw new Error('老师端深色与浅色截图一模一样，深浅没生效')
+    }
+    result.screenshots = [
+      darkStudent.file,
+      lightStudent.file,
+      darkTeacher.file,
+      lightTeacher.file,
+    ]
+
+    // 对比度：正文与背景，最差的一组判不过就失败
+    const failures = result.contrast.flatMap((item) => item.failures || [])
+    const worst = result.contrast
+      .flatMap((item) => item.worst || [])
+      .sort((a, b) => a.ratio - b.ratio)[0]
+    result.worstContrast = worst
+    for (const item of result.contrast) {
+      console.log(
+        `      对比度 ${item.label}：抽查 ${item.checked} 处，最差 ${(item.worst[0] || {}).ratio}:1`,
+      )
+    }
+    if (worst) {
+      console.log(
+        `      最差一组：${worst.ratio}:1「${worst.text}」${worst.color} 于 ${worst.background}`,
+      )
+    }
+    if (failures.length) {
+      throw new Error(
+        `深色下正文对比度低于 4.5:1：${failures
+          .map((item) => `${item.ratio}:1「${item.text}」`)
+          .join('、')}`,
+      )
+    }
+  })
+
+  return result
 }
 
 // ---------------------------------------------------------------- 入口

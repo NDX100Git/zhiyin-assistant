@@ -70,7 +70,7 @@ async function submit() {
   border: var(--zi-card-border);
   border-top: 8px solid var(--zi-accent);
   border-radius: var(--zi-radius);
-  box-shadow: 12px 12px 0 rgba(23, 22, 26, 0.12);
+  box-shadow: var(--zi-card-shadow-hard);
 }
 .card :deep(.el-card__body) {
   padding: 28px;
@@ -112,7 +112,7 @@ async function submit() {
   border: none;
   border-top: none;
   border-radius: 16px;
-  box-shadow: 0 16px 40px rgba(31, 45, 61, 0.12);
+  box-shadow: var(--zi-card-shadow-hard);
 }
 .zi-theme-classic .brand {
   padding-bottom: 0;
