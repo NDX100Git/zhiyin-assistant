@@ -1,8 +1,14 @@
-"""复测 30 秒轮询下的单实例读取容量。
+"""复测一万单排队下的单进程读取容量。
 
-口径：一万人同时在线，每人每 30 秒拉一次「我的订单」列表，平均约 333 次/秒。
+判定口径（本轮的硬指标）：一万单排队、单进程、并发 16 时 QPS 不低于 200、
+各档 p95 低于 1000 ms。脚本按这个口径判通过与否。
+
+背景口径：一万人同时在线、每人每 30 秒拉一次「我的订单」列表 = 333.3 次/秒。
+那是「整套服务（多实例 / 多进程）要扛住的峰值」，不是单个进程的目标；
+把它记在结果里只作参照，不作判定线。
+
 做法：用真实下单接口灌 N 单并置成「排队中」，再按不同并发持续读订单列表，
-量出单实例的每秒成功次数与延迟分位，和 333 次/秒对比。
+量出每秒成功次数、延迟分位，以及（给了 --server-pid 时）每请求进程 CPU。
 
 脚本只肯清名字以 `_stress` 结尾的库，跑法见 RUNBOOK 第 13 节：
 
@@ -38,10 +44,34 @@ from sqlalchemy.engine import make_url  # noqa: E402
 from app.config import settings  # noqa: E402
 from scripts.stress_extreme import _login, _percentile  # noqa: E402
 
-# 一万人 / 30 秒；学生端默认轮询间隔见 student-app/src/config/index.js
+# 本轮判定线：一万单排队、单进程、并发 16 时不低于 200 次/秒，p95 低于 1000 ms
+TARGET_QPS = 200.0
+TARGET_P95_MS = 1000.0
+
+# 背景口径：一万人 / 30 秒；学生端默认轮询间隔见 student-app/src/config/index.js
+# 10000 / 30 = 333.3 次/秒。这是整套服务要扛的峰值，单进程目标按 200 算，留出余量。
 ONLINE_USERS = 10000
 POLL_SECONDS = 30.0
 DEMAND_QPS = ONLINE_USERS / POLL_SECONDS
+
+
+def _proc_cpu_seconds(pids: list[int]) -> float | None:
+    """读 /proc/<pid>/stat 的 utime+stime（单位秒）并求和，量进程真实吃的 CPU。
+
+    多 worker 诊断时把各个 worker 的 pid 都传进来，否则只量到一个 worker 会得出 0。
+    """
+    ticks = 0
+    read_any = False
+    for pid in pids:
+        try:
+            fields = Path(f"/proc/{pid}/stat").read_text().split()
+        except OSError:
+            continue
+        read_any = True
+        ticks += int(fields[13]) + int(fields[14])
+    if not read_any:
+        return None
+    return ticks / os.sysconf("SC_CLK_TCK")
 
 
 def _client(base_url: str) -> httpx.Client:
@@ -216,6 +246,21 @@ def main() -> int:
     parser.add_argument("--seconds", type=float, default=10.0, help="每个并发档位测多久")
     parser.add_argument("--levels", default="16,32,64", help="并发档位，逗号分隔")
     parser.add_argument("--skip-fill", action="store_true", help="不清库不灌数据，直接测读")
+    parser.add_argument(
+        "--server-processes",
+        type=int,
+        default=1,
+        help="被测服务的进程数：1 表示单进程（启动时不加 --workers），大于是诊断对照",
+    )
+    parser.add_argument(
+        "--server-pid",
+        type=str,
+        default=None,
+        help="被测服务进程的 pid，多个用逗号分隔；给了就额外量每请求 CPU",
+    )
+    parser.add_argument(
+        "--note", default="", help="写进结果文件的口径补充（逐条列，用 | 分隔）"
+    )
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
 
@@ -224,6 +269,9 @@ def main() -> int:
         print(f"目标库 {db_name} 不像压力测试库（要求以 _stress 结尾），拒绝清库")
         return 2
 
+    server_pids = [
+        int(item) for item in (args.server_pid or "").replace(" ", "").split(",") if item
+    ]
     levels = [int(item) for item in args.levels.split(",") if item.strip()]
     if not levels or any(level < 1 for level in levels):
         print("并发档位必须是正整数")
@@ -299,26 +347,42 @@ def main() -> int:
         queued = conn.execute(
             sql_text("SELECT COUNT(*) FROM orders WHERE status = 'queuing'")
         ).scalar_one()
-    print(f"\n阶段二：{queued} 单排队时的读取容量（模拟一万人每 30 秒轮询）")
+    print(f"\n阶段二：{queued} 单排队时的读取容量（单进程即 {TARGET_QPS:.0f} 次/秒的目标）")
 
     results = []
     for index, level in enumerate(levels):
         if index:
             time.sleep(1.0)
         print(f"  并发 {level:>3}：", end="", flush=True)
+        cpu_before = _proc_cpu_seconds(server_pids) if server_pids else None
         result = _measure_level(args.base_url, tokens[0], level, args.seconds)
+        cpu_after = _proc_cpu_seconds(server_pids) if server_pids else None
+        if cpu_before is not None and cpu_after is not None and result["success"]:
+            result["cpu_ms_per_request"] = (cpu_after - cpu_before) * 1000 / result["success"]
+            result["cpu_cores"] = (cpu_after - cpu_before) / result["seconds"]
         results.append(result)
+        extra = ""
+        if "cpu_ms_per_request" in result:
+            extra = (
+                f"，每请求 CPU {result['cpu_ms_per_request']:.2f} ms"
+                f"（{result['cpu_cores']:.2f} 核）"
+            )
         print(
             f"{result['qps']:.1f} 次/秒，成功 {result['success']}，失败 {result['errors']}，"
             f"p50 {result['p50']:.0f} ms，p95 {result['p95']:.0f} ms，"
-            f"p99 {result['p99']:.0f} ms"
+            f"p99 {result['p99']:.0f} ms{extra}"
         )
         if result["error_sample"]:
             print(f"    失败样本：{result['error_sample']}")
 
     best = max(results, key=lambda item: item["qps"])
-    headroom = (best["qps"] / DEMAND_QPS - 1.0) * 100 if DEMAND_QPS else 0.0
-    passed = best["qps"] >= DEMAND_QPS and all(item["p95"] < 1000 for item in results)
+    main = next((item for item in results if item["concurrency"] == 16), best)
+    headroom = (main["qps"] / TARGET_QPS - 1.0) * 100
+    demand_headroom = (best["qps"] / DEMAND_QPS - 1.0) * 100 if DEMAND_QPS else 0.0
+    passed = (
+        main["qps"] >= TARGET_QPS
+        and all(item["p95"] < TARGET_P95_MS for item in results)
+    )
     verdict = "通过" if passed else "不通过"
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -327,26 +391,44 @@ def main() -> int:
     )
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    table = [
-        "| 并发 | 测量时长 | 成功次数 | 失败次数 | 实测 QPS | p50 | p95 | p99 | 最大 |",
-        "|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|",
-    ]
+    has_cpu = any("cpu_ms_per_request" in item for item in results)
+    header = "| 并发 | 测量时长 | 成功次数 | 失败次数 | 实测 QPS | p50 | p95 | p99 | 最大 |"
+    rule = "|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|"
+    if has_cpu:
+        header += " 每请求 CPU | 折合核数 |"
+        rule += ":---:|:---:|"
+    table = [header, rule]
     for item in results:
-        table.append(
+        row = (
             f"| {item['concurrency']} | {item['seconds']:.1f} s | {item['success']} | "
             f"{item['errors']} | {item['qps']:.1f} | {item['p50']:.0f} ms | "
             f"{item['p95']:.0f} ms | {item['p99']:.0f} ms | {item['max']:.0f} ms |"
         )
+        if has_cpu:
+            if "cpu_ms_per_request" in item:
+                row += f" {item['cpu_ms_per_request']:.2f} ms | {item['cpu_cores']:.2f} |"
+            else:
+                row += " — | — |"
+        table.append(row)
 
+    processes_note = (
+        "单进程（启动时不加 --workers）"
+        if args.server_processes == 1
+        else f"{args.server_processes} 个 worker（诊断对照，不能当单进程交付）"
+    )
     lines = [
-        f"# 30 秒轮询下的单实例读取容量（{datetime.now():%Y-%m-%d %H:%M}）",
+        f"# 一万单排队下的读取容量（{datetime.now():%Y-%m-%d %H:%M}）",
         "",
         f"- 结论：**{verdict}**",
-        f"- 需求口径：{ONLINE_USERS} 人同时在线，每 {POLL_SECONDS:g} 秒轮询一次，"
-        f"平均 {DEMAND_QPS:.1f} 次/秒",
-        f"- 单实例实测峰值：**{best['qps']:.1f} 次/秒**（并发 {best['concurrency']}），"
-        f"余量 {headroom:+.1f}%",
-        f"- 判定线：QPS 不低于 {DEMAND_QPS:.1f}，且各档 p95 低于 1000 ms",
+        f"- 判定线（本轮硬指标）：一万单排队、单进程、并发 16 时 QPS 不低于 "
+        f"{TARGET_QPS:.0f}，且各档 p95 低于 {TARGET_P95_MS:.0f} ms",
+        f"- 实测：并发 16 时 **{main['qps']:.1f} 次/秒**，p95 {main['p95']:.0f} ms，"
+        f"对 {TARGET_QPS:.0f} 的余量 {headroom:+.1f}%",
+        f"- 各档峰值：{best['qps']:.1f} 次/秒（并发 {best['concurrency']}）",
+        f"- 被测服务进程数：**{processes_note}**",
+        f"- 背景口径（不作判定线）：{ONLINE_USERS} 人同时在线、每 {POLL_SECONDS:g} 秒轮询一次"
+        f" = {DEMAND_QPS:.1f} 次/秒，峰值 {best['qps']:.1f} 次/秒对它的余量 "
+        f"{demand_headroom:+.1f}%",
         "- 读取容量随在途排队订单数变化；本结果对应上面的排队规模，换规模要重跑。",
         "",
         "## 环境",
@@ -357,6 +439,8 @@ def main() -> int:
         f"- 代码提交：`{_git_commit()}`",
         f"- 系统：{platform.platform()}，CPU {os.cpu_count()} 核",
         f"- Python：{platform.python_version()}",
+        *([f"- 采样进程：{', '.join(str(pid) for pid in server_pids)}"]
+          if server_pids else []),
         f"- 连接池：size {settings.db_pool_size}，overflow {settings.db_max_overflow}，"
         f"timeout {settings.db_pool_timeout} 秒",
         "",
@@ -364,17 +448,27 @@ def main() -> int:
         "",
         *table,
         "",
+        *(
+            ["## 补充说明", "", *[f"- {item.strip()}" for item in args.note.split("|") if item.strip()], ""]
+            if args.note.strip()
+            else []
+        ),
         "## 口径",
         "",
         "- 每个档位用固定并发持续打 `/api/order/list`，按成功响应数除以实际测量时长算 QPS。",
         "- 失败计入失败次数，不计入 QPS；失败样本会打印在终端。",
-        "- 把一万人每 30 秒一次摊平成均匀流量，是容量上限的口径；真实流量是脉冲式，"
-        "瞬时峰值会更高，需要多实例时另算。",
+        "- 每请求 CPU = 被测进程 `/proc/<pid>/stat` 的 utime+stime 增量除以成功次数；"
+        "折合核数 = CPU 增量除以墙钟时长，单进程超过 1.0 核说明这一档已经打满一个核。",
+        "- 一万人每 30 秒一次摊平成均匀流量是「整套服务」的容量口径；真实流量是脉冲式，"
+        "瞬时峰值会更高，需要多实例时另算。单进程目标是 200 次/秒，留出多实例叠加的余量。",
         "",
     ]
     text = "\n".join(lines)
     output.write_text(text + "\n", encoding="utf-8")
-    print(f"\n结论：{verdict}，单实例峰值 {best['qps']:.1f} 次/秒，需求 {DEMAND_QPS:.1f} 次/秒")
+    print(
+        f"\n结论：{verdict}，并发 16 时 {main['qps']:.1f} 次/秒（目标 {TARGET_QPS:.0f}），"
+        f"p95 {main['p95']:.0f} ms（上限 {TARGET_P95_MS:.0f}），进程数 {args.server_processes}"
+    )
     print(f"结果已写入：{output}")
     return 0 if passed else 1
 
