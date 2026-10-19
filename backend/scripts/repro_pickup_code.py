@@ -40,6 +40,10 @@ from app.models.order import Order  # noqa: E402
 from app.models.user import User  # noqa: E402
 from app.schemas.order import OrderCreateRequest  # noqa: E402
 from app.services import admin_service, order_service  # noqa: E402
+
+# 回归脚本只验证取件码逻辑，不碰对象存储：跳过「文件是否还在、是否过期」的校验，
+# 否则没有真实上传对象时会直接报 40053，脚本跑不到核销那一步。
+order_service._validate_file_freshness = lambda _key: None
 from app.services.order_state import (  # noqa: E402
     STATUS_PRINTING,
     STATUS_QUEUING,
