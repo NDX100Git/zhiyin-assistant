@@ -23,6 +23,19 @@ MIGRATION_COLUMNS: dict[str, dict[str, str]] = {
         "requeue_at": "DATETIME NULL COMMENT '换文件后重新排队时间，为空时按创建时间排队'",
         "file_changed_at": "DATETIME NULL COMMENT '当前文件最近一次被替换的时间'",
         "files_seen_at": "DATETIME NULL COMMENT '老师确认看到替换后文件的时间'",
+        "print_page_count": (
+            "INT NOT NULL DEFAULT 0 "
+            "COMMENT '整单打印页数 = Σ 各份 page_count × copies'"
+        ),
+    },
+    "order_files": {
+        "print_side": "TINYINT NULL COMMENT '1=单面 2=双面；为空沿用订单级'",
+        "color_mode": "TINYINT NULL COMMENT '0=黑白 1=彩色；为空沿用订单级'",
+        "paper_size": "VARCHAR(8) NULL COMMENT '纸张规格；为空沿用订单级'",
+        "copies": "INT NULL COMMENT '该份份数；为空沿用订单级'",
+        "print_pages": (
+            "INT NOT NULL DEFAULT 0 COMMENT '该份打印页数 = page_count × copies'"
+        ),
     },
     "order_file_versions": {
         "file_index": "INT NOT NULL DEFAULT 1 COMMENT '文件在订单清单里的序号'",
@@ -90,6 +103,47 @@ WHERE o.file_key IS NOT NULL
   AND NOT EXISTS (
     SELECT 1 FROM `order_file_versions` v WHERE v.order_id = o.id
   )
+"""
+
+# 逐份打印参数：老行没有取值时按订单级同名字段回填，保证「行上有值」与订单一致。
+BACKFILL_FILE_PARAMS_SQL = """
+UPDATE `order_files` f JOIN `orders` o ON o.id = f.order_id
+SET f.print_side = COALESCE(f.print_side, o.print_side),
+    f.color_mode = COALESCE(f.color_mode, o.color_mode),
+    f.paper_size = COALESCE(f.paper_size, o.paper_size),
+    f.copies = COALESCE(f.copies, o.copies)
+WHERE f.print_side IS NULL
+   OR f.color_mode IS NULL
+   OR f.paper_size IS NULL
+   OR f.copies IS NULL
+"""
+
+# 该份打印页数 = page_count × copies（回填后恒等于这一口径）。
+BACKFILL_PRINT_PAGES_SQL = """
+UPDATE `order_files` f JOIN `orders` o ON o.id = f.order_id
+SET f.print_pages = f.page_count * COALESCE(f.copies, o.copies, 1)
+WHERE f.print_pages <> f.page_count * COALESCE(f.copies, o.copies, 1)
+"""
+
+# 整单打印页数 = Σ 各份打印页数。
+BACKFILL_ORDER_PRINT_PAGES_SQL = """
+UPDATE `orders` o
+JOIN (
+  SELECT order_id, SUM(print_pages) AS total_print_pages
+  FROM `order_files`
+  GROUP BY order_id
+) s ON s.order_id = o.id
+SET o.print_page_count = s.total_print_pages
+WHERE o.print_page_count <> s.total_print_pages
+"""
+
+# 没有任何文件清单行的老订单，按订单自身的页数与份数直接算。
+BACKFILL_ORDER_PRINT_PAGES_LEGACY_SQL = """
+UPDATE `orders` o
+SET o.print_page_count = COALESCE(o.page_count, 0) * COALESCE(o.copies, 1)
+WHERE o.print_page_count = 0
+  AND COALESCE(o.page_count, 0) > 0
+  AND NOT EXISTS (SELECT 1 FROM `order_files` f WHERE f.order_id = o.id)
 """
 
 
@@ -169,6 +223,24 @@ def run_migrations(engine: Engine) -> list[str]:
             if result.rowcount:
                 applied.append(f"order_file_versions.backfill:{result.rowcount}")
                 logger.info("迁移：已为 %d 张老订单回填文件版本", result.rowcount)
+
+        # 逐份打印参数与页数：先补参数，再算该份打印页数，最后汇总整单打印页数。
+        # 三句都是「按当前数据重新算出正确值」的幂等更新，跑两遍第二遍改 0 行。
+        if _table_exists(conn, "order_files"):
+            for name, sql in (
+                ("order_files.print_params", BACKFILL_FILE_PARAMS_SQL),
+                ("order_files.print_pages", BACKFILL_PRINT_PAGES_SQL),
+                ("orders.print_page_count", BACKFILL_ORDER_PRINT_PAGES_SQL),
+                (
+                    "orders.print_page_count_legacy",
+                    BACKFILL_ORDER_PRINT_PAGES_LEGACY_SQL,
+                ),
+            ):
+                result = conn.execute(text(sql))
+                changed = int(result.rowcount or 0)
+                if changed > 0:
+                    applied.append(f"{name}:{changed}")
+                    logger.info("迁移：%s 回填 %d 行", name, changed)
 
     return applied
 

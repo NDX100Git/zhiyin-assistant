@@ -25,8 +25,10 @@ from app.services.file_change_service import (
 from app.services.order_file_service import (
     batch_files_view,
     ensure_files,
+    file_to_dict,
     files_view,
     is_file_unconfirmed,
+    system_total_cents,
 )
 from app.services.order_state import (
     ADMIN_CANCELLABLE,
@@ -38,7 +40,6 @@ from app.services.order_state import (
     record_log,
     status_label,
 )
-from app.services.pricing import calc_amount_cents
 from app.services.printer import get_printer_provider
 from app.services.queue_service import batch_wait_info, order_wait_info, queue_order_by
 from app.services.session_service import get_or_create_session
@@ -94,6 +95,7 @@ def order_admin_view(db: Session, order: Order, wait: dict | None = None,
         "file_key": order.file_key,
         "file_name": order.file_name,
         "page_count": order.page_count,
+        "print_page_count": int(order.print_page_count or 0),
         "print_side": order.print_side,
         "color_mode": order.color_mode,
         "copies": order.copies,
@@ -174,15 +176,15 @@ def download_url(db: Session, order: Order, file_index: int | None = None) -> di
             )
     storage = get_storage()
     items = [
-        {
-            "file_index": int(row.file_index),
-            "file_key": row.file_key,
-            "file_name": row.file_name,
-            "page_count": int(row.page_count or 0),
-            "signed_url": storage.signed_url(row.file_key),
-        }
+        {**file_to_dict(row, order), "signed_url": storage.signed_url(row.file_key)}
         for row in rows
     ]
+    if not items and order.file_key:
+        # 老订单迁移未回填时，兜底给第 1 份文件的链接
+        for view in files_view(db, order):
+            items.append(
+                {**view, "signed_url": storage.signed_url(view["file_key"])}
+            )
     primary = next(
         (item for item in items if item["file_index"] == int(target.file_index)),
         items[0] if items else None,
@@ -234,9 +236,7 @@ def confirm_files_seen(db: Session, order: Order, operator: str) -> dict:
 def complete_print(db: Session, order: Order, operator: str,
                    amount_cents: int | None = None) -> dict:
     """打印完成：printing -> ready，系统计价预填，老师可改（改价写日志留痕）。"""
-    system_amount = calc_amount_cents(
-        order.page_count or 1, order.print_side or 2, order.color_mode or 0, order.copies or 1
-    )
+    system_amount = system_total_cents(db, order)
     final_amount = system_amount if amount_cents is None else int(amount_cents)
     if final_amount < 0:
         raise BusinessError("金额不能为负数", code=40061)
@@ -430,11 +430,9 @@ def today_summary(db: Session) -> dict:
     }
 
 
-def quote_amount(order: Order) -> dict:
-    """打印完成前的系统报价（老师端弹窗预填用）。"""
-    system_amount = calc_amount_cents(
-        order.page_count or 1, order.print_side or 2, order.color_mode or 0, order.copies or 1
-    )
+def quote_amount(db: Session, order: Order) -> dict:
+    """打印完成前的系统报价（老师端弹窗预填用）：按逐份参数整单累加。"""
+    system_amount = system_total_cents(db, order)
     return {
         "order_id": order.id,
         "system_amount_cents": system_amount,

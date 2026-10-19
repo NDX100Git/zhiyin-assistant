@@ -31,7 +31,9 @@ from app.services.order_file_service import (
     create_order_files,
     files_view,
     is_file_unconfirmed,
+    items_totals,
     normalize_file_items,
+    validate_print_params,
 )
 from app.services.order_state import (
     STATUS_CANCELLED,
@@ -42,7 +44,6 @@ from app.services.order_state import (
     status_label,
 )
 from app.services.payment import get_payment_provider
-from app.services.pricing import calc_amount_cents
 from app.services.queue_service import batch_wait_info, new_order_wait_info, order_wait_info
 from app.services.session_service import current_session_info, get_or_create_session
 from app.services.storage import get_storage
@@ -107,17 +108,10 @@ def build_pickup_code(seq: int, day: date) -> str:
 
 
 def _validate_create(payload, limits: dict) -> None:
-    if payload.print_side not in (1, 2):
-        raise BusinessError("打印方式只能是单面或双面", code=40042)
-    if payload.color_mode not in (0, 1):
-        raise BusinessError("颜色模式只能是黑白或彩色", code=40043)
-    if not 1 <= int(payload.copies) <= int(limits["max_copies"]):
-        raise BusinessError(f"份数必须在 1 到 {limits['max_copies']} 之间", code=40044)
-    if payload.paper_size not in limits["allowed_paper_sizes"]:
-        raise BusinessError(
-            f"纸张规格不支持：{payload.paper_size}，可选 {'、'.join(limits['allowed_paper_sizes'])}",
-            code=40046,
-        )
+    # 订单级参数与逐份参数走同一套校验，错误码也一致
+    validate_print_params(
+        payload.print_side, payload.color_mode, payload.paper_size, payload.copies, limits
+    )
     if payload.remark and len(payload.remark) > int(limits["max_remark_length"]):
         raise BusinessError(f"备注最多 {limits['max_remark_length']} 个字符", code=40047)
 
@@ -143,20 +137,24 @@ def _validate_file_freshness(file_key: str) -> None:
 
 
 def _validate_file_owner(db: Session, user: User, items: list[dict]) -> None:
-    """下单时校验文件归属：有上传记录的必须是本人。
+    """下单时逐个校验文件归属：没有上传记录、或记录不是本人，一律拒绝。
 
     文件标识本身就长成 `files/...`，单靠格式校验挡不住「拿别人的文件标识下单」。
-    迁移前的历史文件没有上传记录，无法判断归属，继续放行，不能因为补校验把老数据
-    的正常下单挡掉。不区分「不存在」与「是别人的」，避免泄露别人的文件标识。
+    历史文件缺少上传记录时同样不能确认归属，因此直接拒绝并要求重新上传；
+    「不存在」与「是别人的」返回同一条提示与同一个错误码，不泄露别人的文件标识。
     """
     keys = [item["file_key"] for item in items]
-    rows = db.execute(
-        select(UploadedFile.file_key, UploadedFile.user_id).where(
-            UploadedFile.file_key.in_(keys)
-        )
-    ).all()
-    for _file_key, owner_id in rows:
-        if int(owner_id) != int(user.id):
+    owners = {
+        str(file_key): int(owner_id)
+        for file_key, owner_id in db.execute(
+            select(UploadedFile.file_key, UploadedFile.user_id).where(
+                UploadedFile.file_key.in_(keys)
+            )
+        ).all()
+    }
+    for item in items:
+        owner_id = owners.get(str(item["file_key"]))
+        if owner_id is None or owner_id != int(user.id):
             raise BusinessError("文件不存在或不属于当前用户，请重新上传", code=40404)
 
 
@@ -172,10 +170,7 @@ def create_order(db: Session, user: User, payload) -> Order:
     # 截单不拒绝下单：仅把订单排到下一个打印时段（首页会给出提示）
     session_info = current_session_info(db)
 
-    total_pages = sum(int(item["page_count"]) for item in items)
-    amount_cents = calc_amount_cents(
-        total_pages, payload.print_side, payload.color_mode, payload.copies
-    )
+    total_pages, total_print_pages, amount_cents = items_totals(items)
     first = items[0]
 
     now = datetime.now()  # 服务端时间
@@ -190,6 +185,7 @@ def create_order(db: Session, user: User, payload) -> Order:
         file_key=first["file_key"],
         file_name=first["file_name"],
         page_count=total_pages,
+        print_page_count=total_print_pages,
         print_side=payload.print_side,
         color_mode=payload.color_mode,
         copies=payload.copies,
@@ -306,6 +302,7 @@ def order_to_dict(db: Session, order: Order, wait: dict | None = None,
         "file_key": order.file_key,
         "file_name": order.file_name,
         "page_count": order.page_count,
+        "print_page_count": int(order.print_page_count or 0),
         "print_side": order.print_side,
         "color_mode": order.color_mode,
         "copies": order.copies,

@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import BigInteger, DateTime, Index, Integer, String, func
+from sqlalchemy.dialects.mysql import TINYINT
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -30,7 +31,16 @@ class OrderFile(Base):
     file_key: Mapped[str] = mapped_column(String(255), nullable=False)
     file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     page_count: Mapped[int] = mapped_column(Integer, nullable=False)
-    # 该文件按当前打印参数算出的行金额快照（分），订单总额是各行之和
+    # 逐份打印参数：为空表示沿用订单级同名字段（老数据与单文件订单无需回填就能用）
+    print_side: Mapped[int | None] = mapped_column(TINYINT, nullable=True)  # 1=单面 2=双面
+    color_mode: Mapped[int | None] = mapped_column(TINYINT, nullable=True)  # 0=黑白 1=彩色
+    paper_size: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    copies: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 该份打印页数 = page_count × copies；订单的 print_page_count 是各行之和
+    print_pages: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    # 该文件按本行打印参数算出的行金额快照（分），订单总额是各行之和
     amount_cents: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )

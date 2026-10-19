@@ -144,7 +144,7 @@ def quote(
     db: Session = Depends(get_db),
 ) -> dict:
     order = admin_service.get_order(db, order_id)
-    return ok(admin_service.quote_amount(order))
+    return ok(admin_service.quote_amount(db, order))
 
 
 @router.post("/order/batch-complete", summary="批量标记完成", response_model=None)
