@@ -75,7 +75,7 @@
             <el-tag effect="plain">{{ row.pickup_code }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="file_name" label="文件" min-width="160" show-overflow-tooltip />
+        <el-table-column prop="file_name" label="文件" min-width="160" show-overflow-tooltip :formatter="fileFormatter" />
         <el-table-column prop="page_count" label="页数" width="70" />
         <el-table-column label="打印参数" width="150">
           <template #default="{ row }">
@@ -231,6 +231,12 @@ const stats = reactive({
   abnormal_count: 0,
 })
 const orders = ref([])
+
+/** 文件名可能为空（接口未带），表格里给个占位，避免整列看着像坏掉。 */
+function fileFormatter(row) {
+  return row.file_name || '论文文档'
+}
+
 const loading = ref(false)
 const selected = ref([])
 const verifyCodeValue = ref('')

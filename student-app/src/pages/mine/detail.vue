@@ -18,11 +18,11 @@
 
       <view class="card">
         <view class="row"><text class="k">订单号</text><text class="v">{{ order.order_no }}</text></view>
-        <view class="row"><text class="k">文件</text><text class="v">{{ order.file_name }}</text></view>
+        <view class="row"><text class="k">文件</text><text class="v">{{ order.file_name || '论文文档' }}</text></view>
         <view class="row"><text class="k">页数</text><text class="v">{{ order.page_count }} 页</text></view>
         <view class="row"><text class="k">打印</text><text class="v">{{ order.print_side === 2 ? '双面' : '单面' }} · {{ order.color_mode === 1 ? '彩色' : '黑白' }} · {{ order.copies }} 份</text></view>
         <view class="row"><text class="k">金额</text><text class="v money">{{ formatMoney(order.amount_cents) }}{{ order.paid ? '（已支付）' : '（未支付）' }}</text></view>
-        <view class="row"><text class="k">下单时间</text><text class="v">{{ order.created_at }}</text></view>
+        <view class="row"><text class="k">下单时间</text><text class="v">{{ formatTime(order.created_at) }}</text></view>
         <view v-if="order.cancel_reason" class="row"><text class="k">取消原因</text><text class="v">{{ order.cancel_reason }}</text></view>
       </view>
 
@@ -86,6 +86,12 @@ const timeline = computed(() => {
 
 function formatMoney(cents) {
   return `¥${((Number(cents) || 0) / 100).toFixed(2)}`
+}
+
+/** 后端返回的是 ISO 时间串，直接显示会带一个 T，这里换成 年-月-日 时:分。 */
+function formatTime(value) {
+  if (!value) return ''
+  return String(value).replace('T', ' ').slice(0, 16)
 }
 
 async function load() {
