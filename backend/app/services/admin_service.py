@@ -52,6 +52,31 @@ logger = logging.getLogger(__name__)
 # 区分「调用方没传」与「明确没有待确认请求」：队列接口批量查到 None 时要传 None
 _UNSET = object()
 
+# 老师手输取件码的归一化表：手机输入法常给出全角数字与全角/中文破折号，
+# 不归成半角就查不到库里的值。只作用于人工输入这一条路径，库里的存储值不动。
+_PICKUP_INPUT_TRANSLATION: dict[int, str] = {
+    # 全角数字 ０ 至 ９ → 半角
+    **{0xFF10 + i: chr(ord("0") + i) for i in range(10)},
+    # 全角字母 → 半角（字母随后统一大写，与库里的取件码一致）
+    **{0xFF21 + i: chr(ord("A") + i) for i in range(26)},
+    **{0xFF41 + i: chr(ord("a") + i) for i in range(26)},
+    # 全角连字符与常见破折号变体，一律归成半角短横
+    **{ord(ch): "-" for ch in "－—–−‒―‐‑﹘﹣"},
+}
+
+
+def _normalize_pickup_input(raw: str) -> str:
+    """人工输入的取件码归一化：全角转半角、破折号归短横、去空白、字母大写。"""
+    text = (raw or "").translate(_PICKUP_INPUT_TRANSLATION)
+    # isspace() 覆盖全角空格 U+3000、制表符与首尾空白
+    return "".join(ch for ch in text if not ch.isspace()).upper()
+
+
+def _pickup_input_display(raw: str, fallback: str) -> str:
+    """错误提示里回显老师输入的那一份，不做归一化，只去首尾空白。"""
+    return (raw or "").strip() or fallback
+
+
 def _short_code_pattern() -> re.Pattern[str]:
     """老师手输的当天短码，如 0-01。按取件码配置生成，改进制与长度不用改这里。"""
     rules = get_order_rules()["pickup_code"]
@@ -367,12 +392,13 @@ def verify_pickup(db: Session, order: Order, operator: str) -> dict:
 
 
 def _normalize_pickup_code(raw: str, now: datetime | None = None) -> str:
-    """规整取件码。
+    """规整取件码（只用于人工输入路径）。
 
     老师可只输当天的短码（A-01），这里按服务器当天补成完整码（261017-A-01）；
     扫码与学生端展示的都是完整码，原样匹配。跨天的遗留单只能用完整码。
+    手机输入法打出的全角数字、全角短横与中文破折号先归一化成半角，否则查不到库。
     """
-    code = "".join((raw or "").split()).upper()
+    code = _normalize_pickup_input(raw)
     if not code:
         return ""
     if PICKUP_SHORT_CODE_RE.fullmatch(code):
@@ -383,9 +409,12 @@ def _normalize_pickup_code(raw: str, now: datetime | None = None) -> str:
 
 def verify_by_code(db: Session, pickup_code: str, operator: str) -> dict:
     """按取件码核销（老师扫码或手动输入）。"""
-    code = _normalize_pickup_code(pickup_code)
+    raw_input = pickup_code or ""
+    code = _normalize_pickup_code(raw_input)
     if not code:
         raise BusinessError("请输入取件码", code=40001)
+    # 错误提示回显老师输入的那一份，不展示归一化结果，避免老师对不上自己打的码
+    shown = _pickup_input_display(raw_input, code)
 
     orders = list(
         db.execute(
@@ -396,11 +425,11 @@ def verify_by_code(db: Session, pickup_code: str, operator: str) -> dict:
         ).scalars()
     )
     if not orders:
-        raise BusinessError(f"没有找到取件码 {code} 对应的待取件订单", code=40401)
+        raise BusinessError(f"没有找到取件码 {shown} 对应的待取件订单", code=40401)
     if len(orders) > 1:
         # 唯一索引下不会发生；只有历史重码数据才会走到，宁可拒绝也不能核销错单
         raise BusinessError(
-            f"取件码 {code} 命中多张待取件单，请用完整取件码或订单号核销", code=40902
+            f"取件码 {shown} 命中多张待取件单，请用完整取件码或订单号核销", code=40902
         )
     return verify_pickup(db, orders[0], operator)
 

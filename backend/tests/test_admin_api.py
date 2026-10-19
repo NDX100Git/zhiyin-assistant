@@ -22,6 +22,16 @@ def _full_code(tail: str, day: date | None = None) -> str:
     return f"{(day or date.today()):%y%m%d}-{tail}"
 
 
+def _fullwidth_digits(text: str) -> str:
+    """把半角数字换成手机输入法打出的全角数字（０ 至 ９）。"""
+    return text.translate({ord(str(i)): chr(0xFF10 + i) for i in range(10)})
+
+
+def _with_dash(text: str, dash: str) -> str:
+    """把取件码里的半角短横换成指定样式的连接符。"""
+    return text.replace("-", dash)
+
+
 def _make_order(db_session, status: str = "queuing", pickup_code: str | None = None,
                 paid: int = 0, **kwargs) -> Order:
     index = next(_seq)
@@ -274,6 +284,87 @@ def test_按取件码核销(client, db_session):
         "/api/admin/order/verify-code", json={"pickup_code": "Z-99"}, headers=auth(token)
     ).json()
     assert missing["code"] == 40401
+
+
+def _verify_by_code(client, token: str, pickup_code: str) -> dict:
+    return client.post(
+        "/api/admin/order/verify-code",
+        json={"pickup_code": pickup_code},
+        headers=auth(token),
+    ).json()
+
+
+def test_半角完整码核销_回归(client, db_session):
+    """回归：学生端展示与扫码用的半角完整码仍可核销。"""
+    token = admin_token(client)
+    order = _make_order(db_session, status="ready", pickup_code="M-31")
+    code = _full_code("M-31")
+
+    body = _verify_by_code(client, token, code)
+    assert body["code"] == 0, body
+    assert body["data"]["order"]["id"] == order.id
+    assert body["data"]["order"]["status"] == "completed"
+
+
+def test_全角短横的完整码能核销(client, db_session):
+    """真机问题：手机输入法给出全角短横「－」（U+FF0D）。"""
+    token = admin_token(client)
+    order = _make_order(db_session, status="ready", pickup_code="0-32")
+    typed = _with_dash(_full_code("0-32"), "－")
+    assert typed != _full_code("0-32")
+
+    body = _verify_by_code(client, token, typed)
+    assert body["code"] == 0, body
+    assert body["data"]["order"]["id"] == order.id
+
+    # 归一化只作用于输入，库里的取件码保持不变
+    db_session.expire_all()
+    assert db_session.get(Order, order.id).pickup_code == _full_code("0-32")
+
+
+def test_全角数字的完整码能核销(client, db_session):
+    token = admin_token(client)
+    order = _make_order(db_session, status="ready", pickup_code="H-07")
+    typed = _fullwidth_digits(_full_code("H-07"))
+
+    body = _verify_by_code(client, token, typed)
+    assert body["code"] == 0, body
+    assert body["data"]["order"]["id"] == order.id
+
+
+def test_中文破折号的完整码能核销(client, db_session):
+    """中文习惯的破折号样连接符也要归成半角短横。"""
+    token = admin_token(client)
+    order = _make_order(db_session, status="ready", pickup_code="N-58")
+    typed = _with_dash(_fullwidth_digits(_full_code("N-58")), "—")
+
+    body = _verify_by_code(client, token, typed)
+    assert body["code"] == 0, body
+    assert body["data"]["order"]["id"] == order.id
+
+
+def test_全角空格包裹的当天短码能核销(client, db_session):
+    """只输当天短码时按服务器当天补全日期，前后全角空格、全角数字与全角短横都要认。"""
+    token = admin_token(client)
+    order = _make_order(db_session, status="ready", pickup_code="F-05")
+    typed = "　" + _with_dash(_fullwidth_digits("f-05"), "－") + "　"
+
+    body = _verify_by_code(client, token, typed)
+    assert body["code"] == 0, body
+    assert body["data"]["order"]["id"] == order.id
+    assert body["data"]["order"]["pickup_code"] == _full_code("F-05")
+
+
+def test_不存在的码仍返回40401并回显原始输入(client, db_session):
+    """核销判定不放宽：查不到还是 40401，提示里带的是老师输入的那一份。"""
+    token = admin_token(client)
+    _make_order(db_session, status="ready", pickup_code="P-11")
+    typed = _with_dash(_fullwidth_digits("Z-99"), "－")
+
+    body = _verify_by_code(client, token, typed)
+    assert body["code"] == 40401
+    assert body["message"] == f"没有找到取件码 {typed} 对应的待取件订单"
+    assert "Z-99" not in body["message"]
 
 
 def test_异常_恢复_关闭三种处置(client, db_session):
