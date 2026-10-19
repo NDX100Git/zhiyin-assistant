@@ -24,8 +24,10 @@ from app.config import settings
 from app.database import SessionLocal
 from app.models.ai_report import AiReport
 from app.models.order import Order
+from app.models.order_file import OrderFile
 from app.models.order_file_change import CHANGE_PENDING, OrderFileChange
 from app.models.order_file_version import OrderFileVersion
+from app.models.uploaded_file import UploadedFile
 from app.services.order_state import STATUS_CANCELLED, STATUS_COMPLETED
 from app.services.storage import FileStorage, get_storage
 
@@ -83,9 +85,9 @@ def _as_local_naive(value: datetime) -> datetime:
 def _load_order_statuses(db: Session, keys: list[str]) -> dict[str, set[str]]:
     """按 file_key 汇总引用该文件的订单状态。
 
-    两张表都看：订单表上的当前文件（也覆盖没有版本行的老数据），以及版本表里
-    标记为当前生效的版本。历史版本故意不计入引用，换下来的旧文件过了保留期
-    就可以回收，不额外续命。
+    三张表都看：订单表上的第一份文件（也覆盖没有清单行的老数据）、订单文件
+    清单里的全部当前文件，以及版本表里标记为当前生效的版本。历史版本故意不计入
+    引用，换下来的旧文件过了保留期就可以回收，不额外续命。
     """
     statuses: dict[str, set[str]] = {}
     for start in range(0, len(keys), ORDER_QUERY_CHUNK):
@@ -106,6 +108,16 @@ def _load_order_statuses(db: Session, keys: list[str]) -> dict[str, set[str]]:
             )
         ).all()
         for file_key, status in version_rows:
+            if file_key:
+                statuses.setdefault(file_key, set()).add(status)
+
+        # 多文件订单的第二份及以后只出现在清单表里，必须单独查
+        file_rows = db.execute(
+            select(OrderFile.file_key, Order.status)
+            .join(Order, Order.id == OrderFile.order_id)
+            .where(OrderFile.file_key.in_(chunk))
+        ).all()
+        for file_key, status in file_rows:
             if file_key:
                 statuses.setdefault(file_key, set()).add(status)
     return statuses
@@ -192,6 +204,12 @@ def _cleanup_files(
             logger.exception("删除文件失败，下一轮重试：%s", obj.key)
             continue
 
+        # 对象已经删掉，上传记录一并清掉，避免表里留下不可撤回的僵尸行
+        db.execute(
+            delete(UploadedFile)
+            .where(UploadedFile.file_key == obj.key)
+            .execution_options(synchronize_session=False)
+        )
         stats.deleted += 1
         logger.info("已删除过期文件 %s", obj.key)
 

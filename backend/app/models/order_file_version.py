@@ -26,7 +26,11 @@ class OrderFileVersion(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     order_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    # 从 1 递增，每次换文件加一
+    # 这份文件在订单文件清单里的序号（从 1 开始）；老订单迁移回填为 1
+    file_index: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    # 从 1 递增，每次换文件加一；同一订单内全局递增，便于追溯操作顺序
     version_no: Mapped[int] = mapped_column(Integer, nullable=False)
     file_key: Mapped[str] = mapped_column(String(255), nullable=False)
     file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -35,6 +39,7 @@ class OrderFileVersion(Base):
     amount_cents: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     # 内容指纹，留给后续去重与「换的是不是同一个文件」判断
     file_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 每个 file_index 各有一个生效版本；多文件订单会有多行 is_current=1
     is_current: Mapped[int] = mapped_column(TINYINT, nullable=False, default=1, server_default="1")
     # student / admin / system（迁移回填）
     operator: Mapped[str | None] = mapped_column(String(32), nullable=True)

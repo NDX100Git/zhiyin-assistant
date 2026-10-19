@@ -9,18 +9,38 @@
 
     <view class="card">
       <view class="card-head">
-        <text class="card-title">1. 选择论文</text>
-        <text v-if="fileKey" class="tag ok">已选择</text>
+        <text class="card-title">1. 选择要打印的文件</text>
+        <text v-if="files.length" class="tag ok">
+          {{ files.length > 1 ? `${files.length} 个文件 · 共 ${totalPages} 页` : '已选择' }}
+        </text>
       </view>
-      <view v-if="fileKey" class="file-info">
-        <text class="file-name">{{ fileName }}</text>
-        <text class="file-meta">{{ formatSize(fileSize) }}</text>
+
+      <view v-if="files.length" class="file-list">
+        <view v-for="(item, index) in files" :key="item.uid" class="file-row">
+          <view class="file-main">
+            <text class="file-name">
+              {{ files.length > 1 ? `${index + 1}. ` : '' }}{{ item.file_name }}
+            </text>
+            <text class="file-meta">
+              {{ item.page_count ? `${item.page_count} 页` : '读取页数中…' }}
+              <text v-if="item.size"> · {{ formatSize(item.size) }}</text>
+            </text>
+          </view>
+          <!-- 移除 = 撤回这份还没下单的上传文件，服务端同时删对象与上传记录 -->
+          <view class="file-remove" :class="{ busy: removingUid === item.uid }" @click="removeFile(index)">
+            {{ removingUid === item.uid ? '撤回中' : '移除' }}
+          </view>
+        </view>
       </view>
-      <view v-else class="empty">支持 PDF / Word / PPT / Excel，单文件不超过 50MB</view>
-      <text v-if="preparing" class="preparing">正在读取页数与打印参数…</text>
+      <view v-if="uploading" class="preparing">正在上传 {{ uploadingName }}…</view>
+      <view v-else-if="!files.length" class="empty">
+        支持 PDF / Word / PPT / Excel，单个文件不超过 50MB；一次可选多份，合成一单只付一次
+      </view>
 
       <view class="actions">
-        <button class="action" :disabled="busy" @click="pickDocument">选择文档</button>
+        <button class="action" :disabled="busy" @click="pickDocuments">
+          {{ files.length ? '继续添加文件' : '选择文档' }}
+        </button>
         <button class="action" :disabled="busy" @click="pickImage">拍照 / 相册</button>
       </view>
       <button class="action demo" :disabled="busy" @click="useDemo">载入示例论文（演示兜底）</button>
@@ -31,17 +51,32 @@
       </view>
     </view>
 
-    <view v-if="fileKey" class="card ai-entry">
+    <view v-if="files.length && singleFile" class="card ai-entry">
       <view class="card-head">
         <text class="card-title">AI 体检与修复（可选）</text>
         <text class="tag" :class="{ ok: aiChecked }">{{ aiChecked ? '已完成' : '可跳过' }}</text>
       </view>
       <text class="ai-entry-desc">
-        {{ aiChecked ? '已按体检结果更新打印方案，也可以重新体检。' : '检查结构、参考文献与版式，并可选择生成修复副本。着急打印可以直接在下方下单。' }}
+        {{ aiChecked ? '已按体检结果更新打印方案，也可以重新体检。' : '检查结构、参考文献与版式，并可选择生成修复副本。不做体检也能直接下单。' }}
       </text>
-      <button class="action ghost" :disabled="checking || preparing" @click="runCheck">
-        {{ checking ? 'AI 正在体检…' : (aiChecked ? '重新体检' : '开始 AI 体检') }}
-      </button>
+      <view class="ai-actions">
+        <button class="action ghost" :disabled="checking || preparing" @click="runCheck">
+          {{ checking ? 'AI 正在体检…' : (aiChecked ? '重新体检' : '开始 AI 体检') }}
+        </button>
+        <button class="action skip" :disabled="busy || preparing || !plan" @click="skipCheckAndOrder">
+          跳过体检，直接下单
+        </button>
+      </view>
+    </view>
+
+    <view v-else-if="files.length > 1" class="card ai-entry">
+      <view class="card-head">
+        <text class="card-title">多文件不参与体检</text>
+        <text class="tag">直接下单</text>
+      </view>
+      <text class="ai-entry-desc">
+        一单多份文件按基础方案下单，AI 体检只针对单份文件；确需体检可先只传这一份，体检后单独下单。
+      </text>
     </view>
 
     <view v-if="checking && !report" class="card center">
@@ -49,7 +84,7 @@
       <text class="loading-sub">解析版式、检查结构与参考文献</text>
     </view>
 
-    <view v-if="report" class="card">
+    <view v-if="report && singleFile" class="card">
       <view class="card-head">
         <text class="card-title">2. AI 体检报告</text>
         <text class="tag">{{ severitySummary }}</text>
@@ -96,7 +131,9 @@
     <view v-if="plan" class="card">
       <view class="card-head">
         <text class="card-title">3. 打印方案</text>
-        <text class="tag">{{ planUsesAi ? 'AI 优化方案' : '基础方案' }} · 共 {{ pageCount }} 页</text>
+        <text class="tag">
+          {{ planUsesAi ? 'AI 优化方案' : '基础方案' }} · 共 {{ totalPages }} 页{{ files.length > 1 ? ` · ${files.length} 个文件` : '' }}
+        </text>
       </view>
       <text class="ai-recommend">当前方案：{{ plan.recommend.print_side === 2 ? '双面' : '单面' }} · {{ plan.recommend.color_mode === 1 ? '彩色' : '黑白' }} · {{ layoutLabel(plan.recommend.layout) }}</text>
       <view class="opt-row">
@@ -127,13 +164,19 @@
           <text class="stepper" @click.stop="changeCopies(1)">＋</text>
         </view>
       </view>
-      <text class="plan-reason">AI 建议理由：{{ plan.reason }}</text>
-      <view class="savings">
+      <text class="plan-reason">{{ singleFile ? 'AI 建议理由' : '方案估算依据' }}：{{ plan.reason }}</text>
+      <view v-if="singleFile" class="savings">
         <text>纸张 {{ plan.original_sheets }} → {{ plan.sheets_needed }} 张</text>
         <text class="green">省 {{ plan.saved_sheets }} 张</text>
         <text class="money">预计 {{ formatMoney(plan.amount_cents) }}</text>
       </view>
-      <button class="primary block" :disabled="busy" @click="createOrder">确认下单</button>
+      <view v-else class="savings">
+        <text>{{ files.length }} 个文件 · 共 {{ totalPages }} 页 × {{ copies }} 份</text>
+        <text class="money">预计 {{ formatMoney(quoteCents) }}</text>
+      </view>
+      <button class="primary block" :disabled="busy" @click="createOrder">
+        {{ files.length > 1 ? `确认下单（${files.length} 个文件 · ${totalPages} 页）` : '确认下单' }}
+      </button>
     </view>
 
     <view v-if="created" class="card success">
@@ -152,9 +195,9 @@
 
 <script setup>
 import { computed, ref } from 'vue'
-import { request, uploadFile } from '@/services/api'
+import { deleteUploadedFile, request, uploadFile } from '@/services/api'
 import { ensureLogin } from '@/services/auth'
-import { chooseDocument, chooseImage, loadDemoDocument } from '@/services/filePicker'
+import { MAX_FILES_PER_PICK, chooseDocuments, chooseImage, loadDemoDocument } from '@/services/filePicker'
 import { notify, notifyError } from '@/services/notify'
 import { useUiTheme } from '@/ui/theme'
 
@@ -169,15 +212,26 @@ const steps = [
 const stepIndex = ref(0)
 const busy = ref(false)
 const checking = ref(false)
-const fileKey = ref('')
-const fileName = ref('')
-const fileSize = ref(0)
+
+/**
+ * 本轮要打印的文件清单（多文件合成一单）。
+ * 每个元素：`{uid, file_key, file_name, size, page_count}`；uid 只给列表 key 用。
+ * 还没下单，所以这里随时可以移除——移除时会调后端的撤回接口。
+ */
+const files = ref([])
+const uploading = ref(false)
+const uploadingName = ref('')
+const removingUid = ref('')
+const uidSeq = ref(0)
+
+/** 一单最多几份：后端 order_rules.json 的 max_files 是 20，界面留同口径。 */
+const MAX_ORDER_FILES = 20
+
 const report = ref(null)
 const selectedIssues = ref([])
 const wantFix = ref(false)
 const plan = ref(null)
 const copies = ref(1)
-const pageCount = ref(1)
 const preparing = ref(false)
 const aiChecked = ref(false)
 const planUsesAi = ref(false)
@@ -191,6 +245,34 @@ const layouts = [
 ]
 const created = ref(null)
 const ocrText = ref('')
+
+/** 只有一份文件时才有 AI 体检与修复：多文件的体检口径产品还没定。 */
+const singleFile = computed(() => files.value.length === 1)
+
+/** 订单总页数：清单里各文件页数之和，下单与计费都按它算。 */
+const totalPages = computed(() =>
+  files.value.reduce((sum, item) => sum + (Number(item.page_count) || 0), 0)
+)
+
+/** 方案与体检都针对第一份文件取参数，多文件只借用它的单价与推荐值。 */
+const primaryFile = computed(() => files.value[0] || null)
+
+/**
+ * 多文件合计金额。
+ *
+ * 打印方案接口只算单份文件（且按 impression 取整），下单与后端计费用的是
+ * 「单价 × 总页数 × 份数」，所以这里从方案里反推单价，再乘总页数，
+ * 保证界面数字与真实扣款一致，不让“预计”和“应付”打打。
+ */
+const quoteCents = computed(() => {
+  const current = plan.value
+  if (!current) return 0
+  if (files.value.length <= 1) return Number(current.amount_cents) || 0
+  const impressions = Number(current.impressions) || 0
+  const unit = impressions > 0 ? Math.round(Number(current.amount_cents) / impressions) : 0
+  if (!unit) return Number(current.amount_cents) || 0
+  return unit * totalPages.value * copies.value
+})
 
 const severitySummary = computed(() => {
   const counts = (report.value && report.value.by_severity) || {}
@@ -226,60 +308,107 @@ function formatMoney(cents) {
   return `¥${((Number(cents) || 0) / 100).toFixed(2)}`
 }
 
-function resetFlow() {
+function resetCheck() {
   report.value = null
   selectedIssues.value = []
   wantFix.value = false
   aiChecked.value = false
-  pageCount.value = 1
   planUsesAi.value = false
-  plan.value = null
-  created.value = null
-  ocrText.value = ''
-  copies.value = 1
-  printSide.value = null
-  colorMode.value = null
-  layout.value = ''
 }
 
-async function useUploaded(data) {
-  fileKey.value = data.file_key
-  fileName.value = data.file_name || '文档'
-  fileSize.value = data.size || 0
-  resetFlow()
-  stepIndex.value = 1
-  await prepareBasicPlan()
+/** 把一次上传结果加进清单；重复选同一个文件不重复入单。 */
+function pushFile(data) {
+  const fileKey = data.file_key
+  if (!fileKey) return false
+  if (files.value.some((item) => item.file_key === fileKey)) return false
+  uidSeq.value += 1
+  files.value.push({
+    uid: `f${uidSeq.value}`,
+    file_key: fileKey,
+    file_name: data.file_name || '文档',
+    size: Number(data.size) || 0,
+    page_count: 0,
+  })
+  return true
 }
 
-async function prepareBasicPlan() {
-  preparing.value = true
-  try {
-    const pc = await request('/api/file/page-count', {
-      method: 'POST',
-      data: { file_key: fileKey.value },
-    })
-    pageCount.value = Math.max(1, Number(pc.page_count) || 1)
-    await loadPlan(false)
-  } catch (error) {
-    notifyError(error)
-  } finally {
-    preparing.value = false
+/** 逐份补页数：页数来自 page-count 接口，不调模型。 */
+async function fillPageCounts() {
+  for (const item of files.value) {
+    if (item.page_count) continue
+    try {
+      const result = await request('/api/file/page-count', {
+        method: 'POST',
+        data: { file_key: item.file_key },
+      })
+      item.page_count = Math.max(1, Number(result.page_count) || 1)
+    } catch (error) {
+      notifyError(error)
+    }
   }
 }
 
-async function pickDocument() {
+/** 清单变了：体检结果作废，重新按当前参数出基础方案。 */
+async function afterFilesChanged() {
+  resetCheck()
+  if (files.value.length === 0) {
+    plan.value = null
+    stepIndex.value = 0
+    return
+  }
+  await fillPageCounts()
+  stepIndex.value = 1
+  await loadPlan(false)
+}
+
+async function pickDocuments() {
   if (busy.value) return
   try {
     await ensureLogin()
-    const picked = await chooseDocument()
+    const remaining = MAX_ORDER_FILES - files.value.length
+    if (remaining <= 0) {
+      notify(`一单最多 ${MAX_ORDER_FILES} 个文件，请先移除再选`)
+      return
+    }
+    const picked = await chooseDocuments(Math.min(MAX_FILES_PER_PICK, remaining))
     busy.value = true
-    const data = await uploadFile(picked.path, picked.name)
-    await useUploaded(data)
-    notify('上传成功', 'success')
+    uploading.value = true
+    for (const item of picked) {
+      uploadingName.value = item.name
+      const uploaded = await uploadFile(item.path, item.name)
+      pushFile(uploaded)
+    }
+    notify(`已添加 ${picked.length} 个文件`, 'success')
+    await afterFilesChanged()
   } catch (error) {
     notifyError(error)
   } finally {
     busy.value = false
+    uploading.value = false
+  }
+}
+
+/**
+ * 移除清单里的一份文件。
+ *
+ * 这是「还没下单的上传文件」的撤回：后端校验归属（只能删自己传的）与引用
+ * （已被订单/文件版本/待确认请求引用的拒绝删除），并同时删对象与上传记录。
+ * 被拒绝时也从本单移除，但把服务端的原话告诉学生，不假装删掉了。
+ */
+async function removeFile(index) {
+  const item = files.value[index]
+  if (!item || removingUid.value) return
+  removingUid.value = item.uid
+  try {
+    await deleteUploadedFile(item.file_key)
+    notify('已撤回该文件', 'success')
+  } catch (error) {
+    notify(`服务端未删除：${error.message}；已从本单移除，文件会在保留期后自动清理`)
+    console.warn('[撤回文件]', error)
+  } finally {
+    files.value.splice(index, 1)
+    removingUid.value = ''
+    await afterFilesChanged()
   }
 }
 
@@ -289,8 +418,12 @@ async function useDemo() {
     await ensureLogin()
     busy.value = true
     const data = await loadDemoDocument()
-    await useUploaded(data)
+    if (!pushFile(data)) {
+      notify('示例论文已经在本单里了')
+      return
+    }
     notify('已载入示例论文', 'success')
+    await afterFilesChanged()
   } catch (error) {
     notifyError(error)
   } finally {
@@ -319,15 +452,17 @@ async function pickImage() {
 }
 
 async function runCheck() {
-  if (checking.value) return
+  if (checking.value || !singleFile.value || !primaryFile.value) return
   checking.value = true
   try {
     report.value = await request('/api/ai/check', {
       method: 'POST',
-      data: { file_key: fileKey.value },
+      data: { file_key: primaryFile.value.file_key },
     })
     aiChecked.value = true
-    pageCount.value = Math.max(1, Number(report.value.page_count) || pageCount.value)
+    const checked = Math.max(1, Number(report.value.page_count) || 1)
+    // 体检可能发现实际页数与 page-count 不一致，以体检为准
+    primaryFile.value.page_count = checked
     selectedIssues.value = []
     wantFix.value = false
     await loadPlan(true)
@@ -338,7 +473,16 @@ async function runCheck() {
   }
 }
 
+/** 明示的「跳过体检，直接下单」：不做任何体检，按基础方案下单。 */
+async function skipCheckAndOrder() {
+  if (busy.value || checking.value) return
+  if (!plan.value) await loadPlan(false)
+  if (plan.value) await createOrder()
+}
+
 async function loadPlan(useAi = false) {
+  if (!primaryFile.value) return
+  preparing.value = true
   try {
     const options = { copies: copies.value, use_ai: useAi }
     if (printSide.value) options.print_side = printSide.value
@@ -347,7 +491,7 @@ async function loadPlan(useAi = false) {
 
     plan.value = await request('/api/ai/print-plan', {
       method: 'POST',
-      data: { file_key: fileKey.value, options },
+      data: { file_key: primaryFile.value.file_key, options },
     })
     planUsesAi.value = useAi
     printSide.value = plan.value.recommend.print_side
@@ -356,6 +500,8 @@ async function loadPlan(useAi = false) {
     stepIndex.value = 2
   } catch (error) {
     notifyError(error)
+  } finally {
+    preparing.value = false
   }
 }
 
@@ -391,21 +537,22 @@ function clearSelected() {
 }
 
 async function generateFixed() {
-  if (busy.value || selectedIssues.value.length === 0) return
+  if (busy.value || selectedIssues.value.length === 0 || !primaryFile.value) return
   busy.value = true
   try {
     const fixed = await request('/api/ai/fix', {
       method: 'POST',
       data: {
-        file_key: fileKey.value,
+        file_key: primaryFile.value.file_key,
         issue_ids: selectedIssues.value,
-        file_name: `修复版-${fileName.value}`,
+        file_name: `修复版-${primaryFile.value.file_name}`,
       },
     })
     notify(`已生成修复版（${fixed.applied_actions.length} 项修改）`, 'success')
-    fileKey.value = fixed.file_key
-    fileName.value = fixed.file_name || fileName.value
-    fileSize.value = fixed.size || fileSize.value
+    // 修复版替掉当前这份文件：学生已经选了「修复」，没修复的原件不该混在清单里
+    primaryFile.value.file_key = fixed.file_key
+    primaryFile.value.file_name = fixed.file_name || primaryFile.value.file_name
+    primaryFile.value.size = Number(fixed.size) || primaryFile.value.size
     wantFix.value = false
     selectedIssues.value = []
     await runCheck()
@@ -424,21 +571,28 @@ async function changeCopies(delta) {
 }
 
 async function createOrder() {
-  if (busy.value || !plan.value) return
+  if (busy.value || !plan.value || files.value.length === 0) return
   busy.value = true
   try {
-    created.value = await request('/api/order/create', {
-      method: 'POST',
-      data: {
-        file_key: fileKey.value,
-        file_name: fileName.value,
-        page_count: pageCount.value,
-        print_side: plan.value.recommend.print_side,
-        color_mode: plan.value.recommend.color_mode,
-        copies: copies.value,
-        paper_size: 'A4',
-      },
-    })
+    // 文件清单是权威字段；单文件时同时带上旧的顶层字段，老后端也能跑
+    const payload = {
+      files: files.value.map((item, index) => ({
+        file_key: item.file_key,
+        file_name: item.file_name,
+        page_count: Math.max(1, Number(item.page_count) || 1),
+        file_index: index + 1,
+      })),
+      print_side: plan.value.recommend.print_side,
+      color_mode: plan.value.recommend.color_mode,
+      copies: copies.value,
+      paper_size: 'A4',
+    }
+    if (files.value.length === 1) {
+      payload.file_key = files.value[0].file_key
+      payload.file_name = files.value[0].file_name
+      payload.page_count = Math.max(1, Number(files.value[0].page_count) || 1)
+    }
+    created.value = await request('/api/order/create', { method: 'POST', data: payload })
     stepIndex.value = 2
   } catch (error) {
     notifyError(error)
@@ -643,18 +797,24 @@ function goMine() {
   font-weight: 800;
   line-height: 1;
 }
-.file-info {
-  display: flex;
-  justify-content: space-between;
+.file-list {
   margin-top: 18rpx;
+}
+.file-row {
+  display: flex;
+  align-items: center;
+  margin-bottom: 12rpx;
   padding: 18rpx;
   border: 2rpx solid var(--zi-line);
   border-radius: var(--zi-radius);
   background: var(--zi-soft);
 }
-.file-name {
+.file-main {
   flex: 1;
   min-width: 0;
+}
+.file-name {
+  display: block;
   color: var(--zi-ink);
   font-size: 26rpx;
   font-weight: 700;
@@ -662,9 +822,30 @@ function goMine() {
   word-break: break-all;
 }
 .file-meta {
-  margin-left: 16rpx;
+  display: block;
+  margin-top: 4rpx;
   color: var(--zi-muted);
-  font-size: 24rpx;
+  font-size: 22rpx;
+}
+.file-remove {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 108rpx;
+  min-height: 60rpx;
+  margin-left: 16rpx;
+  padding: 0 20rpx;
+  border: 2rpx solid var(--zi-danger);
+  border-radius: var(--zi-pill-radius);
+  background: transparent;
+  color: var(--zi-danger);
+  font-size: 22rpx;
+  font-weight: 800;
+  line-height: 1;
+  white-space: nowrap;
+}
+.file-remove.busy {
+  opacity: 0.5;
 }
 .actions {
   display: flex;
@@ -699,6 +880,18 @@ function goMine() {
   border-color: var(--zi-warn);
   background: var(--zi-warn-bg);
   color: var(--zi-warn);
+}
+/* 明示的「跳过体检，直接下单」：与体检按钮并排但用实心主色，不能再靠读者意会 */
+.action.skip {
+  width: 100%;
+  margin: 16rpx 0 0;
+  border-color: var(--zi-accent);
+  background: var(--zi-accent);
+  color: var(--zi-accent-ink);
+}
+.ai-actions {
+  display: flex;
+  flex-direction: column;
 }
 .primary {
   width: 100%;
@@ -1008,7 +1201,7 @@ function goMine() {
   border: 2rpx dashed var(--zi-line-strong);
 }
 .zi-theme-classic .ai-fix-row,
-.zi-theme-classic .file-info,
+.zi-theme-classic .file-row,
 .zi-theme-classic .savings,
 .zi-theme-classic .ocr-box {
   border: none;
@@ -1042,6 +1235,16 @@ function goMine() {
 .zi-theme-classic .action.ghost {
   background: var(--zi-warn-bg);
   color: var(--zi-warn);
+}
+.zi-theme-classic .action.skip {
+  background: var(--zi-accent);
+  color: var(--zi-accent-ink);
+}
+.zi-theme-classic .file-remove {
+  border: none;
+  background: var(--zi-danger);
+  color: #fff;
+  font-weight: 400;
 }
 .zi-theme-classic .primary {
   border: none;

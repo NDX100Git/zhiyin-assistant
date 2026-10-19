@@ -24,6 +24,13 @@ from app.services.file_change_service import (
     pending_change_view,
 )
 from app.services.notifier import get_notifier
+from app.services.order_file_service import (
+    batch_files_view,
+    create_order_files,
+    files_view,
+    is_file_unconfirmed,
+    normalize_file_items,
+)
 from app.services.order_state import (
     STATUS_CANCELLED,
     STATUS_PENDING_PAY,
@@ -98,16 +105,12 @@ def build_pickup_code(seq: int, day: date) -> str:
 
 
 def _validate_create(payload, limits: dict) -> None:
-    if not payload.file_key or not str(payload.file_key).startswith("files/"):
-        raise BusinessError("文件标识无效，请重新上传", code=40041)
     if payload.print_side not in (1, 2):
         raise BusinessError("打印方式只能是单面或双面", code=40042)
     if payload.color_mode not in (0, 1):
         raise BusinessError("颜色模式只能是黑白或彩色", code=40043)
     if not 1 <= int(payload.copies) <= int(limits["max_copies"]):
         raise BusinessError(f"份数必须在 1 到 {limits['max_copies']} 之间", code=40044)
-    if not 1 <= int(payload.page_count) <= int(limits["max_page_count"]):
-        raise BusinessError(f"页数必须在 1 到 {limits['max_page_count']} 之间", code=40045)
     if payload.paper_size not in limits["allowed_paper_sizes"]:
         raise BusinessError(
             f"纸张规格不支持：{payload.paper_size}，可选 {'、'.join(limits['allowed_paper_sizes'])}",
@@ -138,17 +141,21 @@ def _validate_file_freshness(file_key: str) -> None:
 
 
 def create_order(db: Session, user: User, payload) -> Order:
-    """下单：状态置 pending_pay，返回带订单号与取件码的订单。"""
+    """下单：支持单文件旧写法与文件清单新写法，状态置 pending_pay。"""
     rules = get_order_rules()
     _validate_create(payload, rules["limits"])
-    _validate_file_freshness(payload.file_key)
+    items = normalize_file_items(payload, rules["limits"])
+    for item in items:
+        _validate_file_freshness(item["file_key"])
 
     # 截单不拒绝下单：仅把订单排到下一个打印时段（首页会给出提示）
     session_info = current_session_info(db)
 
+    total_pages = sum(int(item["page_count"]) for item in items)
     amount_cents = calc_amount_cents(
-        payload.page_count, payload.print_side, payload.color_mode, payload.copies
+        total_pages, payload.print_side, payload.color_mode, payload.copies
     )
+    first = items[0]
 
     now = datetime.now()  # 服务端时间
     day = now.date()
@@ -158,9 +165,10 @@ def create_order(db: Session, user: User, payload) -> Order:
         pickup_code=build_pickup_code(seq, day),
         user_id=user.id,
         status=STATUS_PENDING_PAY,
-        file_key=payload.file_key,
-        file_name=payload.file_name,
-        page_count=payload.page_count,
+        # 兼容字段指向第一份文件，完整清单在 order_files
+        file_key=first["file_key"],
+        file_name=first["file_name"],
+        page_count=total_pages,
         print_side=payload.print_side,
         color_mode=payload.color_mode,
         copies=payload.copies,
@@ -178,8 +186,9 @@ def create_order(db: Session, user: User, payload) -> Order:
         raise BusinessError("订单号生成失败，请稍后重试", code=50020) from exc
 
     record_log(db, order, "state_change", None, STATUS_PENDING_PAY, "学生创建订单", "student")
-    # 文件版本从第 1 版开始留痕，后续换文件只追加元数据，不复制文件本体
-    create_initial_version(db, order)
+    # 先写当前文件清单，再按清单逐份留版本痕迹；后续换文件只追加元数据
+    rows = create_order_files(db, order, items)
+    create_initial_version(db, order, rows)
     # 仅在本时段仍收单时占用容量；截单后的订单算下一个时段
     if session_info["session"] and session_info["is_open"]:
         session_row = get_or_create_session(db, day, session_info["session"])
@@ -239,27 +248,33 @@ def list_orders(db: Session, user: User, status: str | None = None,
     )
     waits = batch_wait_info(db, rows)
     changes = batch_pending_changes(db, [order.id for order in rows])
+    files = batch_files_view(db, rows)
     return {
         "total": int(total),
         "page": page,
         "page_size": page_size,
         "items": [
-            order_to_dict(db, order, waits.get(order.id), changes.get(order.id))
+            order_to_dict(
+                db, order, waits.get(order.id), changes.get(order.id), files.get(order.id)
+            )
             for order in rows
         ],
     }
 
 
 def order_to_dict(db: Session, order: Order, wait: dict | None = None,
-                  file_change: dict | object | None = _UNSET) -> dict:
+                  file_change: dict | object | None = _UNSET,
+                  files: list[dict] | object | None = _UNSET) -> dict:
     """订单对外字段（不含任何敏感信息）。
 
-    wait 与 file_change 可由调用方批量算好后传入，避免列表接口逐行查询；
-    file_change 不传时按订单 id 单独查一次（详情接口走这条）。
+    wait / file_change / files 可由调用方批量算好后传入，避免列表接口逐行查询；
+    不传时按订单 id 单独查（详情接口走这条）。
     """
     wait = wait or order_wait_info(db, order)
     if file_change is _UNSET:
         file_change = pending_change_view(db, order.id)
+    if files is _UNSET:
+        files = files_view(db, order)
     return {
         "id": order.id,
         "order_no": order.order_no,
@@ -278,12 +293,16 @@ def order_to_dict(db: Session, order: Order, wait: dict | None = None,
         "pay_method": order.pay_method,
         "created_at": order.created_at.isoformat() if order.created_at else None,
         "requeue_at": order.requeue_at.isoformat() if order.requeue_at else None,
+        "file_changed_at": order.file_changed_at.isoformat() if order.file_changed_at else None,
+        "files_seen_at": order.files_seen_at.isoformat() if order.files_seen_at else None,
+        "files_unconfirmed": is_file_unconfirmed(order),
         "printed_at": order.printed_at.isoformat() if order.printed_at else None,
         "picked_at": order.picked_at.isoformat() if order.picked_at else None,
         "remark": order.remark,
         "cancel_reason": order.cancel_reason,
         "queue_position": wait["queue_position"],
         "estimated_minutes": wait["estimated_minutes"],
+        "files": files,
         "file_change": file_change,
     }
 

@@ -9,7 +9,7 @@
     {
       "path": "pages/order/order",
       "style": {
-        "navigationBarTitleText": "AI 体检下单"
+        "navigationBarTitleText": "上传与下单"
       }
     },
     {

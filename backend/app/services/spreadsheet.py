@@ -227,4 +227,3 @@ def render_pdf(source: Path, work_dir: Path, convert, stats: dict | None = None)
     if stats is not None:
         stats.update(attempt_stats)
     return pdf_path
-

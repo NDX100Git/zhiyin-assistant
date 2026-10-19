@@ -27,6 +27,7 @@
   },
   "limits": {
     "max_copies": 50,
+    "max_files": 20,
     "max_page_count": 1000,
     "allowed_paper_sizes": [
       "A4",

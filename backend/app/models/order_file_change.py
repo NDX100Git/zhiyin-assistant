@@ -36,19 +36,31 @@ class OrderFileChange(Base):
     )
     # 待确认时固定为 1，处理完置 NULL；只用于唯一索引，不对外暴露
     pending_flag: Mapped[int | None] = mapped_column(TINYINT, nullable=True)
+    # 要替换订单里的第几份文件（从 1 开始）；单文件订单固定为 1
+    file_index: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
 
-    # 提交时订单上的快照，便于老师对照与事后追溯
+    # 提交时订单上的快照，便于老师对照与事后追溯。
+    # old_page_count / old_amount_cents 是「订单总额与总页数」，与单文件时代语义一致。
     old_file_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     old_file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     old_page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     old_amount_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 被替换的那一份文件自己的页数与行金额，多文件确认弹窗要对照它
+    old_file_page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    old_file_amount_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # 学生提交的新文件
     new_file_key: Mapped[str] = mapped_column(String(255), nullable=False)
     new_file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # 新文件自己的页数；new_page_count 是新订单总页数（与 old_page_count 对称）
+    new_file_page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     new_page_count: Mapped[int] = mapped_column(Integer, nullable=False)
-    # 系统按当前计费规则重算的价格（老师确认弹窗的预填值）
+    # 系统按当前计费规则重算的订单总价（老师确认弹窗的预填值）
     new_amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 新文件自己的行金额，便于追溯
+    new_file_amount_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # 老师确认后的最终价；不传时等于 new_amount_cents
     final_amount_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
 

@@ -37,7 +37,7 @@ RUN pip install --no-cache-dir \
 # Word / Excel / PPT 转 PDF 用的 LibreOffice 装进同一个镜像。
 # 不挂 docker.sock、不装 docker CLI：挂 socket 等于把宿主机 root 交给一个会解析
 # 用户上传文件的 Web 服务，代价远大于省下的镜像体积。装进来就没有这些风险，
-# 也不依赖另一个容器的存活状态。只装 writer 与 calc，不装整套套件。
+# 也不依赖另一个容器的存活状态。只装 writer、calc 与 impress，不装整套套件。
 ARG APT_MIRROR=deb.debian.org
 RUN if [ "$APT_MIRROR" != "deb.debian.org" ]; then \
         sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
@@ -46,6 +46,7 @@ RUN if [ "$APT_MIRROR" != "deb.debian.org" ]; then \
     && apt-get install -y --no-install-recommends \
         libreoffice-writer \
         libreoffice-calc \
+        libreoffice-impress \
         fonts-noto-cjk \
         fontconfig \
     && fc-cache -f \

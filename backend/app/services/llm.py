@@ -7,6 +7,7 @@ API Key、base_url、模型名全部从环境变量读取（见 app.config.setti
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -102,8 +103,20 @@ def chat(
     kwargs = _build_kwargs(messages, json_mode, thinking, temperature)
     client = get_client()
 
-    wait_seconds = float(settings.llm_queue_wait_seconds)
-    if not _semaphore().acquire(timeout=wait_seconds):
+    slot = _acquire_slot(float(settings.llm_queue_wait_seconds))
+    try:
+        return _chat_with_retry(client, kwargs)
+    finally:
+        _release_slot(slot)
+
+
+def _acquire_slot(wait_seconds: float) -> threading.BoundedSemaphore:
+    """拿全局模型调用名额，同步与异步共用。
+
+    返回拿到的信号量本身，归还时释放同一个对象，避免配置变更后释放到新信号量。
+    """
+    semaphore = _semaphore()
+    if not semaphore.acquire(timeout=wait_seconds):
         # 队列里等太久说明此刻排满了，早失败比让请求占着线程干等更好
         logger.warning("AI 并发已满，等待 %.1f 秒未拿到名额，直接拒绝", wait_seconds)
         raise BusinessError("当前使用 AI 的人较多，请稍后重试", code=50034)
@@ -112,13 +125,15 @@ def chat(
     with _gate_guard:
         _in_flight += 1
         current = _in_flight
-    try:
-        logger.info("AI 调用开始，当前并发 %d", current)
-        return _chat_with_retry(client, kwargs)
-    finally:
-        with _gate_guard:
-            _in_flight -= 1
-        _semaphore().release()
+    logger.info("AI 调用开始，当前并发 %d", current)
+    return semaphore
+
+
+def _release_slot(semaphore: threading.BoundedSemaphore) -> None:
+    global _in_flight
+    with _gate_guard:
+        _in_flight -= 1
+    semaphore.release()
 
 
 def _chat_with_retry(client: OpenAI, kwargs: dict[str, Any]) -> str:
@@ -197,20 +212,31 @@ async def achat(
     thinking: bool = False,
     temperature: float | None = None,
 ) -> str:
-    """异步版 chat，供 asyncio.gather 并发调用。"""
+    """异步版 chat，供 asyncio.gather 并发调用。
+
+    异步调用也必须经过同步 chat 用的那道全局闸门，否则校对任务与体检端点
+    各算各的并发，实际模型调用量会突破配置上限。
+    """
     kwargs = _build_kwargs(messages, json_mode, thinking, temperature)
 
-    attempts = max(1, int(settings.llm_max_attempts))
-    last_error: Exception | None = None
-    for attempt in range(1, attempts + 1):
-        try:
-            response = await get_async_client().chat.completions.create(**kwargs)
-            return response.choices[0].message.content or ""
-        except Exception as exc:  # 统一重试
-            last_error = exc
-            logger.warning("异步模型调用失败（第 %d/%d 次）：%s", attempt, attempts, exc)
+    # acquire 会阻塞，放到线程里等，不卡事件循环；拿到的名额在 finally 归还
+    slot = await asyncio.to_thread(
+        _acquire_slot, float(settings.llm_queue_wait_seconds)
+    )
+    try:
+        attempts = max(1, int(settings.llm_max_attempts))
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                response = await get_async_client().chat.completions.create(**kwargs)
+                return response.choices[0].message.content or ""
+            except Exception as exc:  # 统一重试
+                last_error = exc
+                logger.warning("异步模型调用失败（第 %d/%d 次）：%s", attempt, attempts, exc)
 
-    raise BusinessError("AI 服务暂时不可用，请稍后重试", code=50031) from last_error
+        raise BusinessError("AI 服务暂时不可用，请稍后重试", code=50031) from last_error
+    finally:
+        _release_slot(slot)
 
 
 async def achat_json(

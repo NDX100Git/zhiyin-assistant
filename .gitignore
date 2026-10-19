@@ -13,13 +13,16 @@ pytest-of-*/
 .env
 backend/.env
 *.env
-# 本机覆盖文件（Vite / uni-app 约定）：.env.local、.env.production.local ……
-.env.local
-.env.*.local
-# 例外：只有占位值模板入库——.env.example 与前端 Vite 的公开配置
-# （.env.development / .env.production 里只有后端地址，没有密钥）
+# 所有按环境拆分的 env 文件都不入库：.env.production、.env.staging、.env.local ……
+.env.*
+# 例外：只有占位值模板与前端公开配置入库
+# 前端 .env.development / .env.production 里只有后端地址与轮询间隔，没有密钥
 !.env.example
 !**/.env.example
+!student-app/.env.development
+!student-app/.env.production
+!teacher-web/.env.development
+!teacher-web/.env.production
 
 # 运行时产物
 backend/runtime/

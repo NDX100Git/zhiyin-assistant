@@ -106,3 +106,13 @@ export function uploadFile(filePath, fileName) {
     })
   })
 }
+
+/**
+ * 撤回一个还没下单的上传文件。
+ *
+ * 服务端会校验归属（只能删自己传的）与引用（已被订单、文件版本或待确认请求
+ * 引用的文件拒绝删除），因此这里不做任何本地猜测，失败就把原因原样交给页面。
+ */
+export function deleteUploadedFile(fileKey) {
+  return request('/api/file/delete', { method: 'POST', data: { file_key: fileKey } })
+}

@@ -2,7 +2,7 @@
   <view class="page" :class="uiThemeClass">
     <view class="hero">
       <view class="hero-title">智印助手</view>
-      <view class="hero-sub">AI 论文格式体检 · 自助打印</view>
+      <view class="hero-sub">自助打印 · AI 论文体检可选</view>
       <view class="hero-row">
         <view class="hero-item">
           <text class="num">{{ summary.waiting_count }}</text>
@@ -37,7 +37,10 @@
       </view>
     </view>
 
-    <button class="primary block" @click="goOrder">上传论文 · AI 体检</button>
+    <!-- 体检是可选步骤：入口不能再只写 AI，跳过体检一样能直接下单 -->
+    <button class="primary block" @click="goOrder">上传文件，跳过体检直接下单</button>
+    <button class="ghost block" @click="goOrder">先做 AI 体检（可选）</button>
+    <view class="footnote">AI 体检是可选项，跳过它不影响下单、排队与打印。</view>
     <view class="footnote">仅用取件码作为取件凭据，不收集学号等敏感信息。</view>
   </view>
 </template>
@@ -265,6 +268,22 @@ function goOrder() {
 }
 .block {
   width: 100%;
+}
+/* 次要入口：AI 体检放在这里，主入口是直接下单 */
+.ghost {
+  width: 100%;
+  height: 88rpx;
+  margin-top: 16rpx;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2rpx dashed var(--zi-line-strong);
+  border-radius: var(--zi-button-radius);
+  background: transparent;
+  color: var(--zi-muted);
+  font-size: 26rpx;
+  font-weight: 800;
+  line-height: 1;
 }
 .footnote {
   margin: 24rpx 8rpx 60rpx;

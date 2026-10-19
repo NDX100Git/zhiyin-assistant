@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # backend/ 目录与 config/ 目录的绝对路径
@@ -98,6 +99,11 @@ class Settings(BaseSettings):
     # 不提供盘符默认值：Windows 与 Linux 的安装位置不同，猜错了比没配更难查。
     soffice_path: str = ""
     soffice_timeout_seconds: int = 180
+    # 同时最多几个转换进程。每次转换都新起一个 soffice，几十人同时上传时
+    # 进程数与内存会把机器打满，所以超出上限的请求排队，排不到就返回 50046。
+    soffice_max_concurrency: int = 2
+    # 排队等空位的最长秒数。等不到就早失败，不占着请求线程干等。
+    soffice_queue_wait_seconds: float = 20.0
     # 也可以不装本机 LibreOffice，改用常驻转换容器（编排文件里的 libreoffice 服务）。
     # 填容器名即走 docker exec，容器内把后端的 runtime 目录挂成 soffice_container_dir。
     soffice_container: str = ""
@@ -113,6 +119,16 @@ class Settings(BaseSettings):
     wechat_mch_id: str = ""
     wechat_api_key: str = ""
     wechat_notify_url: str = ""
+
+    @model_validator(mode="after")
+    def _check_file_retention(self) -> Settings:
+        """文件物理保留期必须长于下单宽限期，否则学生会引用到已删除的文件。"""
+        if self.file_expire_hours <= self.order_file_grace_hours:
+            raise ValueError(
+                "FILE_EXPIRE_HOURS 必须大于 ORDER_FILE_GRACE_HOURS："
+                f"当前为 {self.file_expire_hours} 与 {self.order_file_grace_hours}"
+            )
+        return self
 
     @property
     def database_url(self) -> str:

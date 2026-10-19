@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS `orders` (
   `paid_at`        DATETIME     DEFAULT NULL,
   `created_at`     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `requeue_at`     DATETIME     DEFAULT NULL COMMENT '换文件后重新排队时间，为空时按创建时间排队',
+  `file_changed_at` DATETIME    DEFAULT NULL COMMENT '当前文件最近一次被替换的时间',
+  `files_seen_at`  DATETIME     DEFAULT NULL COMMENT '老师确认看到替换后文件的时间',
   `printed_at`     DATETIME     DEFAULT NULL,
   `picked_at`      DATETIME     DEFAULT NULL,
   `remark`         VARCHAR(255) DEFAULT NULL,
@@ -63,6 +65,7 @@ CREATE TABLE IF NOT EXISTS `orders` (
 CREATE TABLE IF NOT EXISTS `order_file_versions` (
   `id`           BIGINT       NOT NULL AUTO_INCREMENT,
   `order_id`     BIGINT       NOT NULL,
+  `file_index`   INT          NOT NULL DEFAULT 1 COMMENT '文件在订单清单里的序号',
   `version_no`   INT          NOT NULL COMMENT '从 1 递增，每次换文件加一',
   `file_key`     VARCHAR(255) NOT NULL COMMENT '对象存储路径',
   `file_name`    VARCHAR(255) DEFAULT NULL,
@@ -85,14 +88,19 @@ CREATE TABLE IF NOT EXISTS `order_file_changes` (
   `order_id`           BIGINT       NOT NULL,
   `status`             VARCHAR(16)  NOT NULL DEFAULT 'pending' COMMENT 'pending/approved/rejected/cancelled',
   `pending_flag`       TINYINT      DEFAULT NULL COMMENT '待确认时为 1，处理后置 NULL',
+  `file_index`         INT          NOT NULL DEFAULT 1 COMMENT '要替换第几份文件',
   `old_file_key`       VARCHAR(255) DEFAULT NULL,
   `old_file_name`      VARCHAR(255) DEFAULT NULL,
-  `old_page_count`     INT          DEFAULT NULL,
-  `old_amount_cents`   INT          DEFAULT NULL,
+  `old_page_count`     INT          DEFAULT NULL COMMENT '订单总页数快照',
+  `old_amount_cents`   INT          DEFAULT NULL COMMENT '订单总金额快照，单位：分',
+  `old_file_page_count` INT         DEFAULT NULL COMMENT '被替换文件自己的页数',
+  `old_file_amount_cents` INT       DEFAULT NULL COMMENT '被替换文件自己的行金额，单位：分',
   `new_file_key`       VARCHAR(255) NOT NULL,
   `new_file_name`      VARCHAR(255) DEFAULT NULL,
-  `new_page_count`     INT          NOT NULL,
-  `new_amount_cents`   INT          NOT NULL COMMENT '系统重算价，单位：分',
+  `new_file_page_count` INT         DEFAULT NULL COMMENT '新文件自己的页数',
+  `new_page_count`     INT          NOT NULL COMMENT '换完后的订单总页数',
+  `new_amount_cents`   INT          NOT NULL COMMENT '系统重算的订单总价，单位：分',
+  `new_file_amount_cents` INT       DEFAULT NULL COMMENT '新文件自己的行金额，单位：分',
   `final_amount_cents` INT          DEFAULT NULL COMMENT '老师确认后的最终价，单位：分',
   `reason`             VARCHAR(255) DEFAULT NULL,
   `requested_by`       VARCHAR(32)  DEFAULT NULL,
@@ -104,6 +112,35 @@ CREATE TABLE IF NOT EXISTS `order_file_changes` (
   KEY `idx_file_change_order_status` (`order_id`, `status`),
   UNIQUE KEY `uq_file_change_pending` (`order_id`, `pending_flag`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='换文件变更请求';
+
+-- 订单当前文件清单：一单多文件按 file_index 排序；换文件只改对应行
+CREATE TABLE IF NOT EXISTS `order_files` (
+  `id`           BIGINT       NOT NULL AUTO_INCREMENT,
+  `order_id`     BIGINT       NOT NULL,
+  `file_index`   INT          NOT NULL COMMENT '从 1 开始，老师在队列里看到的顺序',
+  `file_key`     VARCHAR(255) NOT NULL COMMENT '对象存储路径',
+  `file_name`    VARCHAR(255) DEFAULT NULL,
+  `page_count`   INT          NOT NULL,
+  `amount_cents` INT          NOT NULL DEFAULT 0 COMMENT '该文件的行金额快照，单位：分',
+  `created_at`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_order_file_index` (`order_id`, `file_index`),
+  KEY `idx_order_file_key` (`file_key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='订单当前文件清单';
+
+-- 上传记录：记住文件是谁传的，学生撤回未下单文件时做归属校验
+CREATE TABLE IF NOT EXISTS `uploaded_files` (
+  `id`           BIGINT       NOT NULL AUTO_INCREMENT,
+  `user_id`      BIGINT       NOT NULL,
+  `file_key`     VARCHAR(255) NOT NULL,
+  `file_name`    VARCHAR(255) DEFAULT NULL,
+  `size`         INT          NOT NULL DEFAULT 0,
+  `content_type` VARCHAR(128) DEFAULT NULL,
+  `created_at`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_uploaded_file_key` (`file_key`),
+  KEY `idx_uploaded_file_user` (`user_id`, `created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='上传记录，用于撤回未下单文件';
 
 -- 按日发号器：订单号与取件码都从这一行的 last_seq 出。
 -- INSERT ... ON DUPLICATE KEY UPDATE 一句完成原子自增，并发不会重号。

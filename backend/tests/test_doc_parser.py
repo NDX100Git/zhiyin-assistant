@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import shutil
 import zipfile
 from pathlib import Path
 
@@ -183,3 +184,32 @@ def test_docx经LibreOffice转换后可解析(db_session, test_storage, tmp_path
     assert report["source"]["converted_from"] == "docx"
     assert report["page_count"] >= 1
     assert "摘要" in "".join(page["text"] for page in report["pages"])
+
+
+@pytest.mark.skipif(
+    not settings.soffice_container or shutil.which("docker") is None,
+    reason="未配置可用的 LibreOffice 转换容器，跳过容器内 PPT 转换测试",
+)
+def test_pptx经转换容器转换后可解析(db_session, test_storage, tmp_path):
+    """容器镜像必须带 impress，否则上传接口声称支持的 PPT/PPTX 会在部署后失败。"""
+    from pptx import Presentation
+
+    pptx_path = tmp_path / "slides.pptx"
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[1])
+    slide.shapes.title.text = "论文答辩"
+    slide.placeholders[1].text = "规则引擎与模型混合的格式检查"
+    presentation.save(str(pptx_path))
+
+    key = build_object_key("slides.pptx")
+    data = pptx_path.read_bytes()
+    test_storage.upload(
+        key,
+        io.BytesIO(data),
+        len(data),
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    )
+
+    report = parse_document(db_session, key)
+    assert report["source"]["converted_from"] == "pptx"
+    assert report["page_count"] >= 1

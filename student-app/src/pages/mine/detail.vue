@@ -28,8 +28,24 @@
 
       <view class="card">
         <view class="row"><text class="k">订单号</text><text class="v">{{ order.order_no }}</text></view>
-        <view class="row"><text class="k">文件</text><text class="v">{{ order.file_name || '论文文档' }}</text></view>
-        <view class="row"><text class="k">页数</text><text class="v">{{ order.page_count }} 页</text></view>
+        <!-- 多文件订单一单一个取件码：清单逐份列出，老师按这份清单打印 -->
+        <view v-if="files.length > 1" class="file-block">
+          <text class="k">文件（{{ files.length }} 份 · 共 {{ pagesTotal }} 页）</text>
+          <view v-for="(item, index) in files" :key="item.file_index" class="file-line">
+            <text class="file-index">{{ index + 1 }}</text>
+            <text class="file-name">{{ item.file_name }}</text>
+            <text class="file-pages">{{ item.page_count }} 页</text>
+          </view>
+        </view>
+        <view v-else class="row">
+          <text class="k">文件</text>
+          <text class="v">{{ files.length ? files[0].file_name : (order.file_name || '论文文档') }}</text>
+        </view>
+        <view class="row"><text class="k">页数</text><text class="v">{{ pagesTotal }} 页</text></view>
+        <view v-if="fileChangedAt" class="row">
+          <text class="k">文件状态</text>
+          <text class="v">{{ teacherUnconfirmed(order) ? '已替换，等老师重新下载确认' : '已替换，老师已确认' }}</text>
+        </view>
         <view class="row"><text class="k">打印</text><text class="v">{{ order.print_side === 2 ? '双面' : '单面' }} · {{ order.color_mode === 1 ? '彩色' : '黑白' }} · {{ order.copies }} 份</text></view>
         <view class="row"><text class="k">金额</text><text class="v money">{{ formatMoney(order.amount_cents) }}{{ order.paid ? '（已支付）' : '（未支付）' }}</text></view>
         <view class="row"><text class="k">下单时间</text><text class="v">{{ formatTime(order.created_at) }}</text></view>
@@ -42,6 +58,10 @@
           <text class="card-title">换文件待老师确认</text>
         </view>
         <view class="row"><text class="k">变更编号</text><text class="v">#{{ fileChange.change_id }}</text></view>
+        <view v-if="changeInfo && files.length > 1" class="row">
+          <text class="k">换的是</text>
+          <text class="v">{{ changeInfo.label }}：{{ changeInfo.file_name }}</text>
+        </view>
         <view class="row"><text class="k">新文件</text><text class="v">{{ fileChange.new_file_name || '新文件' }}</text></view>
         <view class="row"><text class="k">新页数</text><text class="v">{{ fileChange.new_page_count }} 页</text></view>
         <view class="row"><text class="k">新金额</text><text class="v money">{{ formatMoney(fileChange.new_amount_cents) }}</text></view>
@@ -85,6 +105,7 @@ import { POLL_INTERVAL } from '@/config'
 import { request } from '@/services/api'
 import { ensureLogin } from '@/services/auth'
 import { createPoller, notify, notifyError } from '@/services/notify'
+import { changeTarget, orderFiles, teacherUnconfirmed, totalPages } from '@/services/orderFiles'
 import { usePullRefresh } from '@/ui/pullRefresh'
 import { useUiTheme } from '@/ui/theme'
 
@@ -97,6 +118,13 @@ const isActive = computed(() => order.value && ['queuing', 'printing'].includes(
 
 /** 待老师确认的换文件申请；没有时为 null。 */
 const fileChange = computed(() => (order.value && order.value.file_change) || null)
+
+/** 当前生效的文件清单（多文件订单多行，老订单自动兜底成一行）。 */
+const files = computed(() => orderFiles(order.value))
+const pagesTotal = computed(() => totalPages(order.value))
+const fileChangedAt = computed(() => (order.value && order.value.file_changed_at) || '')
+/** 这次换文件针对哪一份，多文件时说清「第 N 个文件」。 */
+const changeInfo = computed(() => changeTarget(order.value))
 
 /** 允许换文件的状态：待支付直接生效，排队中与异常单走老师确认。 */
 const REPLACEABLE = ['pending_pay', 'queuing', 'abnormal']
@@ -440,6 +468,47 @@ function goOrder() {
 .money {
   color: var(--zi-accent);
   font-weight: 900;
+}
+
+/* 多文件清单：与 .row 同一套分隔线，逐份列出顺序、文件名与页数 */
+.file-block {
+  display: flex;
+  align-items: flex-start;
+  padding: 18rpx 0;
+  border-bottom: 2rpx solid var(--zi-line);
+  font-size: 28rpx;
+}
+.file-block .k {
+  flex: 0 0 150rpx;
+  width: 150rpx;
+}
+.file-line {
+  display: flex;
+  align-items: flex-start;
+  padding: 6rpx 0;
+}
+.file-index {
+  flex: 0 0 34rpx;
+  margin-right: 10rpx;
+  color: var(--zi-muted);
+  font-size: 24rpx;
+  font-weight: 800;
+  line-height: 1.6;
+}
+.file-line .file-name {
+  flex: 1;
+  min-width: 0;
+  color: var(--zi-ink);
+  font-size: 26rpx;
+  font-weight: 700;
+  line-height: 1.6;
+  word-break: break-all;
+}
+.file-pages {
+  margin-left: 14rpx;
+  color: var(--zi-muted);
+  font-size: 24rpx;
+  white-space: nowrap;
 }
 
 .card-head {

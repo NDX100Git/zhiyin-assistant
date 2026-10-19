@@ -6,11 +6,13 @@ from app.models.notice import Notice
 from app.models.notification import Notification
 from app.models.order import Order
 from app.models.order_daily_seq import OrderDailySeq
+from app.models.order_file import OrderFile
 from app.models.order_file_change import OrderFileChange
 from app.models.order_file_version import OrderFileVersion
 from app.models.payment_log import PaymentLog
 from app.models.print_log import PrintLog
 from app.models.queue_session import QueueSession
+from app.models.uploaded_file import UploadedFile
 from app.models.user import User
 
 __all__ = [
@@ -20,10 +22,12 @@ __all__ = [
     "Notification",
     "Order",
     "OrderDailySeq",
+    "OrderFile",
     "OrderFileChange",
     "OrderFileVersion",
     "PaymentLog",
     "PrintLog",
     "QueueSession",
+    "UploadedFile",
     "User",
 ]

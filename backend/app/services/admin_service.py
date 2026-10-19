@@ -22,6 +22,12 @@ from app.services.file_change_service import (
     expire_pending_changes,
     pending_change_view,
 )
+from app.services.order_file_service import (
+    batch_files_view,
+    ensure_files,
+    files_view,
+    is_file_unconfirmed,
+)
 from app.services.order_state import (
     ADMIN_CANCELLABLE,
     STATUS_ABNORMAL,
@@ -68,14 +74,17 @@ def get_order(db: Session, order_id: int) -> Order:
 
 
 def order_admin_view(db: Session, order: Order, wait: dict | None = None,
-                     file_change: dict | object | None = _UNSET) -> dict:
-    """老师端订单视图：含打印参数与排队信息。
+                     file_change: dict | object | None = _UNSET,
+                     files: list[dict] | object | None = _UNSET) -> dict:
+    """老师端订单视图：含打印参数、文件清单与排队信息。
 
-    wait 与 file_change 可由调用方批量算好后传入；file_change 不传时单独查一次。
+    wait / file_change / files 可由调用方批量算好后传入；不传时单独查一次。
     """
     wait = wait or order_wait_info(db, order)
     if file_change is _UNSET:
         file_change = pending_change_view(db, order.id)
+    if files is _UNSET:
+        files = files_view(db, order)
     return {
         "id": order.id,
         "order_no": order.order_no,
@@ -94,12 +103,16 @@ def order_admin_view(db: Session, order: Order, wait: dict | None = None,
         "pay_method": order.pay_method,
         "created_at": order.created_at.isoformat() if order.created_at else None,
         "requeue_at": order.requeue_at.isoformat() if order.requeue_at else None,
+        "file_changed_at": order.file_changed_at.isoformat() if order.file_changed_at else None,
+        "files_seen_at": order.files_seen_at.isoformat() if order.files_seen_at else None,
+        "files_unconfirmed": is_file_unconfirmed(order),
         "printed_at": order.printed_at.isoformat() if order.printed_at else None,
         "picked_at": order.picked_at.isoformat() if order.picked_at else None,
         "remark": order.remark,
         "cancel_reason": order.cancel_reason,
         "queue_position": wait["queue_position"],
         "estimated_minutes": wait["estimated_minutes"],
+        "files": files,
         "file_change": file_change,
     }
 
@@ -128,26 +141,59 @@ def queue_list(db: Session, status: str | None = None, keyword: str | None = Non
     )
     waits = batch_wait_info(db, rows)
     changes = batch_pending_changes(db, [order.id for order in rows])
+    files = batch_files_view(db, rows)
     return {
         "total": int(total),
         "page": page,
         "page_size": page_size,
         "items": [
-            order_admin_view(db, order, waits.get(order.id), changes.get(order.id))
+            order_admin_view(
+                db, order, waits.get(order.id), changes.get(order.id), files.get(order.id)
+            )
             for order in rows
         ],
     }
 
 
-def download_url(order: Order) -> dict:
-    """给老师发限时签名下载链接（私有桶，禁止公开读）。"""
-    if not order.file_key:
+def download_url(db: Session, order: Order, file_index: int | None = None) -> dict:
+    """给老师发限时签名下载链接（私有桶，禁止公开读）。
+
+    不传 file_index 时返回全部文件链接，同时保留顶层的首份文件链接作为旧接口兼容。
+    """
+    rows = ensure_files(db, order)
+    if not rows:
         raise BusinessError("该订单没有关联文件", code=40402)
+    target = rows[0]
+    if file_index is not None:
+        target = next(
+            (row for row in rows if int(row.file_index) == int(file_index)), None
+        )
+        if target is None:
+            raise BusinessError(
+                f"订单里没有第 {file_index} 份文件，请刷新后重试", code=40405
+            )
+    storage = get_storage()
+    items = [
+        {
+            "file_index": int(row.file_index),
+            "file_key": row.file_key,
+            "file_name": row.file_name,
+            "page_count": int(row.page_count or 0),
+            "signed_url": storage.signed_url(row.file_key),
+        }
+        for row in rows
+    ]
+    primary = next(
+        (item for item in items if item["file_index"] == int(target.file_index)),
+        items[0] if items else None,
+    )
     return {
         "order_id": order.id,
-        "file_key": order.file_key,
-        "file_name": order.file_name,
-        "signed_url": get_storage().signed_url(order.file_key),
+        "file_index": primary["file_index"] if primary else None,
+        "file_key": primary["file_key"] if primary else None,
+        "file_name": primary["file_name"] if primary else None,
+        "signed_url": primary["signed_url"] if primary else "",
+        "files": items,
     }
 
 
@@ -159,11 +205,30 @@ def start_print(db: Session, order: Order, operator: str) -> dict:
     """
     expire_pending_changes(db, order.id, "订单已开始打印，换文件请求失效", operator)
     change_status(db, order, STATUS_PRINTING, operator=operator, note="老师开始打印")
-    file_url = get_storage().signed_url(order.file_key) if order.file_key else ""
+    storage = get_storage()
+    rows = files_view(db, order)
+    file_links = [
+        {**row, "signed_url": storage.signed_url(row["file_key"])} for row in rows
+    ]
+    file_url = file_links[0]["signed_url"] if file_links else ""
     job = get_printer_provider().print(order, file_url)
+    job["files"] = file_links
     db.commit()
     db.refresh(order)
     return {"order": order_admin_view(db, order), "print_job": job}
+
+
+def confirm_files_seen(db: Session, order: Order, operator: str) -> dict:
+    """老师重新下载后确认已看到当前文件，清掉「文件已替换」标记。"""
+    order.files_seen_at = datetime.now()  # 服务端时间
+    record_log(
+        db, order, "note",
+        note="老师已重新下载并确认当前文件",
+        operator=operator,
+    )
+    db.commit()
+    db.refresh(order)
+    return order_admin_view(db, order)
 
 
 def complete_print(db: Session, order: Order, operator: str,

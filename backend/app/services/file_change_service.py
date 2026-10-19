@@ -31,6 +31,11 @@ from app.models.order_file_change import (
 from app.models.order_file_version import OrderFileVersion
 from app.models.payment_log import PaymentLog
 from app.services.notifier import get_notifier
+from app.services.order_file_service import (
+    ensure_files,
+    recalc_order_totals,
+    resolve_file_row,
+)
 from app.services.order_state import (
     STATUS_ABNORMAL,
     STATUS_PENDING_PAY,
@@ -104,6 +109,7 @@ def _push_version(
     db: Session,
     order: Order,
     *,
+    file_index: int,
     file_key: str,
     file_name: str | None,
     page_count: int,
@@ -111,15 +117,20 @@ def _push_version(
     operator: str,
     note: str | None = None,
 ) -> OrderFileVersion:
-    """把旧版本标记为非当前，再写入一条新的生效版本。"""
+    """把同一份文件的旧版本标记为非当前，再写入一条新的生效版本。"""
     db.execute(
         update(OrderFileVersion)
-        .where(OrderFileVersion.order_id == order.id, OrderFileVersion.is_current == 1)
+        .where(
+            OrderFileVersion.order_id == order.id,
+            OrderFileVersion.file_index == int(file_index),
+            OrderFileVersion.is_current == 1,
+        )
         .values(is_current=0)
         .execution_options(synchronize_session=False)
     )
     version = OrderFileVersion(
         order_id=order.id,
+        file_index=int(file_index),
         version_no=_next_version_no(db, order.id),
         file_key=file_key,
         file_name=file_name,
@@ -134,24 +145,34 @@ def _push_version(
     return version
 
 
-def create_initial_version(db: Session, order: Order) -> OrderFileVersion | None:
-    """下单时记录第 1 个文件版本；没有文件标识的历史数据不记录。"""
-    if not order.file_key:
+def create_initial_version(
+    db: Session, order: Order, files: list | None = None
+) -> OrderFileVersion | None:
+    """下单时按文件清单逐份记录第 1 个版本；没有文件的历史数据不记录。"""
+    rows = files if files is not None else ensure_files(db, order)
+    if not rows:
         return None
-    version = OrderFileVersion(
-        order_id=order.id,
-        version_no=_next_version_no(db, order.id),
-        file_key=order.file_key,
-        file_name=order.file_name,
-        page_count=int(order.page_count or 0),
-        amount_cents=int(order.amount_cents or 0),
-        is_current=1,
-        operator="student",
-        note="下单时的原始文件",
-    )
-    db.add(version)
+
+    next_no = _next_version_no(db, order.id)
+    versions: list[OrderFileVersion] = []
+    for row in rows:
+        version = OrderFileVersion(
+            order_id=order.id,
+            file_index=int(row.file_index),
+            version_no=next_no,
+            file_key=row.file_key,
+            file_name=row.file_name,
+            page_count=int(row.page_count or 0),
+            amount_cents=int(row.amount_cents or 0),
+            is_current=1,
+            operator="student",
+            note="下单时的原始文件",
+        )
+        db.add(version)
+        versions.append(version)
+        next_no += 1
     db.flush()
-    return version
+    return versions[0]
 
 
 def get_pending_change(db: Session, order_id: int) -> OrderFileChange | None:
@@ -167,20 +188,30 @@ def get_pending_change(db: Session, order_id: int) -> OrderFileChange | None:
 
 
 def change_to_view(change: OrderFileChange) -> dict:
-    """待确认请求的对外字段，学生端与老师端共用同一套键名。"""
+    """待确认请求的对外字段，学生端与老师端共用同一套键名。
+
+    `old_page_count` / `new_page_count` / `old_amount_cents` / `new_amount_cents`
+    是订单总额与总页数（与单文件时代语义一致）；`*_file_*` 字段才是被替换的
+    那一份文件自己的页数与行金额，老师确认弹窗用后者显示「换的是哪一份」。
+    """
     return {
         "id": change.id,
         "change_id": change.id,
         "order_id": change.order_id,
+        "file_index": int(change.file_index or 1),
         "new_file_name": change.new_file_name,
         "new_page_count": change.new_page_count,
         "new_amount_cents": change.new_amount_cents,
+        "new_file_page_count": change.new_file_page_count,
+        "new_file_amount_cents": change.new_file_amount_cents,
         "submitted_at": change.created_at.isoformat() if change.created_at else None,
         "reason": change.reason,
         # 老师确认弹窗需要对照旧值；学生端也可以直接展示
         "old_file_name": change.old_file_name,
         "old_page_count": change.old_page_count,
         "old_amount_cents": change.old_amount_cents,
+        "old_file_page_count": change.old_file_page_count,
+        "old_file_amount_cents": change.old_file_amount_cents,
     }
 
 
@@ -252,38 +283,62 @@ def _record_file_event(
     )
 
 
+def _ensure_total_pages(order: Order, target, new_page_count: int) -> int:
+    """换一份文件后整单页数不能超过配置上限。"""
+    max_pages = int(get_order_rules()["limits"]["max_page_count"])
+    total = int(order.page_count or 0) - int(target.page_count or 0) + int(new_page_count)
+    if total > max_pages:
+        raise BusinessError(
+            f"换完后整单合计 {total} 页，超过上限 {max_pages} 页", code=40045
+        )
+    return total
+
+
 def _apply_immediately(db: Session, order: Order, payload) -> dict:
     """待支付订单直接换：页数与金额重算，订单号、取件码、状态不变。"""
+    rows, target = resolve_file_row(db, order, getattr(payload, "file_index", None))
+    _ensure_total_pages(order, target, payload.page_count)
+
     old = {
-        "file_name": order.file_name,
-        "page_count": order.page_count,
-        "amount_cents": order.amount_cents,
+        "file_name": target.file_name,
+        "page_count": target.page_count,
+        "file_amount_cents": target.amount_cents,
+        "total_page_count": order.page_count,
+        "total_amount_cents": order.amount_cents,
+        "file_index": int(target.file_index),
     }
-    new_amount = system_amount_cents(order, payload.page_count)
 
     # 待支付状态本不该有待确认请求；万一有，先让它失效，避免两套数据打架
     expire_pending_changes(db, order.id, "订单处于待支付，直接换文件", "system")
 
+    target.file_key = payload.file_key
+    target.file_name = payload.file_name
+    target.page_count = int(payload.page_count)
+    total_pages, new_amount = recalc_order_totals(order, rows)
+
     _push_version(
         db,
         order,
+        file_index=target.file_index,
         file_key=payload.file_key,
         file_name=payload.file_name,
         page_count=payload.page_count,
-        amount_cents=new_amount,
+        amount_cents=target.amount_cents,
         operator="student",
         note=payload.reason or "学生换文件（待支付，直接生效）",
     )
 
-    order.file_key = payload.file_key
-    order.file_name = payload.file_name
-    order.page_count = int(payload.page_count)
-    order.amount_cents = new_amount
+    # 文件变了，老师之前「看到」的状态作废，直到重新下载确认
+    now = datetime.now()
+    order.file_changed_at = now
+    order.files_seen_at = None
 
+    file_label = f"第 {old['file_index']} 份文件" if len(rows) > 1 else "文件"
     note = (
-        f"学生换文件：{old['file_name'] or '原文件'}（{old['page_count'] or 0} 页）→ "
-        f"{payload.file_name or payload.file_key}（{payload.page_count} 页），"
-        f"金额 {old['amount_cents'] or 0} 分 → {new_amount} 分"
+        f"学生换{file_label}：{old['file_name'] or '原文件'}（{old['page_count'] or 0} 页）→ "
+        f"{payload.file_name or payload.file_key}（{payload.page_count} 页）；"
+        f"整单 {old['total_page_count'] or 0} 页 / {old['total_amount_cents'] or 0} 分 → "
+        f"{total_pages} 页 / {new_amount} 分"
     )
     _record_file_event(
         db,
@@ -293,12 +348,17 @@ def _apply_immediately(db: Session, order: Order, payload) -> dict:
         operator="student",
         event="order_file_replaced",
         payload={
+            "file_index": old["file_index"],
             "old_file_name": old["file_name"],
             "old_page_count": old["page_count"],
-            "old_amount_cents": old["amount_cents"],
+            "old_amount_cents": old["file_amount_cents"],
+            "old_total_page_count": old["total_page_count"],
+            "old_total_amount_cents": old["total_amount_cents"],
             "new_file_name": payload.file_name,
             "new_page_count": int(payload.page_count),
-            "new_amount_cents": new_amount,
+            "new_amount_cents": int(target.amount_cents),
+            "new_total_page_count": total_pages,
+            "new_total_amount_cents": new_amount,
         },
     )
     db.commit()
@@ -312,19 +372,30 @@ def _create_pending_change(db: Session, order: Order, payload) -> OrderFileChang
     if get_pending_change(db, order.id) is not None:
         raise BusinessError("该订单已有待老师确认的换文件请求，请等待处理", code=40910)
 
-    new_amount = system_amount_cents(order, payload.page_count)
+    rows, target = resolve_file_row(db, order, getattr(payload, "file_index", None))
+    new_total_pages = _ensure_total_pages(order, target, payload.page_count)
+    new_amount = system_amount_cents(order, new_total_pages)
+    new_file_amount = system_amount_cents(order, payload.page_count)
+
     change = OrderFileChange(
         order_id=order.id,
         status=CHANGE_PENDING,
         pending_flag=1,
-        old_file_key=order.file_key,
-        old_file_name=order.file_name,
+        file_index=int(target.file_index),
+        old_file_key=target.file_key,
+        old_file_name=target.file_name,
+        # 这两个是订单总额快照，保持单文件时代的语义
         old_page_count=order.page_count,
         old_amount_cents=order.amount_cents,
+        old_file_page_count=target.page_count,
+        old_file_amount_cents=target.amount_cents,
         new_file_key=payload.file_key,
         new_file_name=payload.file_name,
-        new_page_count=int(payload.page_count),
+        # 新文件自己的页数，以及换完后的整单总页数
+        new_file_page_count=int(payload.page_count),
+        new_page_count=new_total_pages,
         new_amount_cents=new_amount,
+        new_file_amount_cents=new_file_amount,
         reason=payload.reason,
         requested_by="student",
     )
@@ -336,10 +407,13 @@ def _create_pending_change(db: Session, order: Order, payload) -> OrderFileChang
         db.rollback()
         raise BusinessError("该订单已有待老师确认的换文件请求，请等待处理", code=40910) from exc
 
+    file_label = f"第 {target.file_index} 份文件" if len(rows) > 1 else "文件"
     note = (
-        f"学生申请换文件：{order.file_name or '原文件'}（{order.page_count or 0} 页）→ "
+        f"学生申请换{file_label}：{target.file_name or '原文件'}"
+        f"（{target.page_count or 0} 页）→ "
         f"{payload.file_name or payload.file_key}（{payload.page_count} 页），"
-        f"系统重算 {new_amount} 分，等待老师确认"
+        f"整单 {order.page_count or 0} 页 / {order.amount_cents or 0} 分 → "
+        f"{new_total_pages} 页 / {new_amount} 分，等待老师确认"
     )
     _record_file_event(
         db,
@@ -350,19 +424,25 @@ def _create_pending_change(db: Session, order: Order, payload) -> OrderFileChang
         event="order_file_change_pending",
         payload={
             "change_id": change.id,
-            "old_file_name": order.file_name,
-            "old_page_count": order.page_count,
-            "old_amount_cents": order.amount_cents,
+            "file_index": int(target.file_index),
+            "old_file_name": target.file_name,
+            "old_page_count": target.page_count,
+            "old_amount_cents": target.amount_cents,
+            "old_total_page_count": order.page_count,
+            "old_total_amount_cents": order.amount_cents,
             "new_file_name": payload.file_name,
             "new_page_count": int(payload.page_count),
-            "new_amount_cents": new_amount,
+            "new_amount_cents": new_file_amount,
+            "new_total_page_count": new_total_pages,
+            "new_total_amount_cents": new_amount,
         },
     )
     db.commit()
     db.refresh(change)
     logger.info(
-        "订单 %s 换文件请求 #%s 待老师确认：%s 页 / %s 分",
-        order.order_no, change.id, change.new_page_count, change.new_amount_cents,
+        "订单 %s 换文件请求 #%s 待老师确认：第 %s 份 %s 页 / 整单 %s 分",
+        order.order_no, change.id, change.file_index, change.new_file_page_count,
+        change.new_amount_cents,
     )
     return change
 
@@ -444,32 +524,47 @@ def _approve_change(
     if final_amount < 0:
         raise BusinessError("金额不能为负数", code=40061)
 
+    rows, target = resolve_file_row(db, order, change.file_index)
+    new_file_pages = int(change.new_file_page_count or change.new_page_count)
+    _ensure_total_pages(order, target, new_file_pages)
+
     old = {
-        "file_name": order.file_name,
-        "page_count": order.page_count,
-        "amount_cents": order.amount_cents,
+        "file_index": int(target.file_index),
+        "file_name": target.file_name,
+        "page_count": target.page_count,
+        "file_amount_cents": target.amount_cents,
+        "total_page_count": order.page_count,
+        "total_amount_cents": order.amount_cents,
     }
     paid_total = _paid_total(db, order.id)
+
+    target.file_key = change.new_file_key
+    target.file_name = change.new_file_name
+    target.page_count = new_file_pages
+    total_pages, system_total = recalc_order_totals(
+        order, rows, final_amount_cents=final_amount
+    )
 
     _push_version(
         db,
         order,
+        file_index=target.file_index,
         file_key=change.new_file_key,
         file_name=change.new_file_name,
-        page_count=change.new_page_count,
-        amount_cents=final_amount,
+        page_count=new_file_pages,
+        # 单文件订单的版本金额就是整单成交价（包含老师改价）；多文件时保留该文件
+        # 自己的系统行金额，整单成交价在 orders.amount_cents 上，版本表不做分摊。
+        amount_cents=final_amount if len(rows) == 1 else target.amount_cents,
         operator="admin",
         note=f"老师确认换文件（{operator}）",
     )
 
-    order.file_key = change.new_file_key
-    order.file_name = change.new_file_name
-    order.page_count = int(change.new_page_count)
-    order.amount_cents = final_amount
-
-    # 重新排到队尾：不改订单号与创建时间，只写重新排队时间
+    # 重新排到队尾：不改订单号与创建时间，只写重新排队时间。
+    # 文件已替换，老师之前的「已看到」作废，等重新下载后再确认。
     now = datetime.now()
     order.requeue_at = now
+    order.file_changed_at = now
+    order.files_seen_at = None
 
     status_note = ""
     if order.status == STATUS_ABNORMAL:
@@ -495,10 +590,13 @@ def _approve_change(
     else:
         price_note = "与已付金额一致，无需补收"
 
+    file_label = f"第 {old['file_index']} 份文件" if len(rows) > 1 else "文件"
     note = (
-        f"老师确认换文件：{old['file_name'] or '原文件'}（{old['page_count'] or 0} 页）→ "
-        f"{change.new_file_name or change.new_file_key}（{change.new_page_count} 页），"
-        f"金额 {old['amount_cents'] or 0} 分 → {final_amount} 分；"
+        f"老师确认换{file_label}：{old['file_name'] or '原文件'}"
+        f"（{old['page_count'] or 0} 页）→ "
+        f"{change.new_file_name or change.new_file_key}（{new_file_pages} 页）；"
+        f"整单 {old['total_page_count'] or 0} 页 / {old['total_amount_cents'] or 0} 分 → "
+        f"{total_pages} 页 / {final_amount} 分（系统重算 {system_total} 分）；"
         f"{price_note}；已重新排到队尾{status_note}"
     )
     _record_file_event(
@@ -510,12 +608,18 @@ def _approve_change(
         event="order_file_change_approved",
         payload={
             "change_id": change.id,
+            "file_index": old["file_index"],
             "old_file_name": old["file_name"],
             "old_page_count": old["page_count"],
-            "old_amount_cents": old["amount_cents"],
+            "old_amount_cents": old["file_amount_cents"],
+            "old_total_page_count": old["total_page_count"],
+            "old_total_amount_cents": old["total_amount_cents"],
             "new_file_name": change.new_file_name,
-            "new_page_count": change.new_page_count,
-            "new_amount_cents": final_amount,
+            "new_page_count": new_file_pages,
+            "new_amount_cents": int(target.amount_cents),
+            "new_total_page_count": total_pages,
+            "new_total_amount_cents": final_amount,
+            "system_total_amount_cents": system_total,
             "paid_total_cents": paid_total,
             "supplement_cents": supplement,
             "refund_cents": 0,

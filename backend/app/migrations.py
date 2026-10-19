@@ -21,6 +21,18 @@ logger = logging.getLogger(__name__)
 MIGRATION_COLUMNS: dict[str, dict[str, str]] = {
     "orders": {
         "requeue_at": "DATETIME NULL COMMENT '换文件后重新排队时间，为空时按创建时间排队'",
+        "file_changed_at": "DATETIME NULL COMMENT '当前文件最近一次被替换的时间'",
+        "files_seen_at": "DATETIME NULL COMMENT '老师确认看到替换后文件的时间'",
+    },
+    "order_file_versions": {
+        "file_index": "INT NOT NULL DEFAULT 1 COMMENT '文件在订单清单里的序号'",
+    },
+    "order_file_changes": {
+        "file_index": "INT NOT NULL DEFAULT 1 COMMENT '要替换第几份文件'",
+        "old_file_page_count": "INT NULL COMMENT '被替换文件自己的页数'",
+        "old_file_amount_cents": "INT NULL COMMENT '被替换文件自己的行金额（分）'",
+        "new_file_page_count": "INT NULL COMMENT '新文件自己的页数'",
+        "new_file_amount_cents": "INT NULL COMMENT '新文件自己的行金额（分）'",
     },
 }
 
@@ -47,13 +59,29 @@ MIGRATION_INDEXES: dict[str, dict[str, str]] = {
     },
 }
 
+# 老订单没有文件清单行，按单文件字段回填第 1 份文件。
+# 只补完全没有清单行的订单，重复执行不会重复插入。
+BACKFILL_ORDER_FILES_SQL = """
+INSERT INTO `order_files`
+  (`order_id`, `file_index`, `file_key`, `file_name`, `page_count`, `amount_cents`,
+   `created_at`)
+SELECT o.id, 1, o.file_key, o.file_name, COALESCE(o.page_count, 0),
+       COALESCE(o.amount_cents, 0), COALESCE(o.created_at, CURRENT_TIMESTAMP)
+FROM `orders` o
+WHERE o.file_key IS NOT NULL
+  AND o.file_key <> ''
+  AND NOT EXISTS (
+    SELECT 1 FROM `order_files` f WHERE f.order_id = o.id
+  )
+"""
+
 # 老订单没有版本行，回填一条「当前生效版本」，让清理与追溯看到完整的版本表。
 # 只补完全没有版本的订单，重复执行不会重复插入。
 BACKFILL_VERSIONS_SQL = """
 INSERT INTO `order_file_versions`
-  (`order_id`, `version_no`, `file_key`, `file_name`, `page_count`, `amount_cents`,
-   `is_current`, `operator`, `note`, `created_at`)
-SELECT o.id, 1, o.file_key, o.file_name, COALESCE(o.page_count, 0),
+  (`order_id`, `file_index`, `version_no`, `file_key`, `file_name`, `page_count`,
+   `amount_cents`, `is_current`, `operator`, `note`, `created_at`)
+SELECT o.id, 1, 1, o.file_key, o.file_name, COALESCE(o.page_count, 0),
        COALESCE(o.amount_cents, 0), 1, 'system', '迁移回填：订单当前文件',
        COALESCE(o.created_at, CURRENT_TIMESTAMP)
 FROM `orders` o
@@ -127,22 +155,20 @@ def run_migrations(engine: Engine) -> list[str]:
                 applied.append(f"{table}.{index}")
                 logger.info("迁移：已为 %s 增加索引 %s", table, index)
 
-    with engine.connect() as conn:
-        if not _table_exists(conn, "order_file_versions"):
-            return applied
-        # 版本表一旦有数据就不再全表回填，避免每次启动都扫一遍 orders。
-        # 老库第一次上线时版本表为空，这一轮会把历史订单补齐。
-        existing_versions = int(
-            conn.execute(text("SELECT COUNT(*) FROM `order_file_versions`")).scalar_one()
-        )
-    if existing_versions:
-        return applied
-
     with engine.begin() as conn:
-        result = conn.execute(text(BACKFILL_VERSIONS_SQL))
-        if result.rowcount:
-            applied.append(f"order_file_versions.backfill:{result.rowcount}")
-            logger.info("迁移：已为 %d 张老订单回填文件版本", result.rowcount)
+        # 先补当前文件清单，再补版本行；两句都带 NOT EXISTS，重复执行不会重复插入。
+        # 不做「表里有数据就跳过」的判断：迁移中途失败时，下次启动还能把没补的订单补上。
+        if _table_exists(conn, "order_files"):
+            result = conn.execute(text(BACKFILL_ORDER_FILES_SQL))
+            if result.rowcount:
+                applied.append(f"order_files.backfill:{result.rowcount}")
+                logger.info("迁移：已为 %d 张老订单回填当前文件清单", result.rowcount)
+
+        if _table_exists(conn, "order_file_versions"):
+            result = conn.execute(text(BACKFILL_VERSIONS_SQL))
+            if result.rowcount:
+                applied.append(f"order_file_versions.backfill:{result.rowcount}")
+                logger.info("迁移：已为 %d 张老订单回填文件版本", result.rowcount)
 
     return applied
 

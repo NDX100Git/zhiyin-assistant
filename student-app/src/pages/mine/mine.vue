@@ -37,7 +37,7 @@
         <text class="status" :class="order.status">{{ order.status_label }}</text>
       </view>
       <view class="order-body">
-        <text class="file">{{ order.file_name || '论文文档' }}</text>
+        <text class="file">{{ fileLine(order) }}</text>
         <text class="amount">{{ formatMoney(order.amount_cents) }}</text>
       </view>
       <view class="order-meta">
@@ -61,6 +61,7 @@ import { POLL_INTERVAL } from '@/config'
 import { request } from '@/services/api'
 import { ensureLogin, getCurrentUser } from '@/services/auth'
 import { createPoller, notify, notifyError } from '@/services/notify'
+import { fileCount, fileSummary } from '@/services/orderFiles'
 import { usePullRefresh } from '@/ui/pullRefresh'
 import { useUiTheme } from '@/ui/theme'
 
@@ -87,6 +88,12 @@ function isActive(order) {
 
 function formatMoney(cents) {
   return `¥${((Number(cents) || 0) / 100).toFixed(2)}`
+}
+
+/** 列表一行说清这份单要打什么：单文件给文件名，多文件给「N 个文件 · 共 X 页」。 */
+function fileLine(order) {
+  if (fileCount(order) > 1) return fileSummary(order)
+  return order.file_name || '论文文档'
 }
 
 async function load() {

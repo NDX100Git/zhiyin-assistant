@@ -16,8 +16,10 @@ from sqlalchemy import select
 from app.config import settings
 from app.models.ai_report import AiReport
 from app.models.order import Order
+from app.models.order_file import OrderFile
 from app.models.order_file_change import CHANGE_PENDING, CHANGE_REJECTED, OrderFileChange
 from app.models.order_file_version import OrderFileVersion
+from app.models.uploaded_file import UploadedFile
 from app.services.cleanup import run_cleanup
 from app.services.order_state import (
     STATUS_ABNORMAL,
@@ -396,3 +398,51 @@ def test_历史版本在保留期内不提前删除(db_session, fake_storage):
 
     assert stats.deleted == 0
     assert old_key in fake_storage.objects
+
+def test_多文件订单的非首份文件仍受在途保护(db_session, fake_storage):
+    """订单表只挂第一份文件，第二份及以后只在清单表里，清理不能误删。"""
+    first_key = "files/2026/02/multi-first.pdf"
+    second_key = "files/2026/02/multi-second.pdf"
+    fake_storage.put(first_key, EXPIRED_AT)
+    fake_storage.put(second_key, EXPIRED_AT)
+
+    order = _add_order(db_session, first_key, STATUS_QUEUING)
+    db_session.add(
+        OrderFile(
+            order_id=order.id,
+            file_index=2,
+            file_key=second_key,
+            page_count=5,
+            amount_cents=75,
+        )
+    )
+    db_session.flush()
+
+    stats = run_cleanup(db_session, fake_storage, now=NOW)
+
+    assert stats.deleted == 0
+    assert stats.skipped == 2
+    assert first_key in fake_storage.objects
+    assert second_key in fake_storage.objects
+
+
+def test_清理过期文件时同步删除上传记录(db_session, fake_storage):
+    key = "files/2026/02/with-record.pdf"
+    fake_storage.put(key, EXPIRED_AT)
+    db_session.add(
+        UploadedFile(
+            user_id=1,
+            file_key=key,
+            file_name="有记录.pdf",
+            size=1024,
+            content_type="application/pdf",
+        )
+    )
+    db_session.flush()
+
+    stats = run_cleanup(db_session, fake_storage, now=NOW)
+
+    assert stats.deleted == 1
+    assert db_session.execute(
+        select(UploadedFile).where(UploadedFile.file_key == key)
+    ).scalar_one_or_none() is None

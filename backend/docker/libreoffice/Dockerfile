@@ -1,5 +1,5 @@
 # LibreOffice headless 转换容器（阶段 5-A 使用）
-# 用途：把 .doc/.docx 转成 PDF。容器常驻，后端调用：
+# 用途：把 .doc/.docx、.xls/.xlsx、.ppt/.pptx 转成 PDF。容器常驻，后端调用：
 #   docker exec zhiyin-libreoffice soffice --headless --convert-to pdf --outdir /workspace/runtime <file>
 FROM debian:bookworm-slim
 
@@ -14,6 +14,7 @@ RUN if [ "$APT_MIRROR" != "deb.debian.org" ]; then \
     && apt-get install -y --no-install-recommends \
         libreoffice-writer \
         libreoffice-calc \
+        libreoffice-impress \
         fonts-noto-cjk \
         fontconfig \
         ca-certificates \

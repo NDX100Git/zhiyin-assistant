@@ -7,6 +7,22 @@ export const fetchQueue = (params) => http.get('/api/admin/queue', { params })
 export const fetchSummary = () => http.get('/api/admin/summary')
 export const fetchQuote = (orderId) => http.get(`/api/admin/order/${orderId}/quote`)
 export const downloadUrl = (orderId) => http.get(`/api/admin/order/${orderId}/download`)
+
+/**
+ * 逐文件下载：fileIndex 是清单里的「第几份」（从 1 开始）。
+ * 不传时后端返回全部文件链接，行为与旧接口一致。
+ */
+export const downloadFileUrl = (orderId, fileIndex) =>
+  http.get(`/api/admin/order/${orderId}/download`, {
+    params:
+      fileIndex === undefined || fileIndex === null || fileIndex === ''
+        ? {}
+        : { file_index: fileIndex },
+  })
+
+/** 老师重新下载后确认看到当前文件，清掉队列里的「文件已替换」标记。 */
+export const confirmFileSeen = (orderId) =>
+  http.post(`/api/admin/order/${orderId}/confirm-files-seen`)
 export const startPrint = (orderId) => http.post(`/api/admin/order/${orderId}/start`)
 
 export const completePrint = (orderId, amountCents) =>

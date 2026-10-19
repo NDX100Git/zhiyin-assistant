@@ -10,8 +10,21 @@
         </view>
         <view class="row"><text class="k">订单号</text><text class="v">{{ order.order_no }}</text></view>
         <view class="row"><text class="k">取件码</text><text class="v">{{ order.pickup_code }} · 换文件后不变</text></view>
-        <view class="row"><text class="k">当前文件</text><text class="v">{{ order.file_name || '论文文档' }}</text></view>
-        <view class="row"><text class="k">当前页数</text><text class="v">{{ order.page_count }} 页</text></view>
+        <view v-if="files.length > 1" class="file-block">
+          <text class="k">当前文件</text>
+          <view class="file-body">
+            <view v-for="(item, index) in files" :key="item.file_index" class="file-line">
+              <text class="file-index">{{ index + 1 }}</text>
+              <text class="file-name">{{ item.file_name }}</text>
+              <text class="file-pages">{{ item.page_count }} 页</text>
+            </view>
+          </view>
+        </view>
+        <view v-else class="row">
+          <text class="k">当前文件</text>
+          <text class="v">{{ files.length ? files[0].file_name : (order.file_name || '论文文档') }}</text>
+        </view>
+        <view class="row"><text class="k">当前页数</text><text class="v">{{ pagesTotal }} 页</text></view>
         <view class="row">
           <text class="k">当前金额</text>
           <text class="v money">{{ formatMoney(order.amount_cents) }}{{ order.paid ? '（已支付）' : '（未支付）' }}</text>
@@ -25,9 +38,31 @@
       </view>
 
       <template v-else>
+        <!-- 多文件订单换文件必须先选换哪一份，否则老师不知道该替掉哪份 -->
+        <view v-if="files.length > 1" class="card">
+          <view class="card-head">
+            <text class="card-title">1. 选要换哪一份</text>
+            <text class="tag">{{ hasTarget ? '已选' : '请选择' }}</text>
+          </view>
+          <view
+            v-for="(item, index) in files"
+            :key="item.file_index"
+            class="target-row"
+            :class="{ on: targetIndex === index }"
+            @click="selectTarget(index)"
+          >
+            <text class="target-index">{{ index + 1 }}</text>
+            <view class="target-main">
+              <text class="target-name">{{ item.file_name }}</text>
+              <text class="target-meta">{{ item.page_count }} 页 · 第 {{ item.file_index }} 份</text>
+            </view>
+            <text class="target-check">{{ targetIndex === index ? '已选' : '选它' }}</text>
+          </view>
+        </view>
+
         <view class="card">
           <view class="card-head">
-            <text class="card-title">1. 选择新文件</text>
+            <text class="card-title">{{ files.length > 1 ? '2. 选择新文件' : '1. 选择新文件' }}</text>
             <text v-if="fileKey" class="tag ok">已选择</text>
           </view>
           <view v-if="fileKey" class="file-info">
@@ -45,10 +80,18 @@
 
         <view v-if="fileKey" class="card">
           <view class="card-head">
-            <text class="card-title">2. 确认变更</text>
+            <text class="card-title">{{ files.length > 1 ? '3. 确认变更' : '2. 确认变更' }}</text>
             <text class="tag">{{ immediate ? '立即生效' : '需老师确认' }}</text>
           </view>
+          <view v-if="files.length > 1" class="row">
+            <text class="k">替换哪份</text>
+            <text class="v">{{ targetLabel }}</text>
+          </view>
           <view class="row"><text class="k">新页数</text><text class="v">{{ pageCount }} 页</text></view>
+          <view v-if="files.length > 1" class="row">
+            <text class="k">换后总页数</text>
+            <text class="v">{{ nextTotalPages }} 页（整单按新清单重算金额）</text>
+          </view>
           <view class="row"><text class="k">订单号</text><text class="v">{{ order.order_no }}（不变）</text></view>
 
           <textarea
@@ -64,8 +107,12 @@
             <text class="notice-line">价格差不出在线支付：新价更低时多付部分不退，新价更高时差额在取件时现场补缴。</text>
           </view>
 
-          <button class="primary block" :disabled="busy || preparing || !fileKey" @click="submit">
-            {{ busy ? '提交中…' : submitLabel }}
+          <button
+            class="primary block"
+            :disabled="busy || preparing || !fileKey || !targetReady"
+            @click="submit"
+          >
+            {{ busy ? '提交中…' : (targetReady ? submitLabel : '请先选要换哪一份') }}
           </button>
         </view>
       </template>
@@ -80,6 +127,7 @@ import { request, uploadFile } from '@/services/api'
 import { ensureLogin } from '@/services/auth'
 import { chooseDocument, loadDemoDocument } from '@/services/filePicker'
 import { notify, notifyError } from '@/services/notify'
+import { orderFiles, totalPages } from '@/services/orderFiles'
 import { useUiTheme } from '@/ui/theme'
 
 /** 允许换文件的状态：待支付直接生效，排队中与异常单走老师确认。 */
@@ -103,8 +151,36 @@ const fileName = ref('')
 const fileSize = ref(0)
 const pageCount = ref(1)
 const reason = ref('')
+/** 多文件订单里要换第几份（数组下标）；单文件订单恒为 0。 */
+const targetIndex = ref(0)
 
 const immediate = computed(() => !!order.value && order.value.status === 'pending_pay')
+
+/** 当前文件清单：多文件订单逐份列出，要换哪份必须由学生显式选。 */
+const files = computed(() => orderFiles(order.value))
+const pagesTotal = computed(() => totalPages(order.value))
+const multiFile = computed(() => files.value.length > 1)
+/** 单文件订单不用选，直接就是那唯一一份；多文件必须选过（targetIndex 从 -1 起）。 */
+const hasTarget = computed(() => files.value.length > 0 && targetIndex.value >= 0)
+const targetFile = computed(() => files.value[targetIndex.value] || null)
+const targetReady = computed(() => hasTarget.value && !!targetFile.value)
+const targetLabel = computed(() =>
+  targetFile.value ? `第 ${targetFile.value.file_index} 个文件：${targetFile.value.file_name}` : '未选择',
+)
+
+/** 换完这单的总页数：替掉目标那一份的页数，其余不变，与后端重算口径一致。 */
+const nextTotalPages = computed(() => {
+  const replaced = files.value.reduce((sum, item, index) => {
+    if (index === targetIndex.value) return sum
+    return sum + (Number(item.page_count) || 0)
+  }, 0)
+  return replaced + Math.max(1, Number(pageCount.value) || 1)
+})
+
+function selectTarget(index) {
+  targetIndex.value = index
+  notify(`已选择第 ${index + 1} 个文件`, 'success')
+}
 
 const blockedReason = computed(() => {
   const current = order.value
@@ -135,6 +211,8 @@ async function load() {
   if (!orderId.value) return
   try {
     order.value = await request(`/api/order/${orderId.value}`)
+    // 单文件订单不用选；多文件订单从「未选择」开始，避免默认替掉第一份
+    targetIndex.value = files.value.length > 1 ? -1 : 0
   } catch (error) {
     notifyError(error)
   }
@@ -193,6 +271,10 @@ async function useDemo() {
 
 async function submit() {
   if (busy.value || preparing.value || !fileKey.value || blockedReason.value) return
+  if (!targetReady.value) {
+    notify('请先选要换哪一份文件')
+    return
+  }
   busy.value = true
   try {
     const result = await request(`/api/order/${orderId.value}/replace-file`, {
@@ -201,6 +283,8 @@ async function submit() {
         file_key: fileKey.value,
         file_name: fileName.value,
         page_count: pageCount.value,
+        // 多文件订单必须指明换哪一份；单文件订单传 1 与不传等价
+        file_index: targetFile.value ? targetFile.value.file_index : null,
         reason: reason.value.trim() || null,
       },
     })
@@ -351,6 +435,105 @@ onLoad(async (options) => {
   margin-left: 16rpx;
   color: var(--zi-muted);
   font-size: 24rpx;
+}
+
+/* 多文件清单与「选哪一份」列表：整行可点，触控高度不小于 96rpx */
+.file-block {
+  display: flex;
+  align-items: flex-start;
+  padding: 16rpx 0;
+  border-bottom: 2rpx solid var(--zi-line);
+  font-size: 28rpx;
+}
+.file-block .k {
+  flex: 0 0 150rpx;
+  width: 150rpx;
+}
+.file-body {
+  flex: 1;
+  min-width: 0;
+}
+.file-line {
+  display: flex;
+  align-items: flex-start;
+  padding: 6rpx 0;
+}
+.file-index {
+  flex: 0 0 34rpx;
+  margin-right: 10rpx;
+  color: var(--zi-muted);
+  font-size: 24rpx;
+  font-weight: 800;
+  line-height: 1.6;
+}
+.file-line .file-name {
+  flex: 1;
+  min-width: 0;
+  color: var(--zi-ink);
+  font-size: 26rpx;
+  font-weight: 700;
+  line-height: 1.6;
+  word-break: break-all;
+}
+.file-pages {
+  margin-left: 14rpx;
+  color: var(--zi-muted);
+  font-size: 24rpx;
+  white-space: nowrap;
+}
+.target-row {
+  display: flex;
+  align-items: center;
+  min-height: 96rpx;
+  margin-top: 16rpx;
+  padding: 18rpx;
+  border: 2rpx solid var(--zi-line);
+  border-radius: var(--zi-radius);
+  background: var(--zi-soft-2);
+}
+.target-row.on {
+  border-color: var(--zi-accent);
+  background: var(--zi-soft);
+}
+.target-index {
+  flex: 0 0 40rpx;
+  margin-right: 12rpx;
+  color: var(--zi-muted);
+  font-size: 24rpx;
+  font-weight: 800;
+  line-height: 1.6;
+}
+.target-main {
+  flex: 1;
+  min-width: 0;
+}
+.target-name {
+  display: block;
+  color: var(--zi-ink);
+  font-size: 26rpx;
+  font-weight: 700;
+  line-height: 1.5;
+  word-break: break-all;
+}
+.target-meta {
+  display: block;
+  margin-top: 4rpx;
+  color: var(--zi-muted);
+  font-size: 22rpx;
+}
+.target-check {
+  display: flex;
+  align-items: center;
+  min-height: 56rpx;
+  margin-left: 16rpx;
+  padding: 0 20rpx;
+  border: 2rpx solid var(--zi-accent);
+  border-radius: var(--zi-pill-radius);
+  color: var(--zi-accent);
+  font-size: 22rpx;
+  font-weight: 800;
+  line-height: 1;
+  white-space: nowrap;
 }
 .actions {
   display: flex;

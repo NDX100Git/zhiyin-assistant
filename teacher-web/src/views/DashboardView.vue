@@ -70,37 +70,71 @@
         @selection-change="onSelectionChange"
       >
         <el-table-column type="selection" width="46" />
-        <el-table-column prop="order_no" label="订单号" width="130" />
-        <el-table-column prop="pickup_code" label="取件码" width="160" class-name="pickup-cell">
+        <el-table-column prop="order_no" label="订单号" width="140" />
+        <el-table-column prop="pickup_code" label="取件码" width="130" class-name="pickup-cell">
           <template #default="{ row }">
             <el-tag effect="plain">{{ row.pickup_code }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="file_name" label="文件" min-width="160" show-overflow-tooltip :formatter="fileFormatter" />
-        <el-table-column prop="page_count" label="页数" width="70" />
-        <el-table-column label="打印参数" width="150">
+        <el-table-column label="文件" min-width="250">
           <template #default="{ row }">
-            {{ row.print_side === 2 ? '双面' : '单面' }} ·
-            {{ row.color_mode === 1 ? '彩色' : '黑白' }} ·
-            {{ row.copies }} 份
+            <div class="file-cell">
+              <div v-for="file in fileRows(row).lines" :key="file.key" class="file-line">
+                <span v-if="file.label" class="file-seq">#{{ file.seq }}</span>
+                <span class="file-name" :title="file.file_name">{{ file.file_name }}</span>
+                <span class="file-pages muted">{{ file.page_count ? file.page_count + ' 页' : '' }}</span>
+                <el-button link type="primary" class="file-dl" @click="downloadOne(row, file)">
+                  下载
+                </el-button>
+              </div>
+              <div v-if="fileRows(row).rest > 0" class="file-more muted">
+                等 {{ fileRows(row).total }} 个文件
+              </div>
+              <div v-if="fileRows(row).total === 0" class="muted">{{ fileFormatter(row) }}</div>
+            </div>
           </template>
         </el-table-column>
-        <el-table-column label="状态" width="100">
+        <el-table-column label="打印参数" width="150">
+          <template #default="{ row }">
+            <div>
+              {{ row.print_side === 2 ? '双面' : '单面' }} ·
+              {{ row.color_mode === 1 ? '彩色' : '黑白' }} ·
+              {{ row.copies }} 份
+            </div>
+            <!-- 页数列并进来了：多文件时整单页数是各份之和，老师看这一行就够 -->
+            <div class="muted">共 {{ totalPages(row) || row.page_count }} 页</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="状态" width="110">
           <template #default="{ row }">
             <el-tag :type="statusType(row.status)" effect="light">{{ row.status_label }}</el-tag>
             <div v-if="row.file_change" class="status-flag">
               <el-tag type="warning" effect="dark" size="small">文件待确认</el-tag>
             </div>
+            <div v-if="hasUnseenChange(row)" class="status-flag">
+              <el-tag
+                type="warning"
+                effect="light"
+                size="small"
+                class="flag-tag"
+                title="文件已替换，请重新下载后再打印"
+              >
+                已替换
+              </el-tag>
+              <el-button link type="primary" class="flag-link" @click="markSeen(row)">
+                标记已看到
+              </el-button>
+            </div>
           </template>
         </el-table-column>
-        <el-table-column label="金额" width="100">
+        <el-table-column label="金额" width="90">
           <template #default="{ row }">
             <span class="money">{{ yuan(row.amount_cents) }}</span>
             <div v-if="row.paid" class="muted">已支付</div>
             <div v-else class="muted">待收款</div>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="280" fixed="right">
+        <el-table-column label="操作" width="240" fixed="right">
           <template #default="{ row }">
             <el-button
               v-if="row.file_change"
@@ -147,12 +181,35 @@
               <el-tag v-if="row.file_change" type="warning" effect="dark" size="small">
                 文件待确认
               </el-tag>
+              <el-tag v-if="hasUnseenChange(row)" type="warning" effect="light" size="small">
+                文件已替换，待下载确认
+              </el-tag>
               <el-tag :type="statusType(row.status)" effect="light">{{ row.status_label }}</el-tag>
             </div>
           </div>
-          <div class="oc-line muted">{{ row.order_no }} · {{ fileFormatter(row) }}</div>
+          <div v-if="hasUnseenChange(row)" class="oc-flag-action">
+            <el-button link type="primary" @click="markSeen(row)">标记已看到</el-button>
+          </div>
+          <div class="oc-line muted">{{ row.order_no }} · {{ fileSummary(row) }}</div>
+          <!-- 多文件订单一单一个取件码，手机上必须逐条列清文件名与页数 -->
+          <div v-if="fileRows(row).total > 0" class="oc-files">
+            <div
+              v-for="(file, index) in orderFiles(row)"
+              :key="file.id ?? index"
+              class="oc-file"
+            >
+              <div class="oc-file-main">
+                <span v-if="isMultiFile(row)" class="oc-file-seq">第 {{ file.seq }} 个文件</span>
+                <span class="oc-file-name">{{ file.file_name }}</span>
+                <span class="muted">{{ file.page_count ? file.page_count + ' 页' : '页数未知' }}</span>
+              </div>
+              <el-button size="large" class="oc-file-dl" @click="downloadOne(row, file)">
+                下载
+              </el-button>
+            </div>
+          </div>
           <div class="oc-line">
-            {{ row.page_count }} 页 · {{ row.print_side === 2 ? '双面' : '单面' }} ·
+            {{ totalPages(row) || row.page_count }} 页 · {{ row.print_side === 2 ? '双面' : '单面' }} ·
             {{ row.color_mode === 1 ? '彩色' : '黑白' }} · {{ row.copies }} 份
           </div>
           <div class="oc-line">
@@ -209,23 +266,50 @@
       :width="isMobile ? '92%' : '520px'"
     >
       <div v-if="fileChangeDialog.order && fileChangeDialog.change">
-        <el-descriptions :column="1" size="small" label-width="88" border>
+        <!-- 多文件订单先点明这次换的是哪一份，再给整单文件清单概览 -->
+        <div v-if="isMultiFile(fileChangeDialog.order)" class="change-target">
+          <div class="change-target-title">
+            本次换的是{{ changeTarget(fileChangeDialog.order).label }}：{{ changeTarget(fileChangeDialog.order).file_name }}
+          </div>
+          <div class="change-target-list">
+            <div
+              v-for="(file, index) in changeFileList(fileChangeDialog.order)"
+              :key="file.id ?? index"
+              class="change-target-file"
+              :class="{ current: file.current }"
+            >
+              第 {{ file.seq }} 个文件 · {{ file.file_name }} ·
+              {{ file.page_count ? file.page_count + ' 页' : '页数未知' }}
+              <span v-if="file.current" class="change-target-mark">本次更换</span>
+            </div>
+          </div>
+        </div>
+        <el-descriptions :column="1" size="small" label-width="104" border>
           <el-descriptions-item label="订单号">
             {{ fileChangeDialog.order.order_no }}
           </el-descriptions-item>
-          <el-descriptions-item label="原文件">
-            {{ fileChangeDialog.change.old_file_name || fileFormatter(fileChangeDialog.order) }} ·
-            {{ fileChangeDialog.change.old_page_count ?? fileChangeDialog.order.page_count }} 页 ·
-            {{ yuan(fileChangeDialog.change.old_amount_cents ?? fileChangeDialog.order.amount_cents) }}
+          <!-- 这一份自己的新旧对照：老师要看的是被换掉的那份，不是整单一句话 -->
+          <el-descriptions-item label="原文件（这份）">
+            {{ fileChangeDialog.change.old_file_name || changeTarget(fileChangeDialog.order).file_name }} ·
+            {{ fileOldPages }} 页 ·
+            {{ yuan(fileOldAmount) }}
           </el-descriptions-item>
-          <el-descriptions-item label="新文件">
-            {{ fileChangeDialog.change.new_file_name || '未命名' }}
+          <el-descriptions-item label="新文件（这份）">
+            {{ fileChangeDialog.change.new_file_name || '未命名' }} ·
+            {{ fileNewPages }} 页 ·
+            {{ yuan(fileNewAmount) }}
           </el-descriptions-item>
-          <el-descriptions-item label="新页数">
+          <el-descriptions-item label="整单页数">
+            {{ fileChangeDialog.change.old_page_count ?? fileChangeDialog.order.page_count }} 页
+            <span class="muted">→</span>
             {{ fileChangeDialog.change.new_page_count }} 页
           </el-descriptions-item>
           <el-descriptions-item label="系统重算价">
             <span class="money">{{ yuan(fileChangeDialog.change.new_amount_cents) }}</span>
+            <span class="muted">
+              （整单原价
+              {{ yuan(fileChangeDialog.change.old_amount_cents ?? fileChangeDialog.order.amount_cents) }}）
+            </span>
           </el-descriptions-item>
           <el-descriptions-item v-if="fileChangeDialog.change.reason" label="学生原因">
             {{ fileChangeDialog.change.reason }}
@@ -336,7 +420,7 @@
 </template>
 
 <script setup>
-import { onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { useIsMobile } from '../composables/useIsMobile'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
@@ -344,7 +428,8 @@ import {
   cancelAbnormal as cancelAbnormalApi,
   completePrint,
   confirmFileChange,
-  downloadUrl,
+  confirmFileSeen,
+  downloadFileUrl,
   fetchQueue,
   fetchQuote,
   fetchSummary,
@@ -354,6 +439,14 @@ import {
   verifyByCode,
   verifyOrder,
 } from '../api/admin'
+import {
+  changeTarget,
+  fileSummary,
+  hasUnseenChange,
+  isMultiFile,
+  orderFiles,
+  totalPages,
+} from '../api/orderFiles'
 
 const statusOptions = [
   { label: '待支付', value: 'pending_pay' },
@@ -374,9 +467,54 @@ const stats = reactive({
 const isMobile = useIsMobile()
 const orders = ref([])
 
-/** 文件名可能为空（接口未带），表格里给个占位，避免整列看着像坏掉。 */
+/** 桌面表格文件列最多显示几行，其余用「等 N 个文件」收口。 */
+const MAX_FILE_LINES = 3
+
+/** 桌面文件列的行数据：文件名 + 多文件时的「第 N 个文件」序号。 */
+function fileRows(row) {
+  const files = orderFiles(row)
+  const multi = files.length > 1
+  return {
+    lines: files.slice(0, MAX_FILE_LINES).map((file, index) => ({
+      ...file,
+      key: file.id ?? `${file.seq}-${index}`,
+      label: multi ? `第 ${file.seq} 个文件` : '',
+    })),
+    rest: Math.max(files.length - MAX_FILE_LINES, 0),
+    total: files.length,
+  }
+}
+
+/** 换文件弹窗里的文件清单，标出本次更换的那一份。 */
+function changeFileList(row) {
+  const target = changeTarget(row)
+  const isSame = (file) =>
+    target.id !== null && file.id !== null
+      ? String(file.id) === String(target.id)
+      : file.seq === target.seq
+  return orderFiles(row).map((file) => ({
+    ...file,
+    current: isSame(file),
+  }))
+}
+
+/** 单文件文件名（走归一化模块），无清单老订单显示与原来一致。 */
 function fileFormatter(row) {
-  return row.file_name || '论文文档'
+  const files = orderFiles(row)
+  if (files.length === 0) return '论文文档'
+  if (files.length === 1) return files[0].file_name
+  return `${files[0].file_name} 等 ${files.length} 个文件`
+}
+
+/** 换文件针对的那份文件；对不上时退回第一份，用于「先下载」。 */
+function targetFile(row) {
+  const target = changeTarget(row)
+  const files = orderFiles(row)
+  if (target.id !== null && target.id !== undefined) {
+    const byId = files.find((file) => String(file.id) === String(target.id))
+    if (byId) return byId
+  }
+  return files.find((file) => file.seq === target.seq) || files[0] || null
 }
 
 const loading = ref(false)
@@ -400,6 +538,29 @@ const fileChangeDialog = reactive({
   change: null,
   yuan: 0,
   loading: false,
+})
+
+/**
+ * 弹窗里「这一份文件」的新旧页数与行金额。
+ *
+ * 后端给了 `*_file_*` 就用它（多文件时这才是被替换那一份自己的数），
+ * 老数据没有这些字段时退回整单值，口径与单文件时代一致。
+ */
+const fileOldPages = computed(() => {
+  const change = fileChangeDialog.change || {}
+  return change.old_file_page_count ?? changeTarget(fileChangeDialog.order || {}).page_count ?? 0
+})
+const fileNewPages = computed(() => {
+  const change = fileChangeDialog.change || {}
+  return change.new_file_page_count ?? change.new_page_count ?? 0
+})
+const fileOldAmount = computed(() => {
+  const change = fileChangeDialog.change || {}
+  return change.old_file_amount_cents ?? change.old_amount_cents ?? 0
+})
+const fileNewAmount = computed(() => {
+  const change = fileChangeDialog.change || {}
+  return change.new_file_amount_cents ?? change.new_amount_cents ?? 0
 })
 
 let timer = null
@@ -475,18 +636,95 @@ function stopPolling() {
   }
 }
 
+function handleVisibilityChange() {
+  if (!document.hidden) refreshAll()
+}
+
 onMounted(() => {
   refreshAll()
   startPolling()
+  document.addEventListener('visibilitychange', handleVisibilityChange)
 })
-onUnmounted(stopPolling)
+onUnmounted(() => {
+  stopPolling()
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
+})
 
+/** 下载单份文件；不传 file 就是第 1 份（老订单行为不变）。 */
+async function downloadOne(row, file) {
+  // 后端的「第几份」就是清单里的 file_index，从 1 开始
+  const fileIndex = file && file.id !== undefined && file.id !== null ? file.id : undefined
+  try {
+    const data = await downloadFileUrl(row.id, fileIndex)
+    if (data && data.signed_url) {
+      window.open(data.signed_url, '_blank')
+    } else {
+      ElMessage.warning('未取到下载地址，请稍后重试')
+    }
+  } catch (error) {
+    // 拦截器已提示，下载失败不往下走确认流程
+    return
+  }
+  if (!hasUnseenChange(row)) return
+  // 下载成功顺手确认看到新文件；接口失败只提示，不阻断已完成的下载
+  try {
+    await confirmFileSeen(row.id)
+    markRowSeen(row)
+    ElMessage.success('已确认看到新文件')
+    await refreshAll()
+  } catch (error) {
+    /* 拦截器已提示 */
+  }
+}
+
+/**
+ * 把这一行就地标成「已确认看到」，不等下一次拉队列。
+ *
+ * 老师刚点完下载就该看到标记消失；只靠刷新会有一拍延迟，队列没刷到时
+ * 标记还留在屏幕上，容易让人以为没确认成功。
+ */
+function markRowSeen(row) {
+  row.files_unconfirmed = false
+  row.files_seen_at = new Date().toISOString()
+}
+
+/** 操作列的整单下载：等同于下载第 1 份。 */
 async function download(row) {
-  const data = await downloadUrl(row.id)
-  window.open(data.signed_url, '_blank')
+  await downloadOne(row, orderFiles(row)[0] || null)
+}
+
+/** 标记已看到新文件：调确认接口后刷新队列。 */
+async function markSeen(row) {
+  try {
+    await confirmFileSeen(row.id)
+    markRowSeen(row)
+    ElMessage.success('已确认看到新文件')
+    await refreshAll()
+  } catch (error) {
+    /* 拦截器已提示 */
+  }
 }
 
 async function start(row) {
+  if (hasUnseenChange(row)) {
+    // 换过文件：先提醒老师本地可能还是旧版本
+    try {
+      await ElMessageBox.confirm(
+        '这单换过文件，你本地可能还是旧版本，建议先重新下载再打印。',
+        '文件已替换',
+        { confirmButtonText: '仍然开始', cancelButtonText: '先下载', type: 'warning' },
+      )
+    } catch (action) {
+      if (action === 'cancel') {
+        await downloadOne(row, targetFile(row))
+      }
+      return
+    }
+    await startPrint(row.id)
+    ElMessage.success('已开始打印')
+    await refreshAll()
+    return
+  }
   await ElMessageBox.confirm(`确认开始打印订单 ${row.order_no}？`, '开始打印', {
     confirmButtonText: '开始',
     cancelButtonText: '取消',
@@ -647,9 +885,6 @@ async function submitBatchComplete() {
   refreshAll()
 }
 
-document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) refreshAll()
-})
 </script>
 
 <style scoped>
@@ -751,6 +986,7 @@ document.addEventListener('visibilitychange', () => {
 }
 .order-card {
   padding: 14px;
+  min-width: 0;
   background: var(--zi-paper);
   border: var(--zi-card-border);
   border-left: 6px solid var(--zi-accent);
@@ -766,6 +1002,135 @@ document.addEventListener('visibilitychange', () => {
 }
 .status-flag {
   margin-top: 4px;
+}
+/* 未确认标记：长文案允许折行，不要把状态列撑破 */
+.flag-tag {
+  height: auto;
+  padding: 2px 6px;
+  line-height: 1.4;
+  white-space: normal;
+}
+.flag-link {
+  margin-left: 4px;
+  padding: 0;
+  height: auto;
+}
+/* 桌面文件列：一行一份文件，超出省略，行高不鼓 */
+.file-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.file-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  line-height: 1.5;
+}
+.file-seq {
+  flex: none;
+  color: var(--zi-muted);
+  font-size: 12px;
+}
+.file-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-pages {
+  flex: none;
+  font-size: 12px;
+}
+.file-dl {
+  flex: none;
+  height: auto;
+  padding: 0 2px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.file-more {
+  font-size: 12px;
+}
+/* 手机上逐份文件：名字可折行，下载按钮保持 44px 不掉手 */
+.oc-files {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+.oc-file {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 0;
+  border-top: 1px dashed var(--zi-line);
+  min-width: 0;
+}
+.oc-file-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 140px;
+  min-width: 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--zi-ink);
+  word-break: break-all;
+}
+.oc-file-seq {
+  color: var(--zi-muted);
+  font-size: 12px;
+}
+.oc-file-name {
+  min-width: 0;
+  word-break: break-all;
+}
+.oc-file-dl {
+  flex: 0 0 auto;
+  min-height: 44px;
+  margin-left: 0;
+  padding: 0 18px;
+}
+.oc-flag-action :deep(.el-button) {
+  min-height: 44px;
+  padding: 0;
+}
+/* 换文件弹窗顶部的定位区 */
+.change-target {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-left: 4px solid var(--zi-warn);
+  background: var(--zi-warn-bg);
+  color: var(--zi-warn);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.change-target-title {
+  font-weight: 900;
+  letter-spacing: 0.02em;
+  word-break: break-all;
+}
+.change-target-list {
+  margin-top: 6px;
+  color: var(--zi-ink);
+}
+.change-target-file {
+  word-break: break-all;
+}
+.change-target-file.current {
+  font-weight: 900;
+}
+.change-target-mark {
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--zi-warn);
+  color: #fff;
+  font-size: 12px;
 }
 .oc-tags {
   display: flex;
@@ -804,6 +1169,7 @@ document.addEventListener('visibilitychange', () => {
   font-size: 14px;
   line-height: 1.7;
   color: var(--zi-ink);
+  word-break: break-all;
 }
 .oc-line .muted {
   margin-left: 6px;

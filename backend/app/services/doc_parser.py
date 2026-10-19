@@ -15,8 +15,10 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import zipfile
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
 from statistics import median
 from xml.etree import ElementTree
@@ -204,15 +206,69 @@ def _soffice_command(
     ]
 
 
-def convert_document(input_path: Path, out_dir: Path, target: str = "pdf") -> Path:
-    """用 LibreOffice headless 转换文档。路径与容器都读配置，不硬编码。"""
-    # 每次转换用独立的 UserInstallation，避免多请求互相转发到一个实例
-    profile_dir = out_dir / f"lo-profile-{target}"
-    stdout_log = out_dir / f"soffice-{target}.out.log"
-    stderr_log = out_dir / f"soffice-{target}.err.log"
-    cmd = _soffice_command(input_path, out_dir, profile_dir, target)
-    logger.info("调用 LibreOffice 转换：%s -> %s", input_path.name, target)
+# 转换进程能否复用（2026-10-19 用 scripts/bench_soffice_reuse.py 实测，结果见
+# scripts/perf_results/soffice_reuse-*.md）：
+# - 让两次转换共用一个 UserInstallation，后启动的那次会把任务转交给已在运行的实例。
+#   并发两单时只有一单产出 PDF，另一单静默丢失；转换完成后常驻实例还会退出，
+#   下一单又回到冷启动。
+# - 真正复用要起 UNO 常驻服务并改等待语义（轮询输出文件），当前转换容器不带
+#   Python UNO，故障面比每次新起进程大。
+# 结论：暂不复用。用并发闸门把进程数卡在 SOFFICE_MAX_CONCURRENCY（默认 2）；
+# 单次转换超时 SOFFICE_TIMEOUT_SECONDS（默认 180 秒），排队等空位
+# SOFFICE_QUEUE_WAIT_SECONDS（默认 20 秒），等不到返回 50046。
+class _ConversionGate:
+    """LibreOffice 转换的并发闸门。
 
+    每次转换都是一个独立的 soffice 进程。多人同时上传时，不限制并发会让进程数与
+    内存一起涨，最终连健康检查都抢不到 CPU；所以同一时刻只放行配置里的数量，
+    超出的在上限内排队，排不到就明确报错，而不是无限制地起进程后静默变慢。
+
+    上限从配置读取，测试里会改，所以信号量懒加载并在上限变化时重建。
+    调用方都在线程池里（路由是同步函数），因此用 threading 而不是 asyncio。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._slots: threading.BoundedSemaphore | None = None
+        self._limit = 0
+
+    def _current(self) -> tuple[threading.BoundedSemaphore, int]:
+        limit = max(1, int(settings.soffice_max_concurrency))
+        with self._lock:
+            if self._slots is None or self._limit != limit:
+                self._slots = threading.BoundedSemaphore(limit)
+                self._limit = limit
+            return self._slots, limit
+
+    @contextmanager
+    def slot(self):
+        """占一个转换槽位；排队超时抛 50046。"""
+        semaphore, limit = self._current()
+        wait = max(0.0, float(settings.soffice_queue_wait_seconds))
+        if not semaphore.acquire(timeout=wait):
+            raise BusinessError(
+                f"文档转换排队已满（同时最多 {limit} 个），等了 {wait:g} 秒仍没有空位，"
+                "请稍后重试或改上传 PDF",
+                code=50046,
+            )
+        try:
+            yield
+        finally:
+            semaphore.release()
+
+
+_conversion_gate = _ConversionGate()
+
+
+def conversion_slot():
+    """转换槽位上下文管理器；测试与转换函数共用这一个入口。"""
+    return _conversion_gate.slot()
+
+
+def _run_soffice(
+    cmd: list[str], out_dir: Path, stdout_log: Path, stderr_log: Path
+) -> None:
+    """起一个 soffice 子进程并等它退出。调用方必须已持有转换槽位。"""
     # 注意：不能用 subprocess.PIPE 捕获输出。LibreOffice 会派生后台子进程并继承管道句柄，
     # 导致父进程已退出但管道不关闭、读取永久阻塞。改为重定向到日志文件。
     child_env = {**os.environ}
@@ -226,6 +282,19 @@ def convert_document(input_path: Path, out_dir: Path, target: str = "pdf") -> Pa
         except subprocess.TimeoutExpired as exc:
             proc.kill()
             raise BusinessError("文档转换超时，请稍后重试", code=50041) from exc
+
+
+def convert_document(input_path: Path, out_dir: Path, target: str = "pdf") -> Path:
+    """用 LibreOffice headless 转换文档。路径与容器都读配置，不硬编码。"""
+    # 每次转换用独立的 UserInstallation，避免多请求互相转发到一个实例
+    profile_dir = out_dir / f"lo-profile-{target}"
+    stdout_log = out_dir / f"soffice-{target}.out.log"
+    stderr_log = out_dir / f"soffice-{target}.err.log"
+    cmd = _soffice_command(input_path, out_dir, profile_dir, target)
+    logger.info("调用 LibreOffice 转换：%s -> %s", input_path.name, target)
+
+    with conversion_slot():
+        _run_soffice(cmd, out_dir, stdout_log, stderr_log)
 
     output = out_dir / f"{input_path.stem}.{target}"
     if not output.exists():

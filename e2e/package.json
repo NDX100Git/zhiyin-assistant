@@ -1,0 +1,14 @@
+{
+  "name": "zhiyin-browser-e2e",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "智印助手浏览器端到端回归：学生下单与换文件、老师确认与核销",
+  "scripts": {
+    "test": "node run.mjs",
+    "test:start": "node run.mjs --start"
+  },
+  "dependencies": {
+    "puppeteer": "^25.14.0"
+  }
+}

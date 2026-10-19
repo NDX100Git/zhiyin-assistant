@@ -59,10 +59,29 @@ def queue(
 @router.get("/order/{order_id}/download", summary="获取限时下载链接", response_model=None)
 def download(
     order_id: int,
+    file_index: int | None = Query(
+        default=None, ge=1, description="只取第几份文件；不传则返回全部文件链接"
+    ),
     _: str = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict:
-    return ok(admin_service.download_url(admin_service.get_order(db, order_id)))
+    order = admin_service.get_order(db, order_id)
+    return ok(admin_service.download_url(db, order, file_index))
+
+
+@router.post(
+    "/order/{order_id}/confirm-files-seen",
+    summary="老师确认已看到替换后的文件",
+    response_model=None,
+)
+def confirm_files_seen(
+    order_id: int,
+    operator: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict:
+    """老师重新下载后调用，清掉队列里的「文件已替换」标记。"""
+    order = admin_service.get_order(db, order_id)
+    return ok(admin_service.confirm_files_seen(db, order, operator))
 
 
 @router.post("/order/{order_id}/start", summary="开始打印", response_model=None)
