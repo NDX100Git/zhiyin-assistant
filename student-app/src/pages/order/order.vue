@@ -1,5 +1,5 @@
 <template>
-  <view class="page" :class="uiThemeClass">
+  <view class="page" :class="[uiThemeClass, uiSchemeClass]">
     <view class="steps">
       <view v-for="(item, index) in steps" :key="item.key" class="step" :class="{ active: stepIndex >= index }">
         <text class="step-index">{{ index + 1 }}</text>
@@ -287,7 +287,7 @@ import { PAPER_SIZES } from '@/services/orderFiles'
 import { notify, notifyError } from '@/services/notify'
 import { useUiTheme } from '@/ui/theme'
 
-const { uiThemeClass } = useUiTheme()
+const { uiThemeClass, uiSchemeClass } = useUiTheme()
 
 const steps = [
   { key: 'upload', label: '上传' },
@@ -1544,8 +1544,8 @@ onUnmounted(() => {
 }
 .zi-theme-classic .file-remove {
   border: none;
-  background: var(--zi-danger);
-  color: #fff;
+  background: var(--zi-danger-solid);
+  color: var(--zi-on-solid);
   font-weight: 400;
 }
 .zi-theme-classic .primary {

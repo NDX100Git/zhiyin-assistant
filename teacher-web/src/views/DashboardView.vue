@@ -1282,8 +1282,8 @@ async function submitBatchComplete() {
   margin-left: 6px;
   padding: 0 6px;
   border-radius: 999px;
-  background: var(--zi-warn);
-  color: #fff;
+  background: var(--zi-warn-solid);
+  color: var(--zi-on-solid);
   font-size: 12px;
 }
 .oc-tags {
@@ -1378,8 +1378,8 @@ async function submitBatchComplete() {
   padding: 18px;
   border-left: none;
   border-radius: 12px;
-  background: #ffffff;
-  box-shadow: 0 4px 16px rgba(31, 45, 61, 0.06);
+  background: var(--zi-paper);
+  box-shadow: var(--zi-card-shadow-soft);
 }
 .zi-theme-classic .stat-label {
   font-weight: 400;
