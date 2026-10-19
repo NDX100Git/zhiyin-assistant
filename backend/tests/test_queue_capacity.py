@@ -14,13 +14,18 @@ import time
 from datetime import date, datetime
 
 import pytest
-from sqlalchemy import event, insert, update
+from sqlalchemy import event, insert, select, update
 
 from app.config import settings
 from app.models.order import Order
+from app.models.uploaded_file import UploadedFile
 from app.services import queue_service, queue_snapshot
+from app.utils.security import decode_token
 
 _key_seq = itertools.count(1)
+
+# 下单要求每份文件都有本人的上传记录；用例里造出来的 file_key 在下面统一登记
+_SESSION = None
 
 
 def _file_key(name: str = "file") -> str:
@@ -87,6 +92,35 @@ def queue_reads(monkeypatch) -> list[int]:
     return calls
 
 
+@pytest.fixture(autouse=True)
+def capture_session(db_session):
+    """把测试会话存到模块里，供 register_upload 使用。"""
+    global _SESSION
+    _SESSION = db_session
+    yield
+    _SESSION = None
+
+
+def register_upload(file_key: str, file_name: str | None, headers: dict[str, str]) -> None:
+    """把用例造出来的文件标识登记成该用户的上传记录。"""
+    user_id = int(decode_token(headers["Authorization"].split(" ", 1)[1])["sub"])
+    existing = _SESSION.execute(
+        select(UploadedFile).where(UploadedFile.file_key == file_key)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return
+    _SESSION.add(
+        UploadedFile(
+            user_id=user_id,
+            file_key=file_key,
+            file_name=file_name,
+            size=0,
+            content_type="application/pdf",
+        )
+    )
+    _SESSION.commit()
+
+
 def student_headers(client, device_id: str) -> dict[str, str]:
     body = client.post("/api/auth/login", json={"device_id": device_id}).json()
     assert body["code"] == 0, body
@@ -103,7 +137,9 @@ def admin_headers(client) -> dict[str, str]:
 
 
 def create_order(client, headers, page_count: int = 10) -> dict:
-    body = client.post("/api/order/create", json=_order_payload(page_count), headers=headers).json()
+    payload = _order_payload(page_count)
+    register_upload(payload["file_key"], payload["file_name"], headers)
+    body = client.post("/api/order/create", json=payload, headers=headers).json()
     assert body["code"] == 0, body
     return body["data"]
 
@@ -166,8 +202,10 @@ def _action_confirm_file_change(client, student, admin):
     """换文件确认：确认后重排到队尾。"""
     head = queued_order(client, student)
     tail = queued_order(client, student)
+    payload = _replace_payload(30)
+    register_upload(payload["file_key"], payload["file_name"], student)
     body = client.post(
-        f"/api/order/{head['id']}/replace-file", json=_replace_payload(30), headers=student
+        f"/api/order/{head['id']}/replace-file", json=payload, headers=student
     ).json()
     assert body["code"] == 0, body
     admin_post(client, admin, f"/order/{head['id']}/confirm-file-change", {"approve": True})

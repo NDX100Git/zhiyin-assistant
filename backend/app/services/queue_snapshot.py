@@ -27,17 +27,17 @@ class QueueSnapshot:
 
     # 订单 id -> 前面还有多少单（不含自己）
     positions: Mapping[int, int]
-    # 前缀和：第 i 单之前（不含第 i 单）的累计页数，长度 = 队列长度 + 1
+    # 前缀和：第 i 单之前（不含第 i 单）的累计打印页数，长度 = 队列长度 + 1
     prefix_pages: tuple[int, ...]
     total: int
-    # 近 N 单的「秒/页」；没有历史数据时为 None，按配置的默认单均耗时估算
+    # 近 N 单的「秒/打印页」；没有历史数据时为 None，按配置的默认单均耗时估算
     seconds_per_page: float | None
     # 读库开始那一刻的 monotonic 时间，有效期从这里算起
     built_at: float
 
     @property
     def total_pages(self) -> int:
-        """整队页数合计，新下单的预计等待用它。"""
+        """整队打印页数合计，新下单的预计等待用它。"""
         return self.prefix_pages[-1]
 
     def position_of(self, order_id: int) -> int | None:

@@ -9,7 +9,7 @@ from __future__ import annotations
 import itertools
 import threading
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pytest
 from sqlalchemy import select, update
@@ -153,6 +153,19 @@ def queued_order(client, headers: dict[str, str], page_count: int = 10) -> dict:
     order = create_order(client, headers, page_count)
     pay_order(client, headers, order["id"])
     return order
+
+
+def create_multi_order(client, headers: dict[str, str], files: list[dict]) -> dict:
+    """多文件下单（每份可带自己的 copies 等参数），用于造出打印页数 != 文档页数的单。"""
+    for item in files:
+        register_upload(item["file_key"], item.get("file_name"), headers)
+    body = client.post(
+        "/api/order/create",
+        json={"files": files, "print_side": 2, "color_mode": 0, "copies": 1, "paper_size": "A4"},
+        headers=headers,
+    ).json()
+    assert body["code"] == 0, body
+    return body["data"]
 
 
 def replace_file(client, headers: dict[str, str], order_id: int, page_count: int) -> dict:
@@ -398,3 +411,158 @@ def test_构建期间发生失效的快照不会被写回():
 
     assert queue_snapshot.store(snapshot, built_generation) is False
     assert queue_snapshot.current() is None
+
+
+# ------------------------------------------------ 排队等待按打印页数算（硬口径）
+
+
+def test_前序页数与预计等待按打印页数算(client, db_session, monkeypatch):
+    """两份文件 2 页×2 份、3 页×1 份：文档 5 页、打印 7 页；后一单的前序页数按 7 算。"""
+    headers = student_headers(client, "queue-print-pages-basis")
+    head = create_multi_order(
+        client,
+        headers,
+        [
+            {"file_key": _file_key("正文"), "file_name": "正文.pdf", "page_count": 2, "copies": 2},
+            {"file_key": _file_key("附录"), "file_name": "附录.pdf", "page_count": 3, "copies": 1},
+        ],
+    )
+    assert (head["page_count"], head["print_page_count"]) == (5, 7)
+    pay_order(client, headers, head["id"])
+    tail = queued_order(client, headers, page_count=1)
+    assert (tail["page_count"], tail["print_page_count"]) == (1, 1)
+
+    # 固定「一秒/打印页」，等待分钟数就等于打印页数，口径写错会立刻露出来
+    monkeypatch.setattr(queue_service, "per_page_seconds", lambda db: 60.0)
+    queue_snapshot.invalidate()
+
+    snapshot = queue_service.queue_state(db_session)
+    assert snapshot.total == 2
+    # 前缀和是 0 -> 7 -> 8；按文档页数会是 0 -> 5 -> 6
+    assert snapshot.prefix_pages == (0, 7, 8)
+    assert snapshot.total_pages == 8
+
+    items = list_items(client, headers)
+    assert items[head["id"]]["queue_position"] == 0
+    assert items[tail["id"]]["queue_position"] == 1
+    assert items[head["id"]]["estimated_minutes"] == 7
+    assert items[tail["id"]]["estimated_minutes"] == 8
+
+    # 单条订单路径（order_wait_info 的 SUM）同一口径
+    wait = queue_service.order_wait_info(db_session, db_session.get(Order, tail["id"]))
+    assert (wait["queue_position"], wait["estimated_minutes"]) == (1, 8)
+
+    # 对外字段口径不变：文档页数仍是 5
+    assert items[head["id"]]["page_count"] == 5
+
+
+def test_打印页数为0的老订单回落按文档页数算(client, db_session, monkeypatch):
+    """老库回填前 print_page_count 是 0：排队页数回落 page_count，不报错。"""
+    headers = student_headers(client, "queue-print-pages-legacy")
+    order = queued_order(client, headers, page_count=10)
+
+    db_session.execute(update(Order).where(Order.id == order["id"]).values(print_page_count=0))
+    db_session.commit()
+    queue_snapshot.invalidate()
+
+    monkeypatch.setattr(queue_service, "per_page_seconds", lambda db: 60.0)
+    snapshot = queue_service.queue_state(db_session)
+    assert snapshot.prefix_pages == (0, 10)
+
+    items = list_items(client, headers)
+    assert items[order["id"]]["queue_position"] == 0
+    assert items[order["id"]]["estimated_minutes"] == 10
+    assert items[order["id"]]["page_count"] == 10
+    assert items[order["id"]]["print_page_count"] == 0
+
+    wait = queue_service.order_wait_info(db_session, db_session.get(Order, order["id"]))
+    assert (wait["queue_position"], wait["estimated_minutes"]) == (0, 10)
+
+
+def test_单均耗时按打印页数算(client, db_session):
+    """2 文档页 × 2 份 = 4 打印页、240 秒，则「秒/打印页」是 60，不是 120。"""
+    student_headers(client, "queue-print-pages-ratio")
+    now = datetime.now()
+    db_session.add(
+        Order(
+            order_no="261019-901",
+            pickup_code="261019-9-Z1",
+            user_id=1,
+            status="completed",
+            page_count=2,
+            print_page_count=4,
+            copies=2,
+            paid=1,
+            amount_cents=100,
+            created_at=now - timedelta(seconds=240),
+            printed_at=now,
+        )
+    )
+    db_session.commit()
+
+    assert queue_service.per_page_seconds(db_session) == pytest.approx(60.0)
+    assert queue_service._minutes_for(60.0, 4, 1) == 4
+
+
+def test_并发16下位置与预计等待单调且不出现负数(client, session_factory, monkeypatch):
+    """16 个线程各拿独立 session 读队：位置与预计等待都要单调、不为负。"""
+    headers = student_headers(client, "queue-print-pages-concurrent")
+    orders = []
+    for index in range(8):
+        order = create_multi_order(
+            client,
+            headers,
+            [
+                {
+                    "file_key": _file_key(f"并发{index}"),
+                    "file_name": f"文档{index}.pdf",
+                    "page_count": 1 + index % 3,
+                    "copies": 1 + index % 2,
+                }
+            ],
+        )
+        pay_order(client, headers, order["id"])
+        orders.append(order)
+
+    print_pages = [int(order["print_page_count"]) for order in orders]
+    assert print_pages != [int(order["page_count"]) for order in orders], "口径不同的数据才算验到"
+
+    monkeypatch.setattr(queue_service, "per_page_seconds", lambda db: 60.0)
+    monkeypatch.setattr(queue_snapshot, "ttl_seconds", lambda: 60.0)
+    queue_snapshot.invalidate()
+
+    errors: list[BaseException] = []
+    seen: list[list[tuple[int, int]]] = []
+    barrier = threading.Barrier(16)
+
+    def worker() -> None:
+        session = session_factory()
+        try:
+            barrier.wait(timeout=10)
+            active = queue_service.list_active_orders(session)
+            waits = queue_service.batch_wait_info(session, active)
+            seen.append(
+                [(waits[item.id]["queue_position"], waits[item.id]["estimated_minutes"])
+                 for item in active]
+            )
+        except BaseException as exc:  # 线程里的异常不冒泡到主线程，收集起来
+            errors.append(exc)
+        finally:
+            session.close()
+
+    threads = [threading.Thread(target=worker) for _ in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not errors, errors
+    assert len(seen) == 16
+    for pairs in seen:
+        positions = [position for position, _ in pairs]
+        minutes = [value for _, value in pairs]
+        assert positions == list(range(len(orders))), "排队位置必须连续单调"
+        assert all(value >= 0 for value in minutes), "预计等待不允许出现负数"
+        assert minutes == sorted(minutes), "预计等待必须随队列单调不减"
+        # 一秒/打印页 -> 第 i 单的等待分钟数 = 到它为止的打印页数累计
+        assert minutes == list(itertools.accumulate(print_pages))

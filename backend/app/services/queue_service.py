@@ -5,6 +5,10 @@
 订单自然排到队尾，同时不改订单号与创建时间。
 预计等待 = 近 20 单「按页数加权」的平均耗时 × 前序订单页数；
 没有历史数据时按 config/order_rules.json 里的 default_seconds_per_order 估算。
+
+页数口径：排队等待按「实际打印张数」算，即 `orders.print_page_count`
+（Σ 每份文件页数 × 该份份数）；老库回填前该列为 0/NULL 时回落 `orders.page_count`。
+`orders.page_count` 仍是文档页数，对外字段不变。
 """
 
 from __future__ import annotations
@@ -64,6 +68,16 @@ def order_queue_time(order: Order) -> datetime:
     return order.requeue_at or order.created_at
 
 
+def print_pages_expr():
+    """SQL 侧的排队页数：整单打印页数，为 0/NULL 时回落文档页数。"""
+    return func.coalesce(func.nullif(Order.print_page_count, 0), Order.page_count, 0)
+
+
+def order_print_pages(order: Order) -> int:
+    """Python 侧的同一口径，供单条订单使用。"""
+    return int(order.print_page_count or 0) or int(order.page_count or 0)
+
+
 def _ahead_condition(order: Order):
     """排在 order 前面的条件，与 queue_order_by 的排序键一一对应。"""
     own_time = order_queue_time(order)
@@ -93,16 +107,16 @@ def list_active_orders(db: Session) -> list[Order]:
 
 
 def per_page_seconds(db: Session) -> float | None:
-    """近 N 单的「秒/页」，用有效排队时间 -> printed_at 作为单均耗时。"""
+    """近 N 单的「秒/打印页」，用有效排队时间 -> printed_at 作为单均耗时。"""
     limit = int(_wait_rules().get("recent_orders", 20))
     start = queue_time_expr()
+    pages = print_pages_expr()
     rows = list(
         db.execute(
-            select(Order.page_count, start, Order.printed_at)
+            select(pages, start, Order.printed_at)
             .where(Order.status.in_(HISTORY_STATUSES))
             .where(Order.printed_at.is_not(None))
-            .where(Order.page_count.is_not(None))
-            .where(Order.page_count > 0)
+            .where(pages > 0)
             .order_by(Order.printed_at.desc())
             .limit(limit)
         )
@@ -117,7 +131,7 @@ def per_page_seconds(db: Session) -> float | None:
         if seconds <= 0:
             continue
         total_seconds += seconds
-        total_pages += int(page_count)
+        total_pages += int(page_count or 0)
     if total_pages == 0:
         return None
     return total_seconds / total_pages
@@ -130,9 +144,9 @@ def _estimate_with_ratio(ratio: float | None, orders: list[Order]) -> int:
 
     rules = _wait_rules()
     default_seconds = int(rules.get("default_seconds_per_order", 60))
-    pages = [int(order.page_count) for order in orders if order.page_count]
+    pages = [order_print_pages(order) for order in orders]
 
-    if ratio is not None and len(pages) == len(orders):
+    if ratio is not None and all(pages):
         seconds = ratio * sum(pages)
     else:
         seconds = default_seconds * len(orders)
@@ -158,7 +172,7 @@ def queue_position(db: Session, order: Order) -> int:
 
 
 def _read_active_rows(db: Session) -> list:
-    """读整队的订单 id 与页数，按队列顺序。
+    """读整队的订单 id 与打印页数，按队列顺序。
 
      只取两列，不把整个队列读成 ORM 对象：一万单时读对象要一百多毫秒，
     读两列是十几毫秒。SQL 由下面的 `_queue_rows_sql()` 编译一次后固定，
@@ -174,7 +188,7 @@ def _queue_rows_sql() -> str:
     排序键仍然来自 `queue_order_by()`，队列口径只有一处，编译结果不会漂。
     """
     statement = (
-        select(Order.id, Order.page_count)
+        select(Order.id, print_pages_expr())
         .where(Order.status.in_(ACTIVE_STATUSES))
         .order_by(*queue_order_by())
     )
@@ -191,9 +205,9 @@ def _build_snapshot(db: Session) -> QueueSnapshot:
     positions: dict[int, int] = {}
     # 前缀和：前面每个位置的累计页数，避免逐行切片累加
     prefix_pages = [0] * (len(active_rows) + 1)
-    for position, (order_id, page_count) in enumerate(active_rows):
+    for position, (order_id, print_pages) in enumerate(active_rows):
         positions[order_id] = position
-        prefix_pages[position + 1] = prefix_pages[position] + int(page_count or 0)
+        prefix_pages[position + 1] = prefix_pages[position] + int(print_pages or 0)
 
     return QueueSnapshot(
         positions=positions,
@@ -248,7 +262,7 @@ def batch_wait_info(db: Session, orders: list[Order]) -> dict[int, dict]:
             }
             continue
         ahead_pages = snapshot.prefix_pages[position]
-        own_pages = int(order.page_count or 0)
+        own_pages = order_print_pages(order)
         minutes = _minutes_for(
             snapshot.seconds_per_page, ahead_pages + own_pages, position + 1, rules
         )
@@ -263,6 +277,7 @@ def batch_wait_info(db: Session, orders: list[Order]) -> dict[int, dict]:
 def _minutes_for(
     ratio: float | None, pages: int, order_count: int, rules: dict | None = None
 ) -> int:
+    """预计分钟数：ratio 是「秒/打印页」，pages 必须是打印页数，两边口径一致。"""
     rules = rules if rules is not None else _wait_rules()
     default_seconds = int(rules.get("default_seconds_per_order", 60))
     if ratio is not None:
@@ -287,13 +302,13 @@ def order_wait_info(db: Session, order: Order) -> dict:
     ahead_count, ahead_pages = db.execute(
         select(
             func.count(),
-            func.coalesce(func.sum(Order.page_count), 0),
+            func.coalesce(func.sum(print_pages_expr()), 0),
         ).where(ahead_condition)
     ).one()
 
     ratio = per_page_seconds(db)
     minutes = _minutes_for(
-        ratio, int(ahead_pages) + int(order.page_count or 0), int(ahead_count) + 1
+        ratio, int(ahead_pages) + order_print_pages(order), int(ahead_count) + 1
     )
     return {
         "queue_position": int(ahead_count),
