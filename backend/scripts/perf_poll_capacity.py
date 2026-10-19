@@ -55,13 +55,22 @@ POLL_SECONDS = 30.0
 DEMAND_QPS = ONLINE_USERS / POLL_SECONDS
 
 
-def _proc_cpu_seconds(pid: int) -> float | None:
-    """读 /proc/<pid>/stat 的 utime+stime（单位秒），量进程真实吃的 CPU。"""
-    try:
-        fields = Path(f"/proc/{pid}/stat").read_text().split()
-    except OSError:
+def _proc_cpu_seconds(pids: list[int]) -> float | None:
+    """读 /proc/<pid>/stat 的 utime+stime（单位秒）并求和，量进程真实吃的 CPU。
+
+    多 worker 诊断时把各个 worker 的 pid 都传进来，否则只量到一个 worker 会得出 0。
+    """
+    ticks = 0
+    read_any = False
+    for pid in pids:
+        try:
+            fields = Path(f"/proc/{pid}/stat").read_text().split()
+        except OSError:
+            continue
+        read_any = True
+        ticks += int(fields[13]) + int(fields[14])
+    if not read_any:
         return None
-    ticks = int(fields[13]) + int(fields[14])
     return ticks / os.sysconf("SC_CLK_TCK")
 
 
@@ -245,9 +254,12 @@ def main() -> int:
     )
     parser.add_argument(
         "--server-pid",
-        type=int,
+        type=str,
         default=None,
-        help="被测服务进程的 pid（多 worker 时给其中一个）；给了就额外量每请求 CPU",
+        help="被测服务进程的 pid，多个用逗号分隔；给了就额外量每请求 CPU",
+    )
+    parser.add_argument(
+        "--note", default="", help="写进结果文件的口径补充（逐条列，用 | 分隔）"
     )
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
@@ -257,6 +269,9 @@ def main() -> int:
         print(f"目标库 {db_name} 不像压力测试库（要求以 _stress 结尾），拒绝清库")
         return 2
 
+    server_pids = [
+        int(item) for item in (args.server_pid or "").replace(" ", "").split(",") if item
+    ]
     levels = [int(item) for item in args.levels.split(",") if item.strip()]
     if not levels or any(level < 1 for level in levels):
         print("并发档位必须是正整数")
@@ -339,9 +354,9 @@ def main() -> int:
         if index:
             time.sleep(1.0)
         print(f"  并发 {level:>3}：", end="", flush=True)
-        cpu_before = _proc_cpu_seconds(args.server_pid) if args.server_pid else None
+        cpu_before = _proc_cpu_seconds(server_pids) if server_pids else None
         result = _measure_level(args.base_url, tokens[0], level, args.seconds)
-        cpu_after = _proc_cpu_seconds(args.server_pid) if args.server_pid else None
+        cpu_after = _proc_cpu_seconds(server_pids) if server_pids else None
         if cpu_before is not None and cpu_after is not None and result["success"]:
             result["cpu_ms_per_request"] = (cpu_after - cpu_before) * 1000 / result["success"]
             result["cpu_cores"] = (cpu_after - cpu_before) / result["seconds"]
@@ -424,6 +439,8 @@ def main() -> int:
         f"- 代码提交：`{_git_commit()}`",
         f"- 系统：{platform.platform()}，CPU {os.cpu_count()} 核",
         f"- Python：{platform.python_version()}",
+        *([f"- 采样进程：{', '.join(str(pid) for pid in server_pids)}"]
+          if server_pids else []),
         f"- 连接池：size {settings.db_pool_size}，overflow {settings.db_max_overflow}，"
         f"timeout {settings.db_pool_timeout} 秒",
         "",
@@ -431,6 +448,11 @@ def main() -> int:
         "",
         *table,
         "",
+        *(
+            ["## 补充说明", "", *[f"- {item.strip()}" for item in args.note.split("|") if item.strip()], ""]
+            if args.note.strip()
+            else []
+        ),
         "## 口径",
         "",
         "- 每个档位用固定并发持续打 `/api/order/list`，按成功响应数除以实际测量时长算 QPS。",
