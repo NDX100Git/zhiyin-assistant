@@ -28,6 +28,9 @@ NPM="${NPM:-$(command -v npm || true)}"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 STUDENT_PORT="${STUDENT_PORT:-5173}"
 TEACHER_PORT="${TEACHER_PORT:-5174}"
+# 手机真机调试要连这台机器的局域网地址：页面里的接口地址不能是本机回环，
+# 否则手机上 127.0.0.1 指的是手机自己。默认取本机第一张网卡的地址，可用 LAN_IP 覆盖。
+LAN_IP="${LAN_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
 
 info() { printf '%s\n' "$*"; }
 warn() { printf '!! %s\n' "$*" >&2; }
@@ -151,7 +154,7 @@ start_student() {
     return 0
   fi
   info "  启动学生端 H5 :$STUDENT_PORT"
-  setsid bash -c "cd '$STUDENT_DIR' && exec '$NPM' run dev:h5 -- --port $STUDENT_PORT --host 0.0.0.0" \
+  setsid bash -c "cd '$STUDENT_DIR' && VITE_API_BASE_URL=http://$LAN_IP:$BACKEND_PORT exec '$NPM' run dev:h5 -- --port $STUDENT_PORT --host 0.0.0.0" \
     >>"$LOG_DIR/student.log" 2>&1 &
   echo $! >"$(pid_file student)"
   wait_http "http://127.0.0.1:$STUDENT_PORT/" "学生端" 240 ''
@@ -163,7 +166,7 @@ start_teacher() {
     return 0
   fi
   info "  启动老师端 :$TEACHER_PORT"
-  setsid bash -c "cd '$TEACHER_DIR' && exec '$NPM' run dev -- --port $TEACHER_PORT --host 0.0.0.0" \
+  setsid bash -c "cd '$TEACHER_DIR' && VITE_API_BASE_URL=http://$LAN_IP:$BACKEND_PORT exec '$NPM' run dev -- --port $TEACHER_PORT --host 0.0.0.0" \
     >>"$LOG_DIR/teacher.log" 2>&1 &
   echo $! >"$(pid_file teacher)"
   wait_http "http://127.0.0.1:$TEACHER_PORT/" "老师端" 180 ''
@@ -227,11 +230,9 @@ start_all() {
   start_student
   start_teacher
 
-  local lan_ip
-  lan_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
   info ""
   info "全部就绪："
-  info "  后端      http://127.0.0.1:$BACKEND_PORT/docs （局域网 http://$lan_ip:$BACKEND_PORT）"
+  info "  后端      http://127.0.0.1:$BACKEND_PORT/docs （手机访问 http://$LAN_IP:$BACKEND_PORT）"
   info "  学生端    http://127.0.0.1:$STUDENT_PORT"
   info "  老师端    http://127.0.0.1:$TEACHER_PORT"
   info "  日志      $LOG_DIR/{backend,student,teacher}.log"
