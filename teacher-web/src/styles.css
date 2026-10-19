@@ -11,23 +11,507 @@ body,
 
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif;
-  background: #f5f7fb;
-  color: #1f2d3d;
+  background-color: #e9e3d4;
+  color: #17161a;
+  -webkit-font-smoothing: antialiased;
 }
 
+/* ---------------------------------------------------------------------------
+ * 主题变量
+ * 默认 press：纸面工单。signal：信号牌。classic：旧蓝白皮肤（纯色，无渐变）。
+ * 老师端主题入口见 src/theme.js。
+ * ------------------------------------------------------------------------- */
+
+.zi-theme-press {
+  --zi-bg: #e9e3d4;
+  --zi-bg-image: repeating-linear-gradient(
+      0deg,
+      rgba(23, 22, 26, 0.07) 0,
+      rgba(23, 22, 26, 0.07) 1px,
+      transparent 1px,
+      transparent 32px
+    ),
+    repeating-linear-gradient(
+      90deg,
+      rgba(23, 22, 26, 0.07) 0,
+      rgba(23, 22, 26, 0.07) 1px,
+      transparent 1px,
+      transparent 32px
+    );
+  --zi-paper: #f8f4e9;
+  --zi-ink: #17161a;
+  --zi-muted: #67614f;
+  --zi-line: #c3b9a4;
+  --zi-line-strong: #8e8370;
+  --zi-soft: #f1ecdf;
+  --zi-soft-2: #f7f1e4;
+  --zi-accent: #d02d10;
+  --zi-accent-ink: #ffffff;
+  --zi-ok: #2f6b3f;
+  --zi-ok-bg: #e4ecdf;
+  --zi-warn: #8a4b00;
+  --zi-warn-bg: #f4e5c8;
+  --zi-danger: #b3261e;
+  --zi-danger-bg: #f6ded9;
+  --zi-radius: 0px;
+  --zi-card-border: 2px solid #17161a;
+  --zi-card-shadow: none;
+  --zi-primary-bg: #17161a;
+  --zi-primary-ink: #f8f4e9;
+  --zi-control-radius: 0px;
+  --zi-pill-radius: 0px;
+  --zi-aside-bg: #17161a;
+  --zi-aside-text: #d8d1c2;
+  --zi-aside-active: #ffffff;
+  --zi-aside-hover: rgba(255, 255, 255, 0.08);
+  --zi-header-bg: #f8f4e9;
+  --zi-header-border: 2px solid #17161a;
+}
+
+.zi-theme-signal {
+  --zi-bg: #ece7dc;
+  --zi-bg-image: repeating-linear-gradient(
+    135deg,
+    transparent 0,
+    transparent 26px,
+    rgba(210, 43, 30, 0.05) 26px,
+    rgba(210, 43, 30, 0.05) 28px
+  );
+  --zi-paper: #fbf8f1;
+  --zi-ink: #121110;
+  --zi-muted: #5c574e;
+  --zi-line: #d9d2c3;
+  --zi-line-strong: #8a8377;
+  --zi-soft: #efe9dd;
+  --zi-soft-2: #f6f0e6;
+  --zi-accent: #d22b1e;
+  --zi-accent-ink: #ffffff;
+  --zi-ok: #1f6b3a;
+  --zi-ok-bg: #e3efe4;
+  --zi-warn: #8a4a00;
+  --zi-warn-bg: #f5e6c8;
+  --zi-danger: #b3261e;
+  --zi-danger-bg: #f6ded9;
+  --zi-radius: 0px;
+  --zi-card-border: 2px solid #121110;
+  --zi-card-shadow: none;
+  --zi-primary-bg: #d22b1e;
+  --zi-primary-ink: #ffffff;
+  --zi-control-radius: 0px;
+  --zi-pill-radius: 0px;
+  --zi-aside-bg: #121110;
+  --zi-aside-text: #d6d0c2;
+  --zi-aside-active: #ffffff;
+  --zi-aside-hover: rgba(255, 255, 255, 0.08);
+  --zi-header-bg: #fbf8f1;
+  --zi-header-border: 2px solid #121110;
+}
+
+.zi-theme-classic {
+  --zi-bg: #f5f7fb;
+  --zi-bg-image: none;
+  --zi-paper: #ffffff;
+  --zi-ink: #1f2d3d;
+  --zi-muted: #7a869a;
+  --zi-line: #e3e8f0;
+  --zi-line-strong: #c9d3e0;
+  --zi-soft: #f2f4f8;
+  --zi-soft-2: #f7f9fc;
+  --zi-accent: #2f6bff;
+  --zi-accent-ink: #ffffff;
+  --zi-ok: #3f8f5c;
+  --zi-ok-bg: #eaf7ef;
+  --zi-warn: #b25e09;
+  --zi-warn-bg: #fff4e6;
+  --zi-danger: #c0392b;
+  --zi-danger-bg: #fdecea;
+  --zi-radius: 12px;
+  --zi-card-border: 0 solid transparent;
+  --zi-card-shadow: 0 4px 16px rgba(31, 45, 61, 0.06);
+  --zi-primary-bg: #2f6bff;
+  --zi-primary-ink: #ffffff;
+  --zi-control-radius: 4px;
+  --zi-pill-radius: 4px;
+  --zi-aside-bg: #1f2d3d;
+  --zi-aside-text: #c7d2df;
+  --zi-aside-active: #ffffff;
+  --zi-aside-hover: rgba(255, 255, 255, 0.06);
+  --zi-header-bg: #ffffff;
+  --zi-header-border: 1px solid #eef1f6;
+}
+
+body.zi-theme-press,
+body.zi-theme-signal,
+body.zi-theme-classic {
+  background-color: var(--zi-bg);
+  background-image: var(--zi-bg-image);
+  color: var(--zi-ink);
+  --el-color-primary: var(--zi-accent);
+  --el-color-primary-light-3: var(--zi-accent);
+  --el-color-primary-light-5: var(--zi-accent);
+  --el-color-primary-light-7: var(--zi-line-strong);
+  --el-color-primary-light-8: var(--zi-soft);
+  --el-color-primary-light-9: var(--zi-soft);
+  --el-color-primary-dark-2: var(--zi-ink);
+  --el-color-success: var(--zi-ok);
+  --el-color-success-light-3: var(--zi-ok);
+  --el-color-success-light-5: var(--zi-ok);
+  --el-color-success-light-7: var(--zi-line-strong);
+  --el-color-success-light-8: var(--zi-ok-bg);
+  --el-color-success-light-9: var(--zi-ok-bg);
+  --el-color-warning: var(--zi-warn);
+  --el-color-warning-light-3: var(--zi-warn);
+  --el-color-warning-light-5: var(--zi-warn);
+  --el-color-warning-light-7: var(--zi-line-strong);
+  --el-color-warning-light-8: var(--zi-warn-bg);
+  --el-color-warning-light-9: var(--zi-warn-bg);
+  --el-color-danger: var(--zi-danger);
+  --el-color-danger-light-3: var(--zi-danger);
+  --el-color-danger-light-5: var(--zi-danger);
+  --el-color-danger-light-7: var(--zi-line-strong);
+  --el-color-danger-light-8: var(--zi-danger-bg);
+  --el-color-danger-light-9: var(--zi-danger-bg);
+  --el-color-info: var(--zi-muted);
+  --el-color-info-light-9: var(--zi-soft);
+  --el-text-color-primary: var(--zi-ink);
+  --el-text-color-regular: var(--zi-ink);
+  --el-text-color-secondary: var(--zi-muted);
+  --el-text-color-placeholder: var(--zi-line-strong);
+  --el-text-color-disabled: var(--zi-muted);
+  --el-border-color: var(--zi-line);
+  --el-border-color-light: var(--zi-line);
+  --el-border-color-lighter: var(--zi-line);
+  --el-border-color-extra-light: var(--zi-line);
+  --el-border-color-dark: var(--zi-line-strong);
+  --el-fill-color-blank: var(--zi-paper);
+  --el-fill-color: var(--zi-soft);
+  --el-fill-color-light: var(--zi-soft);
+  --el-fill-color-lighter: var(--zi-soft-2);
+  --el-fill-color-extra-light: var(--zi-soft-2);
+  --el-fill-color-dark: var(--zi-line);
+  --el-bg-color: var(--zi-paper);
+  --el-bg-color-page: var(--zi-bg);
+  --el-bg-color-overlay: var(--zi-paper);
+  --el-border-radius-base: var(--zi-control-radius);
+  --el-border-radius-small: var(--zi-control-radius);
+  --el-border-radius-round: var(--zi-pill-radius);
+  --el-mask-color: rgba(248, 244, 233, 0.78);
+  --el-mask-color-extra-light: rgba(248, 244, 233, 0.4);
+}
+
+/* ---------------------------------------------------------------------------
+ * 通用块
+ * ------------------------------------------------------------------------- */
+
 .page-card {
-  background: #fff;
-  border-radius: 12px;
+  background: var(--zi-paper);
+  border: var(--zi-card-border);
+  border-top: 6px solid var(--zi-accent);
+  border-radius: var(--zi-radius);
   padding: 18px;
-  box-shadow: 0 4px 16px rgba(31, 45, 61, 0.06);
+  box-shadow: var(--zi-card-shadow);
 }
 
 .money {
-  font-weight: 600;
-  color: #2f6bff;
+  font-weight: 800;
+  color: var(--zi-accent);
 }
 
 .muted {
-  color: #8b98a8;
+  color: var(--zi-muted);
   font-size: 12px;
+}
+
+/* ---------------------------------------------------------------------------
+ * Element Plus 覆盖：按钮、输入、表格、标签、弹窗
+ * ------------------------------------------------------------------------- */
+
+.el-button {
+  border-radius: var(--zi-control-radius);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.el-button--primary {
+  --el-button-bg-color: var(--zi-primary-bg);
+  --el-button-border-color: var(--zi-primary-bg);
+  --el-button-text-color: var(--zi-primary-ink);
+  --el-button-hover-bg-color: var(--zi-accent);
+  --el-button-hover-border-color: var(--zi-accent);
+  --el-button-hover-text-color: var(--zi-accent-ink);
+  --el-button-active-bg-color: var(--zi-primary-bg);
+  --el-button-active-border-color: var(--zi-ink);
+  --el-button-active-text-color: var(--zi-primary-ink);
+}
+
+.el-button--success {
+  --el-button-bg-color: var(--zi-ok);
+  --el-button-border-color: var(--zi-ok);
+  --el-button-text-color: #ffffff;
+  --el-button-hover-bg-color: var(--zi-ok);
+  --el-button-hover-border-color: var(--zi-ok);
+  --el-button-hover-text-color: #ffffff;
+  --el-button-active-bg-color: var(--zi-ink);
+  --el-button-active-border-color: var(--zi-ink);
+  --el-button-active-text-color: var(--zi-paper);
+}
+
+.el-button--warning {
+  --el-button-bg-color: var(--zi-warn);
+  --el-button-border-color: var(--zi-warn);
+  --el-button-text-color: #ffffff;
+  --el-button-hover-bg-color: var(--zi-warn);
+  --el-button-hover-border-color: var(--zi-warn);
+  --el-button-hover-text-color: #ffffff;
+  --el-button-active-bg-color: var(--zi-ink);
+  --el-button-active-border-color: var(--zi-ink);
+  --el-button-active-text-color: var(--zi-paper);
+}
+
+.el-button--danger {
+  --el-button-bg-color: var(--zi-danger);
+  --el-button-border-color: var(--zi-danger);
+  --el-button-text-color: #ffffff;
+  --el-button-hover-bg-color: var(--zi-danger);
+  --el-button-hover-border-color: var(--zi-danger);
+  --el-button-hover-text-color: #ffffff;
+  --el-button-active-bg-color: var(--zi-ink);
+  --el-button-active-border-color: var(--zi-ink);
+  --el-button-active-text-color: var(--zi-paper);
+}
+
+.el-button.is-link {
+  background: transparent;
+  border-color: transparent;
+}
+.el-button.is-link.el-button--primary {
+  color: var(--zi-accent);
+}
+.el-button.is-link.el-button--success {
+  color: var(--zi-ok);
+}
+.el-button.is-link.el-button--warning {
+  color: var(--zi-warn);
+}
+.el-button.is-link.el-button--danger {
+  color: var(--zi-danger);
+}
+
+.el-input__wrapper,
+.el-select__wrapper,
+.el-textarea__inner {
+  background-color: var(--zi-paper);
+  border-radius: var(--zi-control-radius);
+  box-shadow: 0 0 0 1px var(--zi-line-strong) inset;
+}
+.el-input__wrapper.is-focus,
+.el-select__wrapper.is-focused,
+.el-textarea__inner:focus {
+  box-shadow: 0 0 0 2px var(--zi-accent) inset;
+}
+.el-input__inner {
+  color: var(--zi-ink);
+}
+.el-input__inner::placeholder,
+.el-textarea__inner::placeholder {
+  color: var(--zi-line-strong);
+}
+.el-form-item__label {
+  color: var(--zi-ink);
+  font-weight: 700;
+}
+
+.el-table {
+  --el-table-border-color: var(--zi-line);
+  --el-table-header-bg-color: var(--zi-soft);
+  --el-table-header-text-color: var(--zi-ink);
+  --el-table-row-hover-bg-color: var(--zi-soft);
+  --el-table-current-row-bg-color: var(--zi-soft);
+  --el-table-tr-bg-color: var(--zi-paper);
+  --el-table-bg-color: var(--zi-paper);
+  --el-table-expanded-cell-bg-color: var(--zi-paper);
+  --el-fill-color-lighter: var(--zi-soft-2);
+}
+.el-table th.el-table__cell {
+  background: var(--zi-soft);
+  color: var(--zi-ink);
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+.el-table td.el-table__cell {
+  color: var(--zi-ink);
+}
+.el-table--striped .el-table__body tr.el-table__row--striped td.el-table__cell {
+  background: var(--zi-soft-2);
+}
+.el-table__empty-text {
+  color: var(--zi-muted);
+}
+
+.el-tag {
+  border: 1px solid var(--zi-line-strong);
+  border-radius: var(--zi-pill-radius);
+  background: transparent;
+  color: var(--zi-ink);
+  font-weight: 800;
+  white-space: nowrap;
+}
+.el-tag--primary {
+  border-color: var(--zi-accent);
+  color: var(--zi-accent);
+}
+.el-tag--success {
+  border-color: var(--zi-ok);
+  color: var(--zi-ok);
+}
+.el-tag--warning {
+  border-color: var(--zi-warn);
+  color: var(--zi-warn);
+}
+.el-tag--danger {
+  border-color: var(--zi-danger);
+  background: var(--zi-danger);
+  color: #ffffff;
+}
+.el-tag--info {
+  border-color: var(--zi-line-strong);
+  color: var(--zi-muted);
+}
+.el-tag.is-plain {
+  background: transparent;
+}
+
+.el-dialog,
+.el-message-box {
+  border: var(--zi-card-border);
+  border-top: 8px solid var(--zi-accent);
+  border-radius: var(--zi-radius);
+  background: var(--zi-paper);
+}
+.el-dialog__header {
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--zi-line);
+}
+.el-dialog__title,
+.el-message-box__title {
+  color: var(--zi-ink);
+  font-weight: 900;
+  letter-spacing: 0.02em;
+}
+.el-dialog__body,
+.el-message-box__content {
+  color: var(--zi-ink);
+}
+.el-message {
+  border: 1px solid var(--zi-line-strong);
+  border-left: 5px solid var(--zi-line-strong);
+  border-radius: var(--zi-control-radius);
+  background: var(--zi-paper);
+  box-shadow: 4px 4px 0 rgba(23, 22, 26, 0.12);
+}
+.el-message--success {
+  border-left-color: var(--zi-ok);
+}
+.el-message--warning {
+  border-left-color: var(--zi-warn);
+}
+.el-message--error {
+  border-left-color: var(--zi-danger);
+}
+
+.el-descriptions__label.el-descriptions__cell.is-bordered-label {
+  background: var(--zi-soft);
+  color: var(--zi-muted);
+  font-weight: 800;
+}
+.el-descriptions__content.el-descriptions__cell {
+  color: var(--zi-ink);
+}
+
+.el-popper.is-light {
+  border: 1px solid var(--zi-ink);
+  border-radius: var(--zi-control-radius);
+  background: var(--zi-paper);
+  color: var(--zi-ink);
+}
+.el-select-dropdown__item.is-selected {
+  color: var(--zi-accent);
+  font-weight: 800;
+}
+
+/* ---------------------------------------------------------------------------
+ * 旧蓝白皮肤：恢复轻量圆角与浅色填充
+ * ------------------------------------------------------------------------- */
+
+.zi-theme-classic .page-card {
+  border: none;
+  border-top: none;
+  border-radius: 12px;
+  box-shadow: 0 4px 16px rgba(31, 45, 61, 0.06);
+}
+.zi-theme-classic .el-button {
+  font-weight: 500;
+  letter-spacing: 0;
+}
+.zi-theme-classic .el-tag {
+  border: none;
+  background: var(--zi-soft);
+  font-weight: 400;
+}
+.zi-theme-classic .el-tag--primary {
+  background: var(--zi-soft);
+  color: var(--zi-accent);
+}
+.zi-theme-classic .el-tag--success {
+  background: var(--zi-ok-bg);
+  color: var(--zi-ok);
+}
+.zi-theme-classic .el-tag--warning {
+  background: var(--zi-warn-bg);
+  color: var(--zi-warn);
+}
+.zi-theme-classic .el-tag--danger {
+  background: var(--zi-danger-bg);
+  color: var(--zi-danger);
+}
+.zi-theme-classic .el-tag--info {
+  background: var(--zi-soft);
+  color: var(--zi-muted);
+}
+.zi-theme-classic .el-dialog,
+.zi-theme-classic .el-message-box {
+  border: none;
+  border-top: none;
+  border-radius: 8px;
+}
+.zi-theme-classic .el-dialog__header {
+  border-bottom: 1px solid var(--zi-line);
+}
+.zi-theme-classic .el-input__wrapper,
+.zi-theme-classic .el-select__wrapper,
+.zi-theme-classic .el-textarea__inner {
+  box-shadow: 0 0 0 1px var(--zi-line) inset;
+}
+.zi-theme-classic .el-input__wrapper.is-focus,
+.zi-theme-classic .el-select__wrapper.is-focused,
+.zi-theme-classic .el-textarea__inner:focus {
+  box-shadow: 0 0 0 1px var(--zi-accent) inset;
+}
+.zi-theme-classic .el-table th.el-table__cell {
+  font-weight: 600;
+  letter-spacing: 0;
+}
+.zi-theme-classic .el-message {
+  border: none;
+  border-left: 4px solid var(--zi-line-strong);
+  box-shadow: 0 4px 16px rgba(31, 45, 61, 0.1);
+}
+.zi-theme-classic .el-message--success {
+  border-left-color: var(--zi-ok);
+}
+.zi-theme-classic .el-message--warning {
+  border-left-color: var(--zi-warn);
+}
+.zi-theme-classic .el-message--error {
+  border-left-color: var(--zi-danger);
 }

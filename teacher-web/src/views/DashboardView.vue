@@ -69,13 +69,13 @@
         @selection-change="onSelectionChange"
       >
         <el-table-column type="selection" width="46" />
-        <el-table-column prop="order_no" label="订单号" width="110" />
-        <el-table-column prop="pickup_code" label="取件码" width="150">
+        <el-table-column prop="order_no" label="订单号" width="130" />
+        <el-table-column prop="pickup_code" label="取件码" width="160" class-name="pickup-cell">
           <template #default="{ row }">
             <el-tag effect="plain">{{ row.pickup_code }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="file_name" label="文件" min-width="180" show-overflow-tooltip />
+        <el-table-column prop="file_name" label="文件" min-width="160" show-overflow-tooltip />
         <el-table-column prop="page_count" label="页数" width="70" />
         <el-table-column label="打印参数" width="150">
           <template #default="{ row }">
@@ -96,7 +96,7 @@
             <div v-else class="muted">待收款</div>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="300" fixed="right">
+        <el-table-column label="操作" width="280" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="download(row)">下载</el-button>
             <el-button v-if="row.status === 'queuing'" link type="primary" @click="start(row)">
@@ -458,29 +458,44 @@ document.addEventListener('visibilitychange', () => {
   flex-direction: column;
   gap: 16px;
 }
+
 .stats {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
-  gap: 16px;
+  background: var(--zi-paper);
+  border: var(--zi-card-border);
+  border-top: 6px solid var(--zi-accent);
+  border-radius: var(--zi-radius);
+  box-shadow: var(--zi-card-shadow);
 }
 .stat {
-  background: #fff;
-  border-radius: 12px;
-  padding: 18px;
-  box-shadow: 0 4px 16px rgba(31, 45, 61, 0.06);
+  padding: 18px 20px;
+  border-left: 2px solid var(--zi-line);
+}
+.stat:first-child {
+  border-left: none;
 }
 .stat-label {
-  font-size: 13px;
-  color: #8b98a8;
+  color: var(--zi-muted);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
 }
 .stat-value {
-  margin-top: 8px;
-  font-size: 26px;
-  font-weight: 700;
+  margin-top: 6px;
+  color: var(--zi-ink);
+  font-size: 34px;
+  font-weight: 900;
+  line-height: 1.05;
+  font-variant-numeric: tabular-nums;
+}
+.stat-value.money {
+  color: var(--zi-accent);
 }
 .stat-value.danger {
-  color: #e6a23c;
+  color: var(--zi-danger);
 }
+
 .toolbar {
   display: flex;
   justify-content: space-between;
@@ -495,18 +510,60 @@ document.addEventListener('visibilitychange', () => {
   gap: 10px;
 }
 .table-card {
-  padding-top: 12px;
+  padding-top: 14px;
 }
 .table-head {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 12px;
   margin-bottom: 12px;
-  font-weight: 600;
+  color: var(--zi-ink);
+  font-size: 16px;
+  font-weight: 900;
+  letter-spacing: 0.02em;
+}
+.table-head .muted {
+  font-weight: 400;
+  letter-spacing: 0;
+}
+:deep(.pickup-cell .el-tag) {
+  font-family: Menlo, 'SF Mono', Consolas, 'Courier New', monospace;
+  font-size: 14px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
 }
 .dialog-tip {
   margin: 12px 0 8px;
+  color: var(--zi-muted);
   font-size: 12px;
-  color: #8b98a8;
+}
+
+/* 旧蓝白皮肤 */
+.zi-theme-classic .stats {
+  gap: 16px;
+  border: none;
+  border-top: none;
+  background: transparent;
+  box-shadow: none;
+}
+.zi-theme-classic .stat {
+  padding: 18px;
+  border-left: none;
+  border-radius: 12px;
+  background: #ffffff;
+  box-shadow: 0 4px 16px rgba(31, 45, 61, 0.06);
+}
+.zi-theme-classic .stat-label {
+  font-weight: 400;
+  letter-spacing: 0;
+}
+.zi-theme-classic .stat-value {
+  font-size: 26px;
+  font-weight: 700;
+}
+.zi-theme-classic .table-head {
+  font-weight: 600;
+  letter-spacing: 0;
 }
 </style>

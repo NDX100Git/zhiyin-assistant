@@ -26,10 +26,10 @@
     }
   ],
   "tabBar": {
-    "color": "#7a869a",
-    "selectedColor": "#2f6bff",
-    "backgroundColor": "#ffffff",
-    "borderStyle": "white",
+    "color": "#67614f",
+    "selectedColor": "#d02d10",
+    "backgroundColor": "#f8f4e9",
+    "borderStyle": "black",
     "list": [
       {
         "pagePath": "pages/index/index",
@@ -48,7 +48,7 @@
   "globalStyle": {
     "navigationBarTextStyle": "black",
     "navigationBarTitleText": "智印助手",
-    "navigationBarBackgroundColor": "#ffffff",
-    "backgroundColor": "#f5f7fb"
+    "navigationBarBackgroundColor": "#f8f4e9",
+    "backgroundColor": "#e9e3d4"
   }
 }

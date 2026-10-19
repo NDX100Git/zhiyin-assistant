@@ -58,12 +58,11 @@ import { POLL_INTERVAL } from '@/config'
 import { request } from '@/services/api'
 import { ensureLogin } from '@/services/auth'
 import { createPoller, notify, notifyError } from '@/services/notify'
-import { getUiTheme, themeClass } from '@/ui/theme'
+import { useUiTheme } from '@/ui/theme'
 
 const order = ref(null)
 const orderId = ref('')
-const uiTheme = ref(getUiTheme())
-const uiThemeClass = computed(() => themeClass(uiTheme.value))
+const { uiThemeClass } = useUiTheme()
 let visible = false
 
 const isActive = computed(() => order.value && ['queuing', 'printing'].includes(order.value.status))
@@ -102,7 +101,6 @@ onLoad((options) => {
 
 onShow(async () => {
   visible = true
-  uiTheme.value = getUiTheme()
   try {
     await ensureLogin()
     poller.start()
@@ -456,7 +454,7 @@ function goOrder() {
   color: var(--zi-accent-ink);
 }
 
-/* ---------- 原有蓝白风格 ---------- */
+/* ---------- 旧蓝白皮肤（可选，纯色不使用渐变） ---------- */
 .zi-theme-classic .hero {
   align-items: center;
   text-align: center;

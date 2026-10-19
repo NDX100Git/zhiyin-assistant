@@ -21,7 +21,7 @@
           登录
         </el-button>
       </el-form>
-      <div class="hint">账号密码配置在服务端 backend/.env（ADMIN_USERNAME / ADMIN_PASSWORD）</div>
+      <div class="hint">账号密码由服务端统一配置，请联系系统管理员</div>
     </el-card>
   </div>
 </template>
@@ -56,33 +56,79 @@ async function submit() {
 
 <style scoped>
 .wrap {
-  height: 100vh;
+  min-height: 100vh;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: linear-gradient(135deg, #2f6bff 0%, #5b8cff 55%, #7aa2ff 100%);
+  padding: 24px;
+  background-color: var(--zi-bg);
+  background-image: var(--zi-bg-image);
 }
 .card {
-  width: 380px;
-  border-radius: 16px;
+  width: 400px;
+  background: var(--zi-paper);
+  border: var(--zi-card-border);
+  border-top: 8px solid var(--zi-accent);
+  border-radius: var(--zi-radius);
+  box-shadow: 12px 12px 0 rgba(23, 22, 26, 0.12);
+}
+.card :deep(.el-card__body) {
+  padding: 28px;
 }
 .brand {
-  font-size: 26px;
-  font-weight: 700;
-  color: #1f2d3d;
+  display: inline-block;
+  padding-bottom: 8px;
+  border-bottom: 6px solid var(--zi-accent);
+  color: var(--zi-ink);
+  font-size: 30px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  line-height: 1.15;
 }
 .sub {
-  margin: 4px 0 22px;
+  margin: 10px 0 24px;
+  color: var(--zi-muted);
   font-size: 13px;
-  color: #8b98a8;
+  font-weight: 600;
 }
 .btn {
   width: 100%;
+  height: 48px;
+  font-size: 16px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
 }
 .hint {
-  margin-top: 16px;
+  margin-top: 18px;
+  padding-left: 12px;
+  border-left: 4px solid var(--zi-warn);
+  color: var(--zi-muted);
   font-size: 12px;
-  color: #9aa7b5;
   line-height: 1.6;
+}
+
+/* 旧蓝白皮肤 */
+.zi-theme-classic .card {
+  border: none;
+  border-top: none;
+  border-radius: 16px;
+  box-shadow: 0 16px 40px rgba(31, 45, 61, 0.12);
+}
+.zi-theme-classic .brand {
+  padding-bottom: 0;
+  border-bottom: none;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+.zi-theme-classic .sub {
+  font-weight: 400;
+}
+.zi-theme-classic .btn {
+  font-weight: 600;
+  letter-spacing: 0;
+}
+.zi-theme-classic .hint {
+  padding-left: 0;
+  border-left: none;
 }
 </style>

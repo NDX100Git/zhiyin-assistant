@@ -129,13 +129,28 @@ onMounted(loadSessions)
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
+  gap: 16px;
+  flex-wrap: wrap;
   margin-bottom: 14px;
 }
 .title {
-  font-size: 16px;
-  font-weight: 600;
+  padding-left: 12px;
+  border-left: 6px solid var(--zi-accent);
+  color: var(--zi-ink);
+  font-size: 18px;
+  font-weight: 900;
+  line-height: 1.3;
+  letter-spacing: 0.02em;
 }
 .notice-input {
   margin: 14px 0;
+}
+
+/* 旧蓝白皮肤 */
+.zi-theme-classic .title {
+  padding-left: 0;
+  border-left: none;
+  font-weight: 600;
+  letter-spacing: 0;
 }
 </style>

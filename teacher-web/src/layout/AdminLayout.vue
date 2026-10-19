@@ -3,13 +3,7 @@
     <el-aside width="200px" class="aside">
       <div class="brand">智印助手</div>
       <div class="brand-sub">文印室后台</div>
-      <el-menu
-        :default-active="route.path"
-        router
-        background-color="#1f2d3d"
-        text-color="#c7d2df"
-        active-text-color="#ffffff"
-      >
+      <el-menu :default-active="route.path" router>
         <el-menu-item index="/dashboard">
           <el-icon><DataBoard /></el-icon>
           <span>工作台</span>
@@ -69,38 +63,60 @@ function logout() {
 <style scoped>
 .layout {
   height: 100vh;
+  background: var(--zi-bg);
 }
 .aside {
-  background: #1f2d3d;
-  color: #fff;
+  background: var(--zi-aside-bg);
+  color: var(--zi-aside-active);
   padding-top: 18px;
+  border-right: 6px solid var(--zi-accent);
 }
 .brand {
-  padding: 0 20px;
-  font-size: 20px;
-  font-weight: 700;
+  margin: 0 12px;
+  padding: 0 0 0 12px;
+  border-left: 8px solid var(--zi-accent);
+  color: var(--zi-aside-active);
+  font-size: 21px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  line-height: 1.2;
 }
 .brand-sub {
-  padding: 4px 20px 18px;
+  margin-top: 6px;
+  padding: 0 20px 18px 32px;
+  color: var(--zi-aside-text);
   font-size: 12px;
-  color: #8fa3b8;
+  font-weight: 600;
 }
 .aside :deep(.el-menu) {
   border-right: none;
+  background: transparent;
+  --el-menu-bg-color: transparent;
+  --el-menu-text-color: var(--zi-aside-text);
+  --el-menu-active-color: var(--zi-aside-active);
+  --el-menu-hover-bg-color: var(--zi-aside-hover);
+}
+.aside :deep(.el-menu-item) {
+  height: 48px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
 }
 .aside :deep(.el-menu-item.is-active) {
-  background: #2f6bff;
+  background: var(--zi-accent);
+  color: var(--zi-accent-ink);
 }
 .header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  background: #fff;
-  border-bottom: 1px solid #eef1f6;
+  background: var(--zi-header-bg);
+  border-bottom: var(--zi-header-border);
 }
 .title {
-  font-size: 18px;
-  font-weight: 600;
+  color: var(--zi-ink);
+  font-size: 20px;
+  font-weight: 900;
+  letter-spacing: 0.03em;
 }
 .right {
   display: flex;
@@ -108,11 +124,36 @@ function logout() {
   gap: 12px;
 }
 .admin {
-  font-size: 14px;
-  color: #4b5a6b;
+  color: var(--zi-muted);
+  font-size: 13px;
+  font-weight: 600;
 }
 .main {
-  background: #f5f7fb;
+  background: transparent;
   padding: 18px;
+}
+
+/* 旧蓝白皮肤 */
+.zi-theme-classic .aside {
+  border-right: none;
+}
+.zi-theme-classic .brand {
+  margin-left: 0;
+  padding-left: 20px;
+  border-left: none;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+.zi-theme-classic .brand-sub {
+  padding-left: 20px;
+  font-weight: 400;
+}
+.zi-theme-classic .aside :deep(.el-menu-item) {
+  font-weight: 500;
+  letter-spacing: 0;
+}
+.zi-theme-classic .title {
+  font-weight: 600;
+  letter-spacing: 0;
 }
 </style>

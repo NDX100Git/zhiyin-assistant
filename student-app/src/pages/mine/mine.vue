@@ -1,5 +1,5 @@
 <template>
-  <view class="page">
+  <view class="page" :class="uiThemeClass">
     <view class="card profile">
       <view class="avatar">{{ initial }}</view>
       <view class="profile-main">
@@ -34,7 +34,7 @@
         <text class="amount">{{ formatMoney(order.amount_cents) }}</text>
       </view>
       <view class="order-meta">
-        <text>取件码 {{ order.pickup_code }}</text>
+        <text class="pickup">取件码 {{ order.pickup_code }}</text>
         <text v-if="isActive(order)">前面 {{ order.queue_position }} 单 · 约 {{ order.estimated_minutes }} 分钟</text>
         <text v-else>{{ order.created_at }}</text>
       </view>
@@ -54,6 +54,7 @@ import { POLL_INTERVAL } from '@/config'
 import { request } from '@/services/api'
 import { ensureLogin, getCurrentUser } from '@/services/auth'
 import { createPoller, notify, notifyError } from '@/services/notify'
+import { useUiTheme } from '@/ui/theme'
 
 const tabs = [
   { label: '全部', value: '' },
@@ -70,6 +71,7 @@ const saving = ref(false)
 const nickname = ref('')
 
 const initial = computed(() => (nickname.value || '同').slice(0, 1))
+const { uiThemeClass } = useUiTheme()
 
 function isActive(order) {
   return order.status === 'queuing' || order.status === 'printing'
@@ -169,21 +171,25 @@ function openDetail(id) {
 .page {
   min-height: 100vh;
   padding: 24rpx 24rpx 160rpx;
-  background: #f5f7fb;
   box-sizing: border-box;
+  background-color: var(--zi-bg);
+  background-image: var(--zi-bg-image);
+  color: var(--zi-ink);
 }
 .card {
   margin-bottom: 20rpx;
   padding: 26rpx;
-  background: #fff;
-  border-radius: 24rpx;
-  box-shadow: 0 8rpx 24rpx rgba(31, 45, 61, 0.06);
+  background: var(--zi-paper);
+  border: var(--zi-card-border);
+  border-radius: var(--zi-radius);
+  box-shadow: var(--zi-card-shadow);
 }
 .card.center {
   text-align: center;
-  color: #9aa7b5;
+  color: var(--zi-muted);
   font-size: 26rpx;
 }
+
 .profile {
   display: flex;
   align-items: center;
@@ -191,38 +197,48 @@ function openDetail(id) {
 .avatar {
   width: 88rpx;
   height: 88rpx;
-  border-radius: 50%;
-  background: #eef3ff;
-  color: #2f6bff;
+  border: 3rpx solid var(--zi-ink);
+  border-radius: var(--zi-radius);
+  background: var(--zi-ink);
+  color: var(--zi-paper);
   text-align: center;
-  line-height: 88rpx;
+  line-height: 82rpx;
   font-size: 36rpx;
-  font-weight: 700;
+  font-weight: 900;
 }
 .profile-main {
   flex: 1;
+  min-width: 0;
   margin: 0 20rpx;
 }
 .nickname {
   font-size: 30rpx;
-  color: #1f2d3d;
+  font-weight: 800;
+  color: var(--zi-ink);
 }
 .device {
   display: block;
   margin-top: 6rpx;
+  color: var(--zi-muted);
   font-size: 22rpx;
-  color: #9aa7b5;
+  line-height: 1.5;
 }
 .save {
+  height: 60rpx;
   margin: 0;
   padding: 0 22rpx;
-  height: 60rpx;
-  line-height: 60rpx;
-  border-radius: 999rpx;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: var(--zi-button-border);
+  border-radius: var(--zi-button-radius);
+  background: transparent;
+  color: var(--zi-primary-bg);
   font-size: 24rpx;
-  color: #2f6bff;
-  background: #eef3ff;
+  font-weight: 800;
+  line-height: 1;
 }
+
 .tabs {
   white-space: nowrap;
   margin-bottom: 16rpx;
@@ -231,14 +247,21 @@ function openDetail(id) {
   display: inline-block;
   margin-right: 16rpx;
   padding: 10rpx 24rpx;
-  border-radius: 999rpx;
+  border: 2rpx solid var(--zi-line-strong);
+  border-radius: var(--zi-pill-radius);
+  color: var(--zi-muted);
+  background: transparent;
   font-size: 24rpx;
-  color: #6b7a90;
-  background: #eef1f6;
+  font-weight: 700;
 }
 .tab.active {
-  color: #fff;
-  background: #2f6bff;
+  border-color: var(--zi-primary-bg);
+  background: var(--zi-primary-bg);
+  color: var(--zi-primary-ink);
+}
+
+.order {
+  border-left: 8rpx solid var(--zi-accent);
 }
 .order-head {
   display: flex;
@@ -246,33 +269,38 @@ function openDetail(id) {
   align-items: center;
 }
 .order-no {
+  color: var(--zi-ink);
   font-size: 28rpx;
-  font-weight: 600;
-  color: #1f2d3d;
+  font-weight: 800;
+  letter-spacing: 1rpx;
 }
 .status {
-  padding: 4rpx 16rpx;
-  border-radius: 999rpx;
+  padding: 4rpx 14rpx;
+  border: 2rpx solid var(--zi-line-strong);
+  border-radius: var(--zi-pill-radius);
+  background: transparent;
+  color: var(--zi-muted);
   font-size: 22rpx;
-  background: #eef1f6;
-  color: #6b7a90;
+  font-weight: 800;
+  line-height: 1.3;
 }
+.status.pending_pay,
 .status.queuing,
 .status.printing {
-  color: #2f6bff;
-  background: #eef3ff;
+  border-color: var(--zi-accent);
+  color: var(--zi-accent);
 }
 .status.ready {
-  color: #b25e09;
-  background: #fff4e6;
+  border-color: var(--zi-warn);
+  color: var(--zi-warn);
 }
 .status.completed {
-  color: #3f8f5c;
-  background: #eaf7ef;
+  border-color: var(--zi-ok);
+  color: var(--zi-ok);
 }
 .status.abnormal {
-  color: #c0392b;
-  background: #fdecea;
+  border-color: var(--zi-danger);
+  color: var(--zi-danger);
 }
 .order-body {
   display: flex;
@@ -281,22 +309,31 @@ function openDetail(id) {
 }
 .file {
   flex: 1;
+  min-width: 0;
+  color: var(--zi-ink);
   font-size: 26rpx;
-  color: #4b5a6b;
+  line-height: 1.5;
   word-break: break-all;
 }
 .amount {
   margin-left: 16rpx;
-  font-size: 28rpx;
-  font-weight: 600;
-  color: #1f2d3d;
+  color: var(--zi-accent);
+  font-size: 30rpx;
+  font-weight: 900;
 }
 .order-meta {
   display: flex;
   justify-content: space-between;
+  gap: 12rpx;
   margin-top: 12rpx;
-  font-size: 22rpx;
-  color: #9aa7b5;
+  color: var(--zi-muted);
+  font-size: 24rpx;
+  line-height: 1.5;
+}
+.pickup {
+  color: var(--zi-ink);
+  font-size: 26rpx;
+  font-weight: 700;
 }
 .order-actions {
   display: flex;
@@ -304,21 +341,97 @@ function openDetail(id) {
   margin-top: 16rpx;
 }
 .mini {
+  height: 60rpx;
   margin: 0 0 0 12rpx;
-  padding: 0 22rpx;
-  height: 56rpx;
-  line-height: 56rpx;
-  border-radius: 999rpx;
+  padding: 0 20rpx;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2rpx solid var(--zi-line-strong);
+  border-radius: var(--zi-pill-radius);
+  background: transparent;
+  color: var(--zi-ink);
   font-size: 22rpx;
-  color: #2f6bff;
-  background: #eef3ff;
+  font-weight: 800;
+  line-height: 1;
 }
 .mini.primary {
-  color: #fff;
-  background: #2f6bff;
+  border-color: var(--zi-ink);
+  background: var(--zi-primary-bg);
+  color: var(--zi-primary-ink);
 }
 .mini.ghost {
-  color: #6b7a90;
-  background: #f2f4f8;
+  border-color: var(--zi-line-strong);
+  background: transparent;
+  color: var(--zi-muted);
+}
+
+/* 旧蓝白皮肤：恢复轻量圆角和填充标签 */
+.zi-theme-classic .avatar {
+  border: none;
+  border-radius: 50%;
+  background: var(--zi-soft);
+  color: var(--zi-accent);
+  line-height: 88rpx;
+}
+.zi-theme-classic .save {
+  border: none;
+  border-radius: 999rpx;
+  background: var(--zi-soft);
+  color: var(--zi-accent);
+  font-weight: 600;
+}
+.zi-theme-classic .tab {
+  border: none;
+  background: var(--zi-soft);
+  font-weight: 400;
+}
+.zi-theme-classic .tab.active {
+  background: var(--zi-accent);
+  color: #ffffff;
+}
+.zi-theme-classic .order {
+  border-left: none;
+}
+.zi-theme-classic .status {
+  border: none;
+  background: var(--zi-soft);
+  font-weight: 400;
+}
+.zi-theme-classic .status.pending_pay,
+.zi-theme-classic .status.queuing,
+.zi-theme-classic .status.printing {
+  background: var(--zi-soft);
+  color: var(--zi-accent);
+}
+.zi-theme-classic .status.ready {
+  background: var(--zi-warn-bg);
+  color: var(--zi-warn);
+}
+.zi-theme-classic .status.completed {
+  background: var(--zi-ok-bg);
+  color: var(--zi-ok);
+}
+.zi-theme-classic .status.abnormal {
+  background: var(--zi-danger-bg);
+  color: var(--zi-danger);
+}
+.zi-theme-classic .amount {
+  color: var(--zi-ink);
+  font-weight: 600;
+}
+.zi-theme-classic .mini {
+  border: none;
+  background: var(--zi-soft);
+  color: var(--zi-accent);
+  font-weight: 400;
+}
+.zi-theme-classic .mini.primary {
+  background: var(--zi-accent);
+  color: #ffffff;
+}
+.zi-theme-classic .mini.ghost {
+  background: var(--zi-soft-2);
+  color: var(--zi-muted);
 }
 </style>

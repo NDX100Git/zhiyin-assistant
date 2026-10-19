@@ -21,22 +21,22 @@
 
     <div class="page-card">
       <el-table v-loading="loading" :data="data.items" border stripe>
-        <el-table-column prop="created_at" label="时间" width="180" />
-        <el-table-column prop="order_no" label="订单号" width="120" />
-        <el-table-column label="金额" width="120">
+        <el-table-column prop="created_at" label="时间" min-width="180" />
+        <el-table-column prop="order_no" label="订单号" min-width="150" />
+        <el-table-column label="金额" min-width="120">
           <template #default="{ row }">
             <span class="money">{{ yuan(row.amount_cents) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="方式" width="120">
+        <el-table-column label="方式" min-width="120">
           <template #default="{ row }">
             <el-tag :type="row.method === 'onsite' ? 'success' : 'primary'" effect="plain">
               {{ row.method === 'onsite' ? '现场收款' : '模拟支付' }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="operator" label="操作人" width="160" />
-        <el-table-column prop="order_id" label="订单 ID" width="100" />
+        <el-table-column prop="operator" label="操作人" min-width="160" />
+        <el-table-column prop="order_id" label="订单编号" min-width="110" />
       </el-table>
     </div>
   </div>
@@ -79,6 +79,8 @@ onMounted(load)
   display: flex;
   justify-content: space-between;
   align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
 }
 .left {
   display: flex;
@@ -86,13 +88,19 @@ onMounted(load)
   gap: 10px;
 }
 .label {
+  color: var(--zi-muted);
   font-size: 13px;
-  color: #8b98a8;
+  font-weight: 700;
 }
 .summary {
   display: flex;
   gap: 24px;
+  color: var(--zi-ink);
   font-size: 14px;
-  color: #4b5a6b;
+}
+.summary b {
+  color: var(--zi-accent);
+  font-size: 20px;
+  font-weight: 900;
 }
 </style>
