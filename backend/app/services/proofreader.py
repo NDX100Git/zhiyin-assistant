@@ -1,7 +1,7 @@
 """错别字与标点检查（阶段 5-C）。
 
 长文档按段落分块（默认 2500 字，见 config/ai_rules.json），用 asyncio.gather 并发调用
-（默认 3 路），每块完成后更新进度供前端轮询。
+（每个任务默认 2 路，两个校对任务并发正好占满全局 4 个名额），每块完成后更新进度供前端轮询。
 严格「建议模式」：只报有把握的问题，必须人工确认后才可能进入修复。
 """
 
@@ -144,7 +144,7 @@ def merge_issues(chunk_results: list[list[dict]]) -> list[dict]:
 
 async def _run_chunks(task_id: str, chunks: list[str]) -> list[list[dict]]:
     rules = get_ai_rules()["proofread"]
-    semaphore = asyncio.Semaphore(int(rules.get("max_concurrency", 3)))
+    semaphore = asyncio.Semaphore(int(rules.get("max_concurrency", 2)))
 
     async def run_one(index: int, chunk: str) -> list[dict]:
         async with semaphore:

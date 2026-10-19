@@ -11,6 +11,7 @@ from pathlib import Path
 import pymupdf
 import pytest
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font
 from openpyxl.worksheet.pagebreak import Break
 
 from app.services.spreadsheet import normalize_spreadsheet, render_pdf
@@ -24,8 +25,11 @@ def _wide_sheet(path: Path, rows: int = 30, cols: int = 12) -> Path:
     for row in range(1, rows + 1):
         for col in range(1, cols + 1):
             sheet.cell(row=row, column=col, value=f"R{row}C{col}")
-    # 尾部留出空行空列，模拟学生表里常见的「幽灵区」
-    sheet.cell(row=rows + 20, column=cols + 10, value=None)
+    # 尾部留出空行空列，模拟学生表里常见的「幽灵区」。
+    # 只赋值 None 不会被写入文件，要带格式才会在加载后撑大 max_row/max_column
+    ghost = sheet.cell(row=rows + 20, column=cols + 10)
+    ghost.value = None
+    ghost.font = Font(bold=True)
     sheet.row_breaks.append(Break(id=10))
     workbook.save(path)
     return path
@@ -142,3 +146,30 @@ def test_字号太小自动放宽横向页数(tmp_path: Path) -> None:
     # 一直小：放宽到上限（默认 4 页宽）后仍交出一份 PDF，不抛错
     assert len(calls) == 4
     assert pdf.exists()
+
+
+def test_归一化带出每个表的末尾空行空列(tmp_path: Path) -> None:
+    source = _wide_sheet(tmp_path / "带空白区.xlsx", rows=30, cols=12)
+    stats: dict = {}
+
+    normalize_spreadsheet(source, tmp_path / "work", stats=stats)
+
+    sheet = stats["sheets"][0]
+    assert sheet["title"] == "汇总"
+    assert sheet["content_rows"] == 30
+    assert sheet["content_columns"] == 12
+    # _wide_sheet 在 50 行、22 列留了幽灵单元格
+    assert sheet["trailing_blank_rows"] == 20
+    assert sheet["trailing_blank_cols"] == 10
+
+
+def test_渲染结果带出实际中位字号与横向页数(tmp_path: Path) -> None:
+    source = _wide_sheet(tmp_path / "可读表.xlsx")
+    stats: dict = {}
+
+    render_pdf(source, tmp_path / "work", _fake_convert(11.0, []), stats=stats)
+
+    assert stats["fit_to_width_pages"] == 1
+    assert stats["print_font_pt"] == 11.0
+    assert stats["min_readable_font_pt"] > 0
+    assert stats["sheets"][0]["trailing_blank_rows"] == 20

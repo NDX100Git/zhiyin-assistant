@@ -99,6 +99,10 @@ def test_页边距与图片位置以厘米返回(sample_pdf):
     image = first["images"][0]
     assert image["width_cm"] > 0 and image["height_cm"] > 0
     assert image["x_cm"] > 0
+    # 图片像素宽高与按打印尺寸估算的有效分辨率
+    assert image["pixel_width"] == 120
+    assert image["pixel_height"] == 80
+    assert image["dpi"] is not None and image["dpi"] < 150
 
 
 def test_识别章节与参考文献条目(sample_pdf):

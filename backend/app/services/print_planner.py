@@ -2,6 +2,9 @@
 
 模型负责给出推荐方案与理由；纸张数与金额由服务端按 pricing.json 计算（单位：分），
 不让模型算钱。方案只作建议，学生可自行调整。
+
+AI 是可选能力：请求不传 use_ai 时按关闭处理，只用规则方案，不会静默调用模型花钱。
+报告同时给出「总页数 / 单面张数 / 双面张数」的可读换算。
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_ai_rules
 from app.services.doc_parser import get_cached_report, parse_document, save_report
+from app.services.format_rules_engine import sheet_count_info
 from app.services.llm import chat_json
 from app.services.pricing import unit_price_cents
 from app.utils.exceptions import BusinessError
@@ -162,7 +166,7 @@ def plan_print(db: Session, file_key: str, options: dict, force: bool = False) -
     reason = ""
     errors: list[str] = []
     recommend: dict | None = None
-    use_ai = bool(options.get("use_ai", True))
+    use_ai = bool(options.get("use_ai", False))
 
     if use_ai:
         try:
@@ -193,6 +197,7 @@ def plan_print(db: Session, file_key: str, options: dict, force: bool = False) -
         "options": options,
         "features": features,
         "recommend": final_recommend,
+        "sheet_info": sheet_count_info({"page_count": int(features["page_count"])}),
         "reason": reason or "按文档特征自动选择最省纸的打印方式。",
         **numbers,
         "from_model": recommend is not None and use_ai,

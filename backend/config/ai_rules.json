@@ -2,7 +2,7 @@
   "proofread": {
     "chunk_chars": 2500,
     "min_chunk_chars": 50,
-    "max_concurrency": 3,
+    "max_concurrency": 2,
     "max_chunks": 60
   },
   "print_plan": {
@@ -17,6 +17,5 @@
       85
     ]
   },
-  "_note": "分块并发要跟全局闸门对齐：校对任务数 2 乘 每个任务分块 2 正好等于 settings.llm_max_concurrency（默认 4），总量不超，登录与下单才不会被挤。改这里要同步改 .env 的 LLM_MAX_CONCURRENCY",
-  "max_concurrency": 2
+  "_note": "分块并发要跟全局闸门对齐：校对任务数 2 乘 每个任务的分块并发 2 正好等于 settings.llm_max_concurrency（默认 4），总量不超，登录与下单才不会被挤。proofread.max_concurrency 是每个校对任务内部的分块并发，不要与顶层混淆；改这里要同步改 .env 的 LLM_MAX_CONCURRENCY"
 }

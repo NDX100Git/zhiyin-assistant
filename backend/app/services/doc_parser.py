@@ -230,7 +230,12 @@ def convert_to_pdf(input_path: Path, out_dir: Path) -> Path:
     return convert_document(input_path, out_dir, target="pdf")
 
 
-def _ensure_pdf(local_path: Path, ext: str, work_dir: Path) -> tuple[Path, str | None]:
+def _ensure_pdf(
+    local_path: Path,
+    ext: str,
+    work_dir: Path,
+    spreadsheet_stats: dict | None = None,
+) -> tuple[Path, str | None]:
     """把上传文件变成可解析的 PDF，返回 (pdf 路径, 转换来源)。"""
     if ext == "pdf":
         return local_path, None
@@ -239,7 +244,10 @@ def _ensure_pdf(local_path: Path, ext: str, work_dir: Path) -> tuple[Path, str |
         sheet_path = local_path
         if ext == "xls":
             sheet_path = convert_document(local_path, work_dir, target="xlsx")
-        return render_pdf(sheet_path, work_dir, convert_to_pdf), ext
+        return (
+            render_pdf(sheet_path, work_dir, convert_to_pdf, stats=spreadsheet_stats),
+            ext,
+        )
     if ext in OFFICE_EXTS:
         return convert_to_pdf(local_path, work_dir), ext
     if ext in IMAGE_EXTS:
@@ -271,20 +279,39 @@ def _page_margins(pdf_page: fitz.Page) -> dict | None:
 
 
 def _page_images(pdf_page: fitz.Page) -> list[dict]:
-    """页面内图片的位置与尺寸（cm）。"""
+    """页面内图片的位置、尺寸（cm）与有效分辨率。
+
+    PDF 里存的是像素图，打印尺寸由排版决定。像素宽高除以实际打印尺寸才是
+    真正落到纸上的分辨率（DPI），体检规则据此报「图片分辨率过低」。
+    """
     images: list[dict] = []
     for image in pdf_page.get_images(full=True):
         xref = image[0]
+        pixel_width = int(image[2] or 0)
+        pixel_height = int(image[3] or 0)
         colorspace = str(image[5] or "")  # 用于判断是否含彩色图片
         for rect in pdf_page.get_image_rects(xref):
+            width_cm = _points_to_cm(rect.width)
+            height_cm = _points_to_cm(rect.height)
+            dpi: int | None = None
+            if pixel_width > 0 and pixel_height > 0 and width_cm > 0 and height_cm > 0:
+                dpi = round(
+                    min(
+                        pixel_width / (width_cm / 2.54),
+                        pixel_height / (height_cm / 2.54),
+                    )
+                )
             images.append(
                 {
                     "xref": xref,
                     "color": colorspace not in {"DeviceGray", "G", "1", ""},
                     "x_cm": _points_to_cm(rect.x0),
                     "y_cm": _points_to_cm(rect.y0),
-                    "width_cm": _points_to_cm(rect.width),
-                    "height_cm": _points_to_cm(rect.height),
+                    "width_cm": width_cm,
+                    "height_cm": height_cm,
+                    "pixel_width": pixel_width,
+                    "pixel_height": pixel_height,
+                    "dpi": dpi,
                 }
             )
     return images
@@ -477,8 +504,13 @@ def parse_document(db: Session, file_key: str, force: bool = False) -> dict:
     with tempfile.TemporaryDirectory(prefix="parse-", dir=RUNTIME_TMP_DIR) as tmp:
         work_dir = Path(tmp)
         local_path = get_storage().download_to_file(file_key, work_dir / f"source.{ext or 'bin'}")
-        pdf_path, converted_from = _ensure_pdf(local_path, ext, work_dir)
+        spreadsheet_stats: dict | None = {} if ext in SPREADSHEET_EXTS else None
+        pdf_path, converted_from = _ensure_pdf(
+            local_path, ext, work_dir, spreadsheet_stats
+        )
         report = parse_pdf(pdf_path)
+        if spreadsheet_stats:
+            report["spreadsheet"] = spreadsheet_stats
 
         report["file_key"] = file_key
         report["source"] = {

@@ -22,7 +22,7 @@ class PrintPlanOptions(BaseModel):
         default=None, description="single / handout_2in1 / handout_4in1"
     )
     paper_size: str | None = Field(default=None, description="纸张规格")
-    use_ai: bool = Field(default=True, description="false 时用规则方案，不调用大模型")
+    use_ai: bool = Field(default=False, description="默认 false，用规则方案不调用大模型；true 才走 AI")
 
 
 class PrintPlanRequest(BaseModel):

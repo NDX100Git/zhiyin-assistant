@@ -2,12 +2,15 @@
 
 只做可形式化的判断，不依赖模型，因此结论可直接作为高置信度问题写入体检报告。
 大模型负责语义层面的检查（参考文献著录、目录页码一致性等），两者在
-format_checker 中合并。规则数值全部来自 config/format_rules.json。
+format_checker 中合并。规则数值来自 config/format_rules.json；表格专属阈值
+（末尾空白、可读字号）在 config/spreadsheet_rules.json。
 """
 
 from __future__ import annotations
 
 import re
+
+from app.config import get_format_rules, get_spreadsheet_rules
 
 # 上边距容差放宽：页眉与标题的段前间距会把首行位置往下推，按文本块推算会偏大
 MARGIN_TOLERANCE_BY_EDGE = {"上": 1.0, "下": 0.5, "左": 0.5, "右": 0.5}
@@ -91,6 +94,63 @@ def image_overflow_issues(parsed: dict, rules: dict) -> list[dict]:
                     "打印时超出页边距的区域可能被裁切",
                 )
             )
+    return issues
+
+
+def _effective_dpi(image: dict) -> float | None:
+    """图片落到纸上的有效分辨率；缺像素或打印尺寸时返回 None（不误报）。"""
+    raw_dpi = image.get("dpi")
+    if raw_dpi is not None:
+        try:
+            dpi = float(raw_dpi)
+        except (TypeError, ValueError):
+            return None
+        return dpi if dpi > 0 else None
+
+    try:
+        pixel_width = float(image.get("pixel_width") or 0)
+        pixel_height = float(image.get("pixel_height") or 0)
+        width_cm = float(image.get("width_cm") or 0)
+        height_cm = float(image.get("height_cm") or 0)
+    except (TypeError, ValueError):
+        return None
+    if min(pixel_width, pixel_height, width_cm, height_cm) <= 0:
+        return None
+    return min(pixel_width / (width_cm / 2.54), pixel_height / (height_cm / 2.54))
+
+
+def image_resolution_issues(parsed: dict, rules: dict) -> list[dict]:
+    """图片分辨率过低：像素宽高按实际打印尺寸换算成 DPI，低于阈值才报。"""
+    min_dpi = (rules.get("image") or {}).get("min_dpi")
+    if not min_dpi:
+        min_dpi = (get_format_rules().get("image") or {}).get("min_dpi")
+    if not min_dpi:
+        return []
+    min_dpi = float(min_dpi)
+
+    issues: list[dict] = []
+    for page in parsed.get("pages", []):
+        worst: tuple[float, dict] | None = None
+        for image in page.get("images", []):
+            dpi = _effective_dpi(image)
+            if dpi is None:
+                continue
+            if worst is None or dpi < worst[0]:
+                worst = (dpi, image)
+        if worst is None or worst[0] >= min_dpi:
+            continue
+
+        issues.append(
+            _issue(
+                "layout",
+                "medium",
+                f"第 {page['index']} 页",
+                f"图片有效分辨率约 {round(worst[0], 1):g} DPI，低于打印阈值 {min_dpi:g} DPI",
+                "建议换用更高分辨率的原图，或缩小图片在页面上的尺寸",
+                "按图片像素宽高与实际打印尺寸估算；分辨率过低打印会发虚"
+                "（阈值来源 format_rules.json）",
+            )
+        )
     return issues
 
 
@@ -251,12 +311,108 @@ def typography_issues(parsed: dict, rules: dict) -> list[dict]:
     return issues
 
 
+def _sheet_limits(rules: dict) -> dict:
+    """表格规则阈值：配置文件打底，允许调用方用 rules["spreadsheet"] 覆盖。"""
+    limits = dict(get_spreadsheet_rules())
+    limits.update(rules.get("spreadsheet") or {})
+    return limits
+
+
+def trailing_blank_issues(parsed: dict, rules: dict) -> list[dict]:
+    """表格末尾大片空行空列：超出有效内容区域的部分超过阈值才报。"""
+    sheets = (parsed.get("spreadsheet") or {}).get("sheets") or []
+    if not sheets:
+        return []
+
+    limits = _sheet_limits(rules)
+    max_rows = int(limits.get("max_trailing_blank_rows") or 0)
+    max_cols = int(limits.get("max_trailing_blank_cols") or 0)
+    if max_rows <= 0 and max_cols <= 0:
+        return []
+
+    issues: list[dict] = []
+    for sheet in sheets:
+        rows = max(0, int(sheet.get("trailing_blank_rows") or 0))
+        cols = max(0, int(sheet.get("trailing_blank_cols") or 0))
+        if rows <= max_rows and cols <= max_cols:
+            continue
+
+        title = str(sheet.get("title") or "未命名")
+        issues.append(
+            _issue(
+                "layout",
+                "low",
+                f"工作表「{title}」",
+                f"表格有效区域之外还有 {rows} 个空行、{cols} 个空列",
+                "建议删除表格末尾多余的空行空列后重新上传，避免文件体积与打印区域判断受干扰",
+                f"规则阈值：空行不超过 {max_rows}、空列不超过 {max_cols}"
+                "（阈值来源 spreadsheet_rules.json）",
+            )
+        )
+    return issues
+
+
+def small_font_issues(parsed: dict, rules: dict) -> list[dict]:
+    """表格列太多导致打印字号过小：用归一版式后实际出纸的中位字号判断。"""
+    spreadsheet = parsed.get("spreadsheet") or {}
+    actual = spreadsheet.get("print_font_pt")
+    threshold = spreadsheet.get("min_readable_font_pt")
+    if threshold is None:
+        threshold = _sheet_limits(rules).get("min_readable_font_pt")
+    if actual is None or threshold is None:
+        return []
+    try:
+        actual_pt = float(actual)
+        threshold_pt = float(threshold)
+    except (TypeError, ValueError):
+        return []
+    if actual_pt >= threshold_pt:
+        return []
+
+    return [
+        _issue(
+            "typography",
+            "medium",
+            "全文",
+            f"表格打印时中位字号约 {actual_pt:g}pt，低于可读阈值 {threshold_pt:g}pt",
+            "建议减少列数或缩小列宽，也可以把一张表拆成几张后再打印",
+            "列数过多时缩到一页宽会把字压得过小，出纸后难以辨认"
+            "（阈值来源 spreadsheet_rules.json）",
+        )
+    ]
+
+
+def sheet_count_info(parsed: dict) -> dict:
+    """把总页数换算成单面、双面打印的张数，避免学生把页数当张数。"""
+    try:
+        page_count = int(parsed.get("page_count") or 0)
+    except (TypeError, ValueError):
+        page_count = 0
+
+    if page_count <= 0:
+        return {
+            "page_count": None,
+            "single_sided_sheets": None,
+            "double_sided_sheets": None,
+            "note": "页数未知，暂不换算纸张数。",
+        }
+    return {
+        "page_count": page_count,
+        "single_sided_sheets": page_count,
+        "double_sided_sheets": (page_count + 1) // 2,
+        "note": "总页数不等于纸张数：单面打印 1 页 1 张，双面打印 2 页 1 张。",
+    }
+
+
 def collect_facts(parsed: dict, rules: dict) -> list[dict]:
     """规则引擎产出的全部确定性事实。"""
     return [
         *blank_page_issues(parsed),
         *image_overflow_issues(parsed, rules),
+        *image_resolution_issues(parsed, rules),
         *margin_issues(parsed, rules),
         *structure_issues(parsed, rules),
         *typography_issues(parsed, rules),
+        *trailing_blank_issues(parsed, rules),
+        *small_font_issues(parsed, rules),
     ]
