@@ -35,6 +35,8 @@ from app.services.storage.base import FileStorage, StoredObject
 # 固定参考时间，用例不依赖真实时钟
 NOW = datetime(2026, 3, 1, 12, 0, 0)
 EXPIRED_AT = NOW - timedelta(hours=settings.file_expire_hours + 1)
+# 报告与文件同寿命：超过这个小时数才算「过了保留期」
+REPORT_EXPIRED_AT = NOW - timedelta(hours=settings.report_expire_hours + 1)
 FRESH_AT = NOW - timedelta(hours=1)
 
 _ORDER_SEQ = itertools.count(1)
@@ -178,7 +180,7 @@ def test_演练模式不真正删除文件(db_session, fake_storage):
         AiReport(
             file_key=key,
             report_json={"kind": "parse"},
-            created_at=NOW - timedelta(days=settings.report_retention_days + 1),
+            created_at=REPORT_EXPIRED_AT,
         )
     )
     db_session.flush()
@@ -216,21 +218,22 @@ def test_删除失败计入失败且下一轮仍能扫到(db_session, fake_stora
     assert key not in fake_storage.objects
 
 
-def test_超过保留天数的体检报告缓存被清理(db_session, fake_storage):
+def test_超过保留小时的体检报告缓存被清理(db_session, fake_storage):
+    """文件早就不在了（历史残留、人工删文件），过保留期就兜底清掉。"""
     old_key = "files/2026/02/report-old.pdf"
     fresh_key = "files/2026/03/report-fresh.pdf"
     db_session.add(
         AiReport(
             file_key=old_key,
             report_json={"kind": "parse"},
-            created_at=NOW - timedelta(days=settings.report_retention_days + 1),
+            created_at=REPORT_EXPIRED_AT,
         )
     )
     db_session.add(
         AiReport(
             file_key=fresh_key,
             report_json={"kind": "parse"},
-            created_at=NOW - timedelta(days=1),
+            created_at=NOW - timedelta(hours=1),
         )
     )
     db_session.flush()
@@ -446,3 +449,149 @@ def test_清理过期文件时同步删除上传记录(db_session, fake_storage)
     assert db_session.execute(
         select(UploadedFile).where(UploadedFile.file_key == key)
     ).scalar_one_or_none() is None
+
+
+# ---------------------------------------------------------------- 报告与文件同寿命
+
+
+def _add_report(db_session, file_key: str, created_at: datetime) -> AiReport:
+    """插入一条体检报告缓存行，只关心 file_key 与创建时间。"""
+    report = AiReport(file_key=file_key, report_json={"kind": "parse"}, created_at=created_at)
+    db_session.add(report)
+    db_session.flush()
+    return report
+
+
+def _report_keys(db_session) -> list[str]:
+    return [row.file_key for row in db_session.execute(select(AiReport)).scalars().all()]
+
+
+def test_文件过期清理时文件_上传记录_体检报告三者同轮一起没了(db_session, fake_storage):
+    """文件过了 72 小时又没人引用：文件、上传记录、对应报告一轮里全清掉。
+
+    报告本身还在自己的保留期内（一小时前生成），它消失的唯一原因只能是跟着文件走，
+    所以这条同时验证「同轮一起删」，而不是等下一轮报告清理。
+    """
+    key = "files/2026/02/triple.pdf"
+    fake_storage.put(key, EXPIRED_AT)
+    db_session.add(
+        UploadedFile(
+            user_id=1,
+            file_key=key,
+            file_name="三件套.pdf",
+            size=1024,
+            content_type="application/pdf",
+        )
+    )
+    _add_report(db_session, key, NOW - timedelta(hours=1))
+
+    stats = run_cleanup(db_session, fake_storage, now=NOW)
+
+    assert stats.deleted == 1
+    assert stats.reports_deleted == 1
+    assert fake_storage.deleted == [key]
+    assert key not in fake_storage.objects
+    assert db_session.execute(
+        select(UploadedFile).where(UploadedFile.file_key == key)
+    ).scalar_one_or_none() is None
+    assert _report_keys(db_session) == []
+
+
+def test_文件还在保留期内时报告不提前清(db_session, fake_storage):
+    """报告自己的创建时间早就过了 72 小时，但文件还在，报告就不能先走。"""
+    key = "files/2026/03/kept.pdf"
+    fake_storage.put(key, FRESH_AT)
+    _add_report(db_session, key, REPORT_EXPIRED_AT)
+
+    stats = run_cleanup(db_session, fake_storage, now=NOW)
+
+    assert stats.deleted == 0
+    assert stats.reports_deleted == 0
+    assert _report_keys(db_session) == [key]
+    assert key in fake_storage.objects
+
+
+def test_文件已不存在但报告残留时过保留小时后单独清掉(db_session, fake_storage):
+    """历史数据或人工删掉文件留下的报告，没有文件可跟，按同一保留期兜底清。"""
+    key = "files/2026/02/orphan-report.pdf"
+    _add_report(db_session, key, REPORT_EXPIRED_AT)
+
+    stats = run_cleanup(db_session, fake_storage, now=NOW)
+
+    assert stats.deleted == 0
+    assert stats.reports_deleted == 1
+    assert _report_keys(db_session) == []
+
+
+def test_文件已不存在但报告未过保留小时时留着(db_session, fake_storage):
+    """文件刚被人工删掉、报告还很新，等它过保留期再由兜底清理收走。"""
+    key = "files/2026/03/orphan-report-fresh.pdf"
+    _add_report(db_session, key, NOW - timedelta(hours=1))
+
+    stats = run_cleanup(db_session, fake_storage, now=NOW)
+
+    assert stats.reports_deleted == 0
+    assert _report_keys(db_session) == [key]
+
+
+def test_在途订单引用时文件与报告都不清(db_session, fake_storage):
+    """文件受在途保护，报告跟着文件留，不能因为自己老了就提前删。"""
+    key = "files/2026/02/in-flight-report.pdf"
+    fake_storage.put(key, EXPIRED_AT)
+    _add_order(db_session, key, STATUS_QUEUING)
+    _add_report(db_session, key, REPORT_EXPIRED_AT)
+
+    stats = run_cleanup(db_session, fake_storage, now=NOW)
+
+    assert stats.skipped == 1
+    assert stats.deleted == 0
+    assert stats.reports_deleted == 0
+    assert key in fake_storage.objects
+    assert _report_keys(db_session) == [key]
+
+
+def test_待确认换文件的新文件及其报告都不清(db_session, fake_storage):
+    """学生刚传、老师还没确认的新文件同样受保护，报告一起留着。"""
+    old_key = "files/2026/02/change-report-old.pdf"
+    new_key = "files/2026/02/change-report-new.pdf"
+    fake_storage.put(old_key, EXPIRED_AT)
+    fake_storage.put(new_key, EXPIRED_AT)
+    _add_report(db_session, new_key, REPORT_EXPIRED_AT)
+
+    order = _add_order(db_session, old_key, STATUS_QUEUING)
+    db_session.add(
+        OrderFileChange(
+            order_id=order.id,
+            status=CHANGE_PENDING,
+            pending_flag=1,
+            old_file_key=old_key,
+            new_file_key=new_key,
+            new_page_count=20,
+            new_amount_cents=300,
+        )
+    )
+    db_session.flush()
+
+    stats = run_cleanup(db_session, fake_storage, now=NOW)
+
+    assert stats.deleted == 0
+    assert stats.pending_protected == 1
+    assert stats.reports_deleted == 0
+    assert new_key in fake_storage.objects
+    assert _report_keys(db_session) == [new_key]
+
+
+def test_文件删除失败时报告跟着留着(db_session, fake_storage):
+    """对象没删掉，报告也不能单独删，否则又会变成「文件在、报告没了」。"""
+    key = "files/2026/02/delete-failed-report.pdf"
+    fake_storage.put(key, EXPIRED_AT)
+    fake_storage.fail_keys.add(key)
+    _add_report(db_session, key, REPORT_EXPIRED_AT)
+
+    stats = run_cleanup(db_session, fake_storage, now=NOW)
+
+    assert stats.failed == 1
+    assert stats.deleted == 0
+    assert stats.reports_deleted == 0
+    assert key in fake_storage.objects
+    assert _report_keys(db_session) == [key]

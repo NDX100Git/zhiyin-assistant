@@ -86,8 +86,6 @@ class Settings(BaseSettings):
     order_file_grace_hours: int = 48
     # 异常单引用的文件额外保留天数。异常单没有自动超时，不设上限会无限期占空间
     abnormal_file_grace_days: int = 3
-    # 体检报告缓存（ai_reports）的保留天数，过期由定时任务清理
-    report_retention_days: int = 7
     signed_url_expire_minutes: int = 30
 
     # 定时清理。默认开启；测试环境通过 CLEANUP_ENABLED=false 关掉，避免后台任务干扰用例
@@ -129,6 +127,15 @@ class Settings(BaseSettings):
                 f"当前为 {self.file_expire_hours} 与 {self.order_file_grace_hours}"
             )
         return self
+
+    @property
+    def report_expire_hours(self) -> int:
+        """体检报告缓存（ai_reports）的保留小时数。
+
+        产品口径：报告跟它对应的上传文件同寿命、同步删除，所以这里不另设独立
+        常量，直接取 file_expire_hours。两处各写一个数字迟早会打架。
+        """
+        return self.file_expire_hours
 
     @property
     def database_url(self) -> str:

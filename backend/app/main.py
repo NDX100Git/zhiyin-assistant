@@ -39,10 +39,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     if settings.cleanup_enabled:
         cleanup_task = asyncio.create_task(cleanup_loop(), name="cleanup-loop")
         logger.info(
-            "定时清理已启用，间隔 %d 分钟，文件保留 %d 小时，报告保留 %d 天",
+            "定时清理已启用，间隔 %d 分钟，文件保留 %d 小时，体检报告与文件同寿命（%d 小时，同轮一起删）",
             settings.cleanup_interval_minutes,
             settings.file_expire_hours,
-            settings.report_retention_days,
+            settings.report_expire_hours,
         )
     else:
         logger.info("定时清理已关闭（CLEANUP_ENABLED=false）")

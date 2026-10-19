@@ -4,7 +4,11 @@
 1. 上传文件：对象存储中超过 FILE_EXPIRE_HOURS 的文件会被删除，但只要还有
    未完结订单引用该文件就跳过。未完结指状态不是「已完成」也不是「已取消」，
    包含待支付 / 排队中 / 打印中 / 待取件 / 异常，宁可少删也不能删掉在途文件。
-2. 体检报告：ai_reports 中超过 REPORT_RETENTION_DAYS 的缓存行会被删除。
+2. 体检报告（ai_reports）：与文件同寿命，跟着文件走，不单独按天数清。
+   - 文件被删掉的那一轮，同一 file_key 的报告缓存一起删，不等下一轮；
+   - 文件还在（含在途保护而留下的）就跟着留，不提前删；
+   - 文件已不存在但报告残留（历史数据、人工删了文件）时，按
+     report_expire_hours（即 file_expire_hours）兜底清掉，不留垃圾。
 
 对外入口是 run_cleanup(db, storage, now=None, dry_run=False)，纯函数式、便于单测；
 后台调度由 cleanup_loop() 负责，单轮异常只记日志，不让任务静默死掉。
@@ -54,7 +58,7 @@ class CleanupStats:
     skipped: int = 0           # 因未完结订单引用而跳过的文件数
     failed: int = 0            # 删除失败的文件数，下一轮会重新扫到
     not_expired: int = 0       # 仍在保留期内、本轮不处理的文件数
-    reports_deleted: int = 0   # 删除（或将会删除）的体检报告缓存行数
+    reports_deleted: int = 0   # 删除（或将会删除）的体检报告缓存行数，含随文件同删与残留兜底两块
     pending_protected: int = 0 # 因待老师确认的换文件请求而跳过的文件数
     dry_run: bool = False
 
@@ -138,14 +142,50 @@ def _load_pending_file_keys(db: Session, keys: list[str]) -> set[str]:
     return pending
 
 
+def _delete_reports_of_file(
+    db: Session,
+    file_key: str,
+    dry_run: bool,
+    stats: CleanupStats,
+) -> int:
+    """删除某一份文件的体检报告缓存，返回删除（或演练时将会删除）的行数。
+
+    文件与报告必须同轮一起走：只删文件会把报告留成孤儿，下一轮虽然能兜底，
+    但中间这段时间学生若还在看报告页就会拿到一份已经取不到文件的报告。
+    """
+    if dry_run:
+        count = db.execute(
+            select(func.count())
+            .select_from(AiReport)
+            .where(AiReport.file_key == file_key)
+        ).scalar_one()
+        stats.reports_deleted += int(count)
+        return int(count)
+
+    result = db.execute(
+        delete(AiReport)
+        .where(AiReport.file_key == file_key)
+        .execution_options(synchronize_session=False)
+    )
+    removed = int(result.rowcount or 0)
+    stats.reports_deleted += removed
+    return removed
+
+
 def _cleanup_files(
     db: Session,
     storage: FileStorage,
     now: datetime,
     dry_run: bool,
     stats: CleanupStats,
-) -> None:
-    """删除超过保留期且没有未完结订单引用的上传文件。"""
+) -> set[str] | None:
+    """删除超过保留期且没有未完结订单引用的上传文件。
+
+    返回本轮对象存储里列出的 file_key 集合：报告清理靠它区分「跟文件走」与
+    「文件早已不在的残留」。本轮被删掉的文件也在里面，免得报告兜底再算一遍。
+    列举对象失败时返回 None，调用方据此跳过残留报告清理，否则会把文件其实
+    还在的报告误删掉。
+    """
     cutoff = now - timedelta(hours=settings.file_expire_hours)
     abnormal_cutoff = cutoff - timedelta(days=settings.abnormal_file_grace_days)
     try:
@@ -154,13 +194,14 @@ def _cleanup_files(
         # 列不出来就无法判断谁过期，计入失败并跳过本轮文件清理，下一轮重试
         stats.failed += 1
         logger.exception("列出对象存储文件失败，本轮跳过文件清理")
-        return
+        return None
 
+    listed_keys = {obj.key for obj in objects}
     stats.scanned = len(objects)
     expired = [obj for obj in objects if _as_local_naive(obj.last_modified) <= cutoff]
     stats.not_expired = stats.scanned - len(expired)
     if not expired:
-        return
+        return listed_keys
 
     references = _load_order_statuses(db, [obj.key for obj in expired])
     # 还没确认的新文件不能被清掉：学生可能刚传完，老师还没来得及点确认
@@ -193,7 +234,8 @@ def _cleanup_files(
 
         if dry_run:
             stats.deleted += 1
-            logger.info("[演练] 将删除过期文件 %s", obj.key)
+            reports = _delete_reports_of_file(db, obj.key, dry_run=True, stats=stats)
+            logger.info("[演练] 将删除过期文件 %s 及其 %d 条体检报告缓存", obj.key, reports)
             continue
 
         try:
@@ -210,8 +252,12 @@ def _cleanup_files(
             .where(UploadedFile.file_key == obj.key)
             .execution_options(synchronize_session=False)
         )
+        # 报告跟文件同寿命：文件这一轮走的，报告同一轮走，不等下一轮
+        reports = _delete_reports_of_file(db, obj.key, dry_run=False, stats=stats)
         stats.deleted += 1
-        logger.info("已删除过期文件 %s", obj.key)
+        logger.info("已删除过期文件 %s，同时删除体检报告缓存 %d 条", obj.key, reports)
+
+    return listed_keys
 
 
 def _cleanup_reports(
@@ -219,28 +265,42 @@ def _cleanup_reports(
     now: datetime,
     dry_run: bool,
     stats: CleanupStats,
+    listed_keys: set[str] | None,
 ) -> None:
-    """删除超过保留天数的体检报告缓存行。"""
-    cutoff = now - timedelta(days=settings.report_retention_days)
+    """兜底清理「文件已不在、报告还在」的残留报告缓存。
 
-    if dry_run:
-        count = db.execute(
-            select(func.count())
-            .select_from(AiReport)
-            .where(AiReport.created_at < cutoff)
-        ).scalar_one()
-        stats.reports_deleted = int(count)
-        logger.info("[演练] 将删除 %d 条过期体检报告缓存", count)
+    文件还在的报告一律不动：报告跟文件同寿命，文件因为保留期或异常单宽限还留着时，
+    报告也不能先走。判断依据是本轮对象存储里列出的 key（含本轮刚删掉的文件，
+    它们的报告已经同轮删过），所以列对象失败时必须跳过。
+    """
+    if listed_keys is None:
+        logger.info("对象存储未列出，本轮跳过残留体检报告清理")
         return
 
-    result = db.execute(
-        delete(AiReport)
-        .where(AiReport.created_at < cutoff)
-        .execution_options(synchronize_session=False)
-    )
-    stats.reports_deleted = int(result.rowcount or 0)
-    if stats.reports_deleted:
-        logger.info("已删除 %d 条过期体检报告缓存", stats.reports_deleted)
+    cutoff = now - timedelta(hours=settings.report_expire_hours)
+    rows = db.execute(
+        select(AiReport.id, AiReport.file_key).where(AiReport.created_at < cutoff)
+    ).all()
+    orphan_ids = [row.id for row in rows if row.file_key not in listed_keys]
+    if not orphan_ids:
+        return
+
+    if dry_run:
+        stats.reports_deleted += len(orphan_ids)
+        logger.info("[演练] 将删除 %d 条残留体检报告缓存（对应文件已不在）", len(orphan_ids))
+        return
+
+    removed = 0
+    for start in range(0, len(orphan_ids), ORDER_QUERY_CHUNK):
+        chunk = orphan_ids[start:start + ORDER_QUERY_CHUNK]
+        result = db.execute(
+            delete(AiReport)
+            .where(AiReport.id.in_(chunk))
+            .execution_options(synchronize_session=False)
+        )
+        removed += int(result.rowcount or 0)
+    stats.reports_deleted += removed
+    logger.info("已删除 %d 条残留体检报告缓存（对应文件已不在）", removed)
 
 
 def run_cleanup(
@@ -256,11 +316,22 @@ def run_cleanup(
     """
     reference = _as_local_naive(now or datetime.now())
     stats = CleanupStats(dry_run=dry_run)
+    logger.info(
+        "清理开始（%s）：文件保留 %d 小时，体检报告与文件同寿命（%d 小时）",
+        "演练" if dry_run else "实跑",
+        settings.file_expire_hours,
+        settings.report_expire_hours,
+    )
 
-    _cleanup_files(db, storage, reference, dry_run, stats)
-    _cleanup_reports(db, reference, dry_run, stats)
+    listed_keys = _cleanup_files(db, storage, reference, dry_run, stats)
+    _cleanup_reports(db, reference, dry_run, stats, listed_keys)
 
-    logger.info("清理完成：%s", stats.as_dict())
+    logger.info(
+        "清理完成：删除文件 %d 个，删除体检报告 %d 条，%s",
+        stats.deleted,
+        stats.reports_deleted,
+        stats.as_dict(),
+    )
     return stats
 
 
