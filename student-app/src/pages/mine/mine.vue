@@ -1,5 +1,12 @@
 <template>
   <view class="page" :class="uiThemeClass">
+    <!-- #ifdef H5 -->
+    <view class="pull-refresh" :style="{ height: pullOffset + 'px' }">
+      <text class="pull-refresh-text">
+        {{ pullRefreshing ? '正在刷新…' : (pullOffset >= pullThreshold ? '松开刷新' : '下拉刷新') }}
+      </text>
+    </view>
+    <!-- #endif -->
     <view class="card profile">
       <view class="avatar">{{ initial }}</view>
       <view class="profile-main">
@@ -48,12 +55,13 @@
 </template>
 
 <script setup>
-import { onHide, onShow } from '@dcloudio/uni-app'
+import { onHide, onPullDownRefresh, onShow } from '@dcloudio/uni-app'
 import { computed, onUnmounted, ref } from 'vue'
 import { POLL_INTERVAL } from '@/config'
 import { request } from '@/services/api'
 import { ensureLogin, getCurrentUser } from '@/services/auth'
 import { createPoller, notify, notifyError } from '@/services/notify'
+import { usePullRefresh } from '@/ui/pullRefresh'
 import { useUiTheme } from '@/ui/theme'
 
 const tabs = [
@@ -108,6 +116,29 @@ onShow(async () => {
 })
 onHide(() => poller.stop())
 onUnmounted(() => poller.stop())
+
+/**
+ * 轮询改成 30 秒后，下拉刷新是学生主动查看最新状态的主路径。
+ * 小程序端由页面配置派发 onPullDownRefresh，H5 端由 usePullRefresh 的手势兜底。
+ */
+async function refreshOrders() {
+  try {
+    await ensureLogin()
+    await load()
+  } catch (error) {
+    notifyError(error)
+  } finally {
+    uni.stopPullDownRefresh()
+  }
+}
+
+onPullDownRefresh(refreshOrders)
+
+const {
+  offset: pullOffset,
+  refreshing: pullRefreshing,
+  threshold: pullThreshold,
+} = usePullRefresh(refreshOrders)
 
 function selectTab(value) {
   status.value = value
@@ -176,6 +207,22 @@ function openDetail(id) {
   background-image: var(--zi-bg-image);
   color: var(--zi-ink);
 }
+/* H5 下拉提示：撑开的高度由手势位移决定，松手后收回 */
+.pull-refresh {
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  overflow: hidden;
+  margin: -24rpx -24rpx 8rpx;
+}
+.pull-refresh-text {
+  padding-bottom: 8rpx;
+  color: var(--zi-muted);
+  font-size: 24rpx;
+  font-weight: 700;
+  letter-spacing: 1rpx;
+}
+
 .card {
   margin-bottom: 20rpx;
   padding: 26rpx;

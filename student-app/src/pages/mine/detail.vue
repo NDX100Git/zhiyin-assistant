@@ -1,10 +1,20 @@
 <template>
   <view class="page" :class="uiThemeClass">
+    <!-- #ifdef H5 -->
+    <view class="pull-refresh" :style="{ height: pullOffset + 'px' }">
+      <text class="pull-refresh-text">
+        {{ pullRefreshing ? '正在刷新…' : (pullOffset >= pullThreshold ? '松开刷新' : '下拉刷新') }}
+      </text>
+    </view>
+    <!-- #endif -->
     <view v-if="!order" class="card loading">加载中…</view>
     <template v-else>
       <view class="hero">
         <view class="hero-slash"></view>
         <view class="status"><text class="status-text">{{ order.status_label }}</text></view>
+        <view v-if="fileChange" class="pending-flag">
+          <text class="pending-flag-text">文件待确认</text>
+        </view>
         <view class="code-block">
           <text class="code">{{ order.pickup_code }}</text>
         </view>
@@ -26,6 +36,22 @@
         <view v-if="order.cancel_reason" class="row"><text class="k">取消原因</text><text class="v">{{ order.cancel_reason }}</text></view>
       </view>
 
+      <view v-if="fileChange" class="card change-card">
+        <view class="card-head">
+          <view class="title-mark"></view>
+          <text class="card-title">换文件待老师确认</text>
+        </view>
+        <view class="row"><text class="k">变更编号</text><text class="v">#{{ fileChange.change_id }}</text></view>
+        <view class="row"><text class="k">新文件</text><text class="v">{{ fileChange.new_file_name || '新文件' }}</text></view>
+        <view class="row"><text class="k">新页数</text><text class="v">{{ fileChange.new_page_count }} 页</text></view>
+        <view class="row"><text class="k">新金额</text><text class="v money">{{ formatMoney(fileChange.new_amount_cents) }}</text></view>
+        <view class="row"><text class="k">提交时间</text><text class="v">{{ formatTime(fileChange.submitted_at) }}</text></view>
+        <view v-if="fileChange.reason" class="row"><text class="k">变更原因</text><text class="v">{{ fileChange.reason }}</text></view>
+        <text class="change-tip">
+          老师确认前仍按原文件与原金额处理。确认后取件码不变，订单排到队尾重新排队，金额差额在取件时现场结清（多付部分不退）。
+        </text>
+      </view>
+
       <view class="card">
         <view class="card-head">
           <view class="title-mark"></view>
@@ -45,6 +71,7 @@
       <view class="actions">
         <button v-if="order.status === 'pending_pay'" class="primary" @click="pay">模拟支付</button>
         <button v-if="order.status === 'pending_pay' || order.status === 'queuing'" class="ghost" @click="cancel">取消订单</button>
+        <button class="ghost" :class="{ locked: !canReplace }" @click="onReplace">换文件</button>
         <button class="ghost" @click="goOrder">再来一单</button>
       </view>
     </template>
@@ -52,12 +79,13 @@
 </template>
 
 <script setup>
-import { onHide, onLoad, onShow } from '@dcloudio/uni-app'
+import { onHide, onLoad, onPullDownRefresh, onShow } from '@dcloudio/uni-app'
 import { computed, onUnmounted, ref } from 'vue'
 import { POLL_INTERVAL } from '@/config'
 import { request } from '@/services/api'
 import { ensureLogin } from '@/services/auth'
 import { createPoller, notify, notifyError } from '@/services/notify'
+import { usePullRefresh } from '@/ui/pullRefresh'
 import { useUiTheme } from '@/ui/theme'
 
 const order = ref(null)
@@ -66,6 +94,29 @@ const { uiThemeClass } = useUiTheme()
 let visible = false
 
 const isActive = computed(() => order.value && ['queuing', 'printing'].includes(order.value.status))
+
+/** 待老师确认的换文件申请；没有时为 null。 */
+const fileChange = computed(() => (order.value && order.value.file_change) || null)
+
+/** 允许换文件的状态：待支付直接生效，排队中与异常单走老师确认。 */
+const REPLACEABLE = ['pending_pay', 'queuing', 'abnormal']
+
+const canReplace = computed(
+  () => !!order.value && REPLACEABLE.includes(order.value.status) && !fileChange.value,
+)
+
+const replaceBlockedReason = computed(() => {
+  if (!order.value) return ''
+  if (fileChange.value) return '已有一份换文件申请等老师确认，确认后才能再换。'
+  return (
+    {
+      printing: '文件正在打印，不能再换。确实传错了请到文印室联系老师处理。',
+      ready: '文件已经打印完成，不能再换文件。',
+      completed: '订单已完成，不能再换文件。',
+      cancelled: '订单已取消，不能再换文件。',
+    }[order.value.status] || '当前订单状态不能换文件。'
+  )
+})
 
 const timeline = computed(() => {
   const current = order.value ? order.value.status : ''
@@ -151,6 +202,44 @@ function cancel() {
   })
 }
 
+/**
+ * 下拉刷新：小程序端由页面配置派发 onPullDownRefresh，H5 端由 usePullRefresh 的手势兜底。
+ * 轮询是 30 秒一次，学生想马上看老师确认结果时用下拉。
+ */
+async function refreshOrder() {
+  try {
+    await ensureLogin()
+    await load()
+  } catch (error) {
+    notifyError(error)
+  } finally {
+    uni.stopPullDownRefresh()
+  }
+}
+
+onPullDownRefresh(refreshOrder)
+
+const {
+  offset: pullOffset,
+  refreshing: pullRefreshing,
+  threshold: pullThreshold,
+} = usePullRefresh(refreshOrder)
+
+/** 不能换时给明确原因，而不是把入口藏起来让人猜。 */
+function onReplace() {
+  if (!order.value) return
+  if (canReplace.value) {
+    uni.navigateTo({ url: `/pages/mine/replace?id=${orderId.value}` })
+    return
+  }
+  uni.showModal({
+    title: '不能换文件',
+    content: replaceBlockedReason.value,
+    showCancel: false,
+    confirmText: '知道了',
+  })
+}
+
 function goOrder() {
   uni.switchTab({ url: '/pages/order/order' })
 }
@@ -180,6 +269,22 @@ function goOrder() {
   text-align: center;
   color: var(--zi-muted);
   font-size: 26rpx;
+}
+
+/* H5 下拉提示：撑开的高度由手势位移决定，松手后收回 */
+.pull-refresh {
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  overflow: hidden;
+  margin: -24rpx -24rpx 8rpx;
+}
+.pull-refresh-text {
+  padding-bottom: 8rpx;
+  color: var(--zi-muted);
+  font-size: 24rpx;
+  font-weight: 700;
+  letter-spacing: 1rpx;
 }
 
 /* 取件码主视觉：一眼看到码，再看到状态与提示 */
@@ -260,6 +365,36 @@ function goOrder() {
   margin-top: 26rpx;
   padding-top: 20rpx;
   border-top: 2rpx solid var(--zi-hero-line);
+}
+
+/* 有换文件申请待确认时，在取件码上方挂一个告示，避免学生以为已经生效 */
+.pending-flag {
+  position: relative;
+  z-index: 1;
+  margin-top: 18rpx;
+  padding: 6rpx 16rpx;
+  border: 3rpx solid var(--zi-warn);
+  background: var(--zi-warn-bg);
+}
+.pending-flag-text {
+  color: var(--zi-warn);
+  font-size: 24rpx;
+  font-weight: 800;
+  letter-spacing: 1rpx;
+}
+
+/* 换文件待确认卡片：与订单信息卡区分开，靠左侧提示条 */
+.change-card {
+  border-left: 8rpx solid var(--zi-warn);
+}
+.change-tip {
+  display: block;
+  margin-top: 16rpx;
+  padding-top: 14rpx;
+  border-top: 2rpx solid var(--zi-line);
+  color: var(--zi-muted);
+  font-size: 24rpx;
+  line-height: 1.6;
 }
 .queue {
   display: block;
@@ -381,12 +516,14 @@ function goOrder() {
 
 .actions {
   display: flex;
+  flex-wrap: wrap;
   padding-bottom: 8rpx;
   gap: 16rpx;
 }
 .primary,
 .ghost {
-  flex: 1;
+  flex: 1 1 44%;
+  min-width: 0;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -399,6 +536,11 @@ function goOrder() {
   font-weight: 800;
   line-height: 1.2;
   letter-spacing: 2rpx;
+}
+.ghost.locked {
+  border-style: dashed;
+  border-color: var(--zi-line-strong);
+  color: var(--zi-muted);
 }
 .primary {
   background: var(--zi-primary-bg);

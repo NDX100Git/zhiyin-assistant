@@ -24,6 +24,18 @@ export const recoverOrder = (orderId) => http.post(`/api/admin/order/${orderId}/
 export const cancelAbnormal = (orderId, reason) =>
   http.post(`/api/admin/order/${orderId}/cancel`, { reason })
 
+/**
+ * 确认或驳回学生提交的换文件申请。
+ * amountCents 是老师确认后的最终价（分）；不传则按系统重算价落库。
+ */
+export const confirmFileChange = (orderId, approve, amountCents) =>
+  http.post(`/api/admin/order/${orderId}/confirm-file-change`, {
+    approve,
+    ...(amountCents === undefined || amountCents === null
+      ? {}
+      : { amount_cents: amountCents }),
+  })
+
 export const fetchSessions = (date) => http.get('/api/admin/sessions', { params: { date } })
 export const closeSession = (date, session) =>
   http.post('/api/admin/session/close', { date, session })

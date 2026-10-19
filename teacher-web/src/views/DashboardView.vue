@@ -48,7 +48,7 @@
 
     <div class="page-card table-card">
       <div class="table-head">
-        <div>接单队列 <span class="muted">（按订单号排序，每 5 秒自动刷新）</span></div>
+        <div>接单队列 <span class="muted">（每 5 秒自动刷新，确认换文件后该单排到队尾）</span></div>
         <div>
           <el-button
             type="warning"
@@ -88,6 +88,9 @@
         <el-table-column label="状态" width="100">
           <template #default="{ row }">
             <el-tag :type="statusType(row.status)" effect="light">{{ row.status_label }}</el-tag>
+            <div v-if="row.file_change" class="status-flag">
+              <el-tag type="warning" effect="dark" size="small">文件待确认</el-tag>
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="金额" width="100">
@@ -99,6 +102,14 @@
         </el-table-column>
         <el-table-column label="操作" width="280" fixed="right">
           <template #default="{ row }">
+            <el-button
+              v-if="row.file_change"
+              link
+              type="warning"
+              @click="openFileChange(row)"
+            >
+              确认换文件
+            </el-button>
             <el-button link type="primary" @click="download(row)">下载</el-button>
             <el-button v-if="row.status === 'queuing'" link type="primary" @click="start(row)">
               开始打印
@@ -132,7 +143,12 @@
         <div v-for="row in orders" :key="row.id" class="order-card">
           <div class="oc-head">
             <span class="oc-code">{{ row.pickup_code }}</span>
-            <el-tag :type="statusType(row.status)" effect="light">{{ row.status_label }}</el-tag>
+            <div class="oc-tags">
+              <el-tag v-if="row.file_change" type="warning" effect="dark" size="small">
+                文件待确认
+              </el-tag>
+              <el-tag :type="statusType(row.status)" effect="light">{{ row.status_label }}</el-tag>
+            </div>
           </div>
           <div class="oc-line muted">{{ row.order_no }} · {{ fileFormatter(row) }}</div>
           <div class="oc-line">
@@ -143,7 +159,19 @@
             <span class="money">{{ yuan(row.amount_cents) }}</span>
             <span class="muted">{{ row.paid ? '已支付' : '待收款' }}</span>
           </div>
+          <div v-if="row.file_change" class="oc-change">
+            <span class="oc-change-title">新文件待确认</span>
+            <span>{{ row.file_change.new_file_name || '未命名' }}</span>
+            <span>
+              {{ row.file_change.new_page_count }} 页 ·
+              {{ yuan(row.file_change.new_amount_cents) }}
+            </span>
+            <span v-if="row.file_change.reason">原因：{{ row.file_change.reason }}</span>
+          </div>
           <div class="oc-actions">
+            <el-button v-if="row.file_change" size="large" type="warning" @click="openFileChange(row)">
+              确认换文件
+            </el-button>
             <el-button size="large" @click="download(row)">下载</el-button>
             <el-button v-if="row.status === 'queuing'" size="large" type="primary" @click="start(row)">
               开始打印
@@ -173,6 +201,70 @@
         <el-empty v-if="!loading && orders.length === 0" description="没有订单" />
       </div>
     </div>
+
+    <el-dialog
+      v-model="fileChangeDialog.visible"
+      title="确认换文件"
+      class="file-change-dialog"
+      :width="isMobile ? '92%' : '520px'"
+    >
+      <div v-if="fileChangeDialog.order && fileChangeDialog.change">
+        <el-descriptions :column="1" size="small" label-width="88" border>
+          <el-descriptions-item label="订单号">
+            {{ fileChangeDialog.order.order_no }}
+          </el-descriptions-item>
+          <el-descriptions-item label="原文件">
+            {{ fileChangeDialog.change.old_file_name || fileFormatter(fileChangeDialog.order) }} ·
+            {{ fileChangeDialog.change.old_page_count ?? fileChangeDialog.order.page_count }} 页 ·
+            {{ yuan(fileChangeDialog.change.old_amount_cents ?? fileChangeDialog.order.amount_cents) }}
+          </el-descriptions-item>
+          <el-descriptions-item label="新文件">
+            {{ fileChangeDialog.change.new_file_name || '未命名' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="新页数">
+            {{ fileChangeDialog.change.new_page_count }} 页
+          </el-descriptions-item>
+          <el-descriptions-item label="系统重算价">
+            <span class="money">{{ yuan(fileChangeDialog.change.new_amount_cents) }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item v-if="fileChangeDialog.change.reason" label="学生原因">
+            {{ fileChangeDialog.change.reason }}
+          </el-descriptions-item>
+          <el-descriptions-item label="提交时间">
+            {{ formatTime(fileChangeDialog.change.submitted_at) }}
+          </el-descriptions-item>
+        </el-descriptions>
+        <div class="dialog-tip">
+          通过后按下面的最终价落库，订单排到队尾重新排队，取件码不变；异常单同时恢复为排队中。
+          新价高于已付时差额在取件时现场收取，低于已付时多付部分不退。
+        </div>
+        <el-input-number
+          v-model="fileChangeDialog.yuan"
+          :min="0"
+          :precision="2"
+          :step="5"
+          style="width: 100%"
+        />
+        <div class="dialog-tip">最终价（元），提交时转换为分</div>
+      </div>
+      <template #footer>
+        <el-button @click="fileChangeDialog.visible = false">取消</el-button>
+        <el-button
+          type="danger"
+          :loading="fileChangeDialog.loading"
+          @click="submitFileChange(false)"
+        >
+          驳回
+        </el-button>
+        <el-button
+          type="primary"
+          :loading="fileChangeDialog.loading"
+          @click="submitFileChange(true)"
+        >
+          通过
+        </el-button>
+      </template>
+    </el-dialog>
 
     <el-dialog v-model="completeDialog.visible" title="打印完成" :width="isMobile ? '92%' : '420px'">
       <div v-if="completeDialog.order">
@@ -251,6 +343,7 @@ import {
   batchComplete,
   cancelAbnormal as cancelAbnormalApi,
   completePrint,
+  confirmFileChange,
   downloadUrl,
   fetchQueue,
   fetchQuote,
@@ -300,11 +393,25 @@ const completeDialog = reactive({
 })
 const verifyDialog = reactive({ visible: false, order: null, loading: false })
 const abnormalDialog = reactive({ visible: false, order: null, reason: '', loading: false })
+/** 换文件确认弹窗：change 是队列项里的 file_change，未确认前一直跟着订单走。 */
+const fileChangeDialog = reactive({
+  visible: false,
+  order: null,
+  change: null,
+  yuan: 0,
+  loading: false,
+})
 
 let timer = null
 
 function yuan(cents) {
   return `¥${((Number(cents) || 0) / 100).toFixed(2)}`
+}
+
+/** 后端时间串带 T，表格与弹窗里统一换成 年-月-日 时:分。 */
+function formatTime(value) {
+  if (!value) return ''
+  return String(value).replace('T', ' ').slice(0, 16)
 }
 
 function statusType(status) {
@@ -469,8 +576,7 @@ async function submitAbnormal() {
   }
 }
 
-async function recover(row) {
-  await ElMessageBox.confirm('确认异常已处理，恢复排队？', '恢复排队', {
+async function recover(row) {  await ElMessageBox.confirm('确认异常已处理，恢复排队？', '恢复排队', {
     confirmButtonText: '恢复',
     cancelButtonText: '取消',
   })
@@ -488,6 +594,45 @@ async function closeAbnormal(row) {
   await cancelAbnormalApi(row.id, value)
   ElMessage.success('异常单已关闭')
   refreshAll()
+}
+
+/** 打开确认弹窗：默认按系统重算价，老师可改最终价。 */
+function openFileChange(row) {
+  if (!row.file_change) return
+  fileChangeDialog.order = row
+  fileChangeDialog.change = row.file_change
+  fileChangeDialog.yuan = (Number(row.file_change.new_amount_cents) || 0) / 100
+  fileChangeDialog.visible = true
+}
+
+async function submitFileChange(approve) {
+  const order = fileChangeDialog.order
+  if (!order) return
+  fileChangeDialog.loading = true
+  try {
+    const cents = Math.round(Number(fileChangeDialog.yuan) * 100)
+    const result = await confirmFileChange(
+      order.id,
+      approve,
+      approve ? cents : undefined,
+    )
+    if (!approve) {
+      ElMessage.success('已驳回，订单保持原文件与原金额')
+    } else if (Number(result.supplement_cents) > 0) {
+      ElMessage.success(
+        `已通过，订单按 ${yuan(result.amount_cents ?? cents)} 排到队尾，取件时现场补收 ${yuan(
+          result.supplement_cents,
+        )}`,
+      )
+    } else {
+      ElMessage.success(`已通过，订单按 ${yuan(result.amount_cents ?? cents)} 排到队尾`)
+    }
+    fileChangeDialog.visible = false
+    // 通过后该单会出现在队尾，重新拉队列与统计
+    await refreshAll()
+  } finally {
+    fileChangeDialog.loading = false
+  }
 }
 
 async function submitBatchComplete() {
@@ -613,10 +758,38 @@ document.addEventListener('visibilitychange', () => {
 }
 .oc-head {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
   gap: 8px;
   margin-bottom: 8px;
+}
+.status-flag {
+  margin-top: 4px;
+}
+.oc-tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.oc-change {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-left: 4px solid var(--zi-warn);
+  background: var(--zi-warn-bg);
+  color: var(--zi-warn);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.oc-change span {
+  display: block;
+  word-break: break-all;
+}
+.oc-change-title {
+  font-weight: 900;
+  letter-spacing: 0.04em;
 }
 .oc-code {
   font-family: Menlo, Consolas, monospace;
@@ -624,7 +797,8 @@ document.addEventListener('visibilitychange', () => {
   font-weight: 900;
   letter-spacing: 0.02em;
   color: var(--zi-accent);
-  word-break: break-all;
+  white-space: nowrap;
+  word-break: normal;
 }
 .oc-line {
   font-size: 14px;

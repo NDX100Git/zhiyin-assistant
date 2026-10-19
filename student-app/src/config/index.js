@@ -11,8 +11,14 @@ export const API_BASE_URL = String(
   (import.meta.env && import.meta.env.VITE_API_BASE_URL) || fallbackBase
 ).replace(/\/+$/, '')
 
+/**
+ * 订单状态轮询间隔（毫秒）。
+ *
+ * 默认 30 秒：一万人同时在线时每秒请求约 333 次，正好落在单机容量（约 340 次/秒）内。
+ * 需要更实时可改 .env 里的 VITE_POLL_INTERVAL，但不要低于 5000，那会把容量打满。
+ */
 export const POLL_INTERVAL = Number(
-  (import.meta.env && import.meta.env.VITE_POLL_INTERVAL) || 4000
+  (import.meta.env && import.meta.env.VITE_POLL_INTERVAL) || 30000
 )
 
 let miniProgram = false

@@ -515,3 +515,29 @@ body.zi-theme-classic {
 .zi-theme-classic .el-message--error {
   border-left-color: var(--zi-danger);
 }
+
+/* ---------------------------------------------------------------------------
+ * 换文件确认弹窗
+ * 弹窗被 teleport 到 body，拿不到页面级的主题变量，因此这里只管版式：
+ * 长文件名必须能断行，窄屏下三个按钮竖排且不小于 44 像素，避免横向溢出。
+ * ------------------------------------------------------------------------- */
+
+.file-change-dialog .el-descriptions__content {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 767px) {
+  .file-change-dialog .el-dialog__body {
+    padding: 12px;
+  }
+  .file-change-dialog .el-dialog__footer {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .file-change-dialog .el-dialog__footer .el-button {
+    flex: 1 1 100%;
+    margin: 0;
+    min-height: 44px;
+  }
+}
