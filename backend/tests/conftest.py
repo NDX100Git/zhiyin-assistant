@@ -19,6 +19,7 @@ import app.models  # noqa: E402  确保所有表注册到 metadata
 from app.config import settings  # noqa: E402
 from app.database import get_db  # noqa: E402
 from app.main import app  # noqa: E402
+from app.migrations import run_migrations  # noqa: E402
 from app.models.base import Base  # noqa: E402
 from app.services import storage as storage_module  # noqa: E402
 
@@ -47,6 +48,8 @@ def engine():
 
     test_engine = create_engine(url.set(database=TEST_DB_NAME), pool_pre_ping=True)
     Base.metadata.create_all(test_engine)
+    # 测试库可能由旧版本建过，create_all 不会给已有表加列；跑一遍幂等迁移
+    run_migrations(test_engine)
     yield test_engine
     test_engine.dispose()
 

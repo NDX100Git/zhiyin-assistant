@@ -17,6 +17,12 @@ from app.models.order import Order
 from app.models.payment_log import PaymentLog
 from app.models.queue_session import QueueSession
 from app.models.user import User
+from app.services.file_change_service import (
+    batch_pending_changes,
+    create_initial_version,
+    expire_pending_changes,
+    pending_change_view,
+)
 from app.services.notifier import get_notifier
 from app.services.order_state import (
     STATUS_CANCELLED,
@@ -34,6 +40,9 @@ from app.services.storage import get_storage
 from app.utils.exceptions import BusinessError
 
 logger = logging.getLogger(__name__)
+
+# 区分「调用方没传」与「明确没有待确认请求」：列表接口批量查到 None 时要传 None
+_UNSET = object()
 
 def _next_daily_seq(db: Session, day: date) -> int:
     """取当日的下一个序号，订单号与取件码共用它。
@@ -169,6 +178,8 @@ def create_order(db: Session, user: User, payload) -> Order:
         raise BusinessError("订单号生成失败，请稍后重试", code=50020) from exc
 
     record_log(db, order, "state_change", None, STATUS_PENDING_PAY, "学生创建订单", "student")
+    # 文件版本从第 1 版开始留痕，后续换文件只追加元数据，不复制文件本体
+    create_initial_version(db, order)
     # 仅在本时段仍收单时占用容量；截单后的订单算下一个时段
     if session_info["session"] and session_info["is_open"]:
         session_row = get_or_create_session(db, day, session_info["session"])
@@ -227,17 +238,28 @@ def list_orders(db: Session, user: User, status: str | None = None,
         ).scalars()
     )
     waits = batch_wait_info(db, rows)
+    changes = batch_pending_changes(db, [order.id for order in rows])
     return {
         "total": int(total),
         "page": page,
         "page_size": page_size,
-        "items": [order_to_dict(db, order, waits.get(order.id)) for order in rows],
+        "items": [
+            order_to_dict(db, order, waits.get(order.id), changes.get(order.id))
+            for order in rows
+        ],
     }
 
 
-def order_to_dict(db: Session, order: Order, wait: dict | None = None) -> dict:
-    """订单对外字段（不含任何敏感信息）。wait 可由调用方批量算好后传入。"""
+def order_to_dict(db: Session, order: Order, wait: dict | None = None,
+                  file_change: dict | object | None = _UNSET) -> dict:
+    """订单对外字段（不含任何敏感信息）。
+
+    wait 与 file_change 可由调用方批量算好后传入，避免列表接口逐行查询；
+    file_change 不传时按订单 id 单独查一次（详情接口走这条）。
+    """
     wait = wait or order_wait_info(db, order)
+    if file_change is _UNSET:
+        file_change = pending_change_view(db, order.id)
     return {
         "id": order.id,
         "order_no": order.order_no,
@@ -255,12 +277,14 @@ def order_to_dict(db: Session, order: Order, wait: dict | None = None) -> dict:
         "paid": order.paid,
         "pay_method": order.pay_method,
         "created_at": order.created_at.isoformat() if order.created_at else None,
+        "requeue_at": order.requeue_at.isoformat() if order.requeue_at else None,
         "printed_at": order.printed_at.isoformat() if order.printed_at else None,
         "picked_at": order.picked_at.isoformat() if order.picked_at else None,
         "remark": order.remark,
         "cancel_reason": order.cancel_reason,
         "queue_position": wait["queue_position"],
         "estimated_minutes": wait["estimated_minutes"],
+        "file_change": file_change,
     }
 
 
@@ -272,6 +296,8 @@ def cancel_order(db: Session, user: User, order_id: int, reason: str | None = No
             f"订单当前状态为「{status_label(order.status)}」，不能取消", code=40901
         )
     order.cancel_reason = reason
+    # 订单一旦取消，未处理的换文件请求跟着失效，避免悬空请求
+    expire_pending_changes(db, order.id, "订单已取消，换文件请求失效", "student")
     change_status(db, order, STATUS_CANCELLED, operator="student",
                   note=reason or "学生取消订单")
     db.commit()

@@ -24,6 +24,8 @@ from app.config import settings
 from app.database import SessionLocal
 from app.models.ai_report import AiReport
 from app.models.order import Order
+from app.models.order_file_change import CHANGE_PENDING, OrderFileChange
+from app.models.order_file_version import OrderFileVersion
 from app.services.order_state import STATUS_CANCELLED, STATUS_COMPLETED
 from app.services.storage import FileStorage, get_storage
 
@@ -51,6 +53,7 @@ class CleanupStats:
     failed: int = 0            # 删除失败的文件数，下一轮会重新扫到
     not_expired: int = 0       # 仍在保留期内、本轮不处理的文件数
     reports_deleted: int = 0   # 删除（或将会删除）的体检报告缓存行数
+    pending_protected: int = 0 # 因待老师确认的换文件请求而跳过的文件数
     dry_run: bool = False
 
     def as_dict(self) -> dict[str, int | bool]:
@@ -62,6 +65,7 @@ class CleanupStats:
             "failed": self.failed,
             "not_expired": self.not_expired,
             "reports_deleted": self.reports_deleted,
+            "pending_protected": self.pending_protected,
             "dry_run": self.dry_run,
         }
 
@@ -77,7 +81,12 @@ def _as_local_naive(value: datetime) -> datetime:
 
 
 def _load_order_statuses(db: Session, keys: list[str]) -> dict[str, set[str]]:
-    """按 file_key 汇总引用该文件的订单状态。"""
+    """按 file_key 汇总引用该文件的订单状态。
+
+    两张表都看：订单表上的当前文件（也覆盖没有版本行的老数据），以及版本表里
+    标记为当前生效的版本。历史版本故意不计入引用，换下来的旧文件过了保留期
+    就可以回收，不额外续命。
+    """
     statuses: dict[str, set[str]] = {}
     for start in range(0, len(keys), ORDER_QUERY_CHUNK):
         chunk = keys[start:start + ORDER_QUERY_CHUNK]
@@ -87,7 +96,34 @@ def _load_order_statuses(db: Session, keys: list[str]) -> dict[str, set[str]]:
         for file_key, status in rows:
             if file_key:
                 statuses.setdefault(file_key, set()).add(status)
+
+        version_rows = db.execute(
+            select(OrderFileVersion.file_key, Order.status)
+            .join(Order, Order.id == OrderFileVersion.order_id)
+            .where(
+                OrderFileVersion.file_key.in_(chunk),
+                OrderFileVersion.is_current == 1,
+            )
+        ).all()
+        for file_key, status in version_rows:
+            if file_key:
+                statuses.setdefault(file_key, set()).add(status)
     return statuses
+
+
+def _load_pending_file_keys(db: Session, keys: list[str]) -> set[str]:
+    """待老师确认的换文件请求引用的新文件。"""
+    pending: set[str] = set()
+    for start in range(0, len(keys), ORDER_QUERY_CHUNK):
+        chunk = keys[start:start + ORDER_QUERY_CHUNK]
+        rows = db.execute(
+            select(OrderFileChange.new_file_key).where(
+                OrderFileChange.new_file_key.in_(chunk),
+                OrderFileChange.status == CHANGE_PENDING,
+            )
+        ).scalars()
+        pending.update(key for key in rows if key)
+    return pending
 
 
 def _cleanup_files(
@@ -115,8 +151,16 @@ def _cleanup_files(
         return
 
     references = _load_order_statuses(db, [obj.key for obj in expired])
+    # 还没确认的新文件不能被清掉：学生可能刚传完，老师还没来得及点确认
+    pending_keys = _load_pending_file_keys(db, [obj.key for obj in expired])
 
     for obj in expired:
+        if obj.key in pending_keys:
+            stats.skipped += 1
+            stats.pending_protected += 1
+            logger.info("跳过文件 %s：仍是待老师确认的换文件请求引用的新文件", obj.key)
+            continue
+
         statuses = references.get(obj.key, set())
         # 异常单享受额外宽限：没超过宽限上限就继续留着
         in_flight = statuses - FINISHED_STATUSES - {ABNORMAL_STATUS}

@@ -18,3 +18,12 @@ class OrderCreateRequest(BaseModel):
 
 class OrderCancelRequest(BaseModel):
     reason: str | None = Field(default=None, description="取消原因")
+
+
+class OrderFileReplaceRequest(BaseModel):
+    """学生换文件请求。订单标识走路径参数，这里只描述新文件。"""
+
+    file_key: str = Field(description="新文件的对象 key（上传接口返回）")
+    file_name: str | None = Field(default=None, description="新文件展示名")
+    page_count: int = Field(ge=1, description="新文件页数")
+    reason: str | None = Field(default=None, description="换文件原因，如传错版本")

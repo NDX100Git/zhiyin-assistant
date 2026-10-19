@@ -17,6 +17,11 @@ from app.config import get_order_rules
 from app.models.notice import Notice
 from app.models.order import Order
 from app.models.payment_log import PaymentLog
+from app.services.file_change_service import (
+    batch_pending_changes,
+    expire_pending_changes,
+    pending_change_view,
+)
 from app.services.order_state import (
     ADMIN_CANCELLABLE,
     STATUS_ABNORMAL,
@@ -29,12 +34,15 @@ from app.services.order_state import (
 )
 from app.services.pricing import calc_amount_cents
 from app.services.printer import get_printer_provider
-from app.services.queue_service import batch_wait_info, order_wait_info
+from app.services.queue_service import batch_wait_info, order_wait_info, queue_order_by
 from app.services.session_service import get_or_create_session
 from app.services.storage import get_storage
 from app.utils.exceptions import BusinessError
 
 logger = logging.getLogger(__name__)
+
+# 区分「调用方没传」与「明确没有待确认请求」：队列接口批量查到 None 时要传 None
+_UNSET = object()
 
 def _short_code_pattern() -> re.Pattern[str]:
     """老师手输的当天短码，如 0-01。按取件码配置生成，改进制与长度不用改这里。"""
@@ -59,9 +67,15 @@ def get_order(db: Session, order_id: int) -> Order:
     return order
 
 
-def order_admin_view(db: Session, order: Order, wait: dict | None = None) -> dict:
-    """老师端订单视图：含打印参数与排队信息。wait 可由调用方批量算好后传入。"""
+def order_admin_view(db: Session, order: Order, wait: dict | None = None,
+                     file_change: dict | object | None = _UNSET) -> dict:
+    """老师端订单视图：含打印参数与排队信息。
+
+    wait 与 file_change 可由调用方批量算好后传入；file_change 不传时单独查一次。
+    """
     wait = wait or order_wait_info(db, order)
+    if file_change is _UNSET:
+        file_change = pending_change_view(db, order.id)
     return {
         "id": order.id,
         "order_no": order.order_no,
@@ -79,12 +93,14 @@ def order_admin_view(db: Session, order: Order, wait: dict | None = None) -> dic
         "paid": order.paid,
         "pay_method": order.pay_method,
         "created_at": order.created_at.isoformat() if order.created_at else None,
+        "requeue_at": order.requeue_at.isoformat() if order.requeue_at else None,
         "printed_at": order.printed_at.isoformat() if order.printed_at else None,
         "picked_at": order.picked_at.isoformat() if order.picked_at else None,
         "remark": order.remark,
         "cancel_reason": order.cancel_reason,
         "queue_position": wait["queue_position"],
         "estimated_minutes": wait["estimated_minutes"],
+        "file_change": file_change,
     }
 
 
@@ -105,17 +121,21 @@ def queue_list(db: Session, status: str | None = None, keyword: str | None = Non
         db.execute(
             select(Order)
             .where(*condition)
-            .order_by(Order.order_no.asc(), Order.id.asc())
+            .order_by(*queue_order_by())
             .offset((page - 1) * page_size)
             .limit(page_size)
         ).scalars()
     )
     waits = batch_wait_info(db, rows)
+    changes = batch_pending_changes(db, [order.id for order in rows])
     return {
         "total": int(total),
         "page": page,
         "page_size": page_size,
-        "items": [order_admin_view(db, order, waits.get(order.id)) for order in rows],
+        "items": [
+            order_admin_view(db, order, waits.get(order.id), changes.get(order.id))
+            for order in rows
+        ],
     }
 
 
@@ -132,7 +152,12 @@ def download_url(order: Order) -> dict:
 
 
 def start_print(db: Session, order: Order, operator: str) -> dict:
-    """开始打印：queuing -> printing，并交给当前 PrinterProvider。"""
+    """开始打印：queuing -> printing，并交给当前 PrinterProvider。
+
+    订单一旦进入打印中就不能再换文件，所以先把待确认请求置为失效，
+    避免老师在打印后才看到一个无法执行的确认请求。
+    """
+    expire_pending_changes(db, order.id, "订单已开始打印，换文件请求失效", operator)
     change_status(db, order, STATUS_PRINTING, operator=operator, note="老师开始打印")
     file_url = get_storage().signed_url(order.file_key) if order.file_key else ""
     job = get_printer_provider().print(order, file_url)
@@ -304,6 +329,7 @@ def cancel_abnormal(db: Session, order: Order, reason: str | None, operator: str
         )
     note = (reason or "").strip() or "老师关闭异常单"
     order.cancel_reason = note
+    expire_pending_changes(db, order.id, "异常单已关闭，换文件请求失效", operator)
     change_status(db, order, "cancelled", operator=operator, note=note)
     db.commit()
     db.refresh(order)

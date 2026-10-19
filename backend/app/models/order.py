@@ -39,6 +39,9 @@ class Order(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.current_timestamp()
     )
+    # 换文件后重新排队的时间。队列排序优先用它，为空时回落到 created_at；
+    # 不改 order_no 与 created_at，保证订单号、取件码与下单时间都可追溯。
+    requeue_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     printed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     picked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     remark: Mapped[str | None] = mapped_column(String(255), nullable=True)

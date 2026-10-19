@@ -10,8 +10,8 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.user import User
-from app.schemas.order import OrderCancelRequest, OrderCreateRequest
-from app.services import order_service
+from app.schemas.order import OrderCancelRequest, OrderCreateRequest, OrderFileReplaceRequest
+from app.services import file_change_service, order_service
 from app.services.session_service import order_notice
 from app.utils.response import ok
 from app.utils.security import get_current_user
@@ -75,3 +75,22 @@ def pay_order(
 ) -> dict:
     """调用当前配置的 PaymentProvider，成功后状态转排队中。"""
     return ok(order_service.pay_order(db, user, order_id))
+
+
+@router.post("/{order_id}/replace-file", summary="换文件（需登录）", response_model=None)
+def replace_file(
+    order_id: int,
+    payload: OrderFileReplaceRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """待支付直接生效；排队中与异常单转「待老师确认」；其余状态拒绝。
+
+    返回订单对象本身，另加 `applied` 标识是立即生效还是等待确认；
+    待确认时订单里的 `file_change` 字段给出新文件与系统重算价。
+    """
+    order = order_service.get_owned_order(db, user, order_id)
+    result = file_change_service.replace_order_file(db, order, payload)
+    data = order_service.order_to_dict(db, order)
+    data["applied"] = bool(result["applied"])
+    return ok(data)

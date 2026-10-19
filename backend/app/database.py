@@ -39,9 +39,17 @@ def get_db() -> Iterator[Session]:
 
 
 def init_db() -> None:
-    """按 SQLAlchemy 模型建表（V1 简化实现，等价于 backend/schema.sql）。"""
+    """按 SQLAlchemy 模型建表，并补齐已有库缺失的列与索引。
+
+    `create_all` 只建缺失的表，不会给已有表加列；换文件功能新增的
+    `orders.requeue_at` 由 run_migrations 幂等补上，新库则直接建全。
+    """
     # 先导入全部模型，保证 Base.metadata 中已注册所有表
     from app import models  # noqa: F401
+    from app.migrations import run_migrations
 
     Base.metadata.create_all(bind=engine)
+    applied = run_migrations(engine)
+    if applied:
+        logger.info("数据库结构已补齐：%s", "、".join(applied))
     logger.info("数据库表已就绪，共 %d 张表", len(Base.metadata.tables))

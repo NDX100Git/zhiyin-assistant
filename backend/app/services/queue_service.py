@@ -1,6 +1,8 @@
 """排队位置与预计等待时间。
 
-队列不单独建表：直接用 orders 表按 created_at ASC、status IN ('queuing','printing') 过滤。
+队列不单独建表：直接用 orders 表按「有效排队时间」升序过滤，
+有效排队时间 = COALESCE(requeue_at, created_at)。换文件后 requeue_at 被写成换文件那一刻，
+订单自然排到队尾，同时不改订单号与创建时间。
 预计等待 = 近 20 单「按页数加权」的平均耗时 × 前序订单页数；
 没有历史数据时按 config/order_rules.json 里的 default_seconds_per_order 估算。
 """
@@ -10,7 +12,7 @@ from __future__ import annotations
 import math
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from app.config import get_order_rules
@@ -25,23 +27,69 @@ def _wait_rules() -> dict:
     return get_order_rules()["wait"]
 
 
+def queue_time_expr():
+    """有效排队时间：换过文件的单按重新排队时间，其余按下单时间。"""
+    return func.coalesce(Order.requeue_at, Order.created_at)
+
+
+def queue_tiebreak_expr():
+    """同一秒内的先后：换过文件的单排在未换过的单之后。
+
+    数据库 DATETIME 只到秒，换文件与另一单下单落在同一秒时，仅靠时间比不出先后；
+    用「是否重新排队」做第二排序键，保证刚换完文件的单确实在队尾。
+    """
+    return case((Order.requeue_at.is_not(None), 1), else_=0)
+
+
+def queue_order_by():
+    """队列的完整排序键，列表与位置计算共用，避免两处口径漂移。"""
+    return (
+        queue_time_expr().asc(),
+        queue_tiebreak_expr().asc(),
+        Order.id.asc(),
+    )
+
+
+def order_queue_time(order: Order) -> datetime:
+    """Python 侧的同一口径，供单条订单比较用。"""
+    return order.requeue_at or order.created_at
+
+
+def _ahead_condition(order: Order):
+    """排在 order 前面的条件，与 queue_order_by 的排序键一一对应。"""
+    own_time = order_queue_time(order)
+    own_flag = 1 if order.requeue_at else 0
+    queue_time = queue_time_expr()
+    tiebreak = queue_tiebreak_expr()
+    return (
+        (queue_time < own_time)
+        | ((queue_time == own_time) & (tiebreak < own_flag))
+        | (
+            (queue_time == own_time)
+            & (tiebreak == own_flag)
+            & (Order.id < order.id)
+        )
+    )
+
+
 def list_active_orders(db: Session) -> list[Order]:
-    """当前队列（含打印中），按订单号排序。"""
+    """当前队列（含打印中），按有效排队时间排序。"""
     return list(
         db.execute(
             select(Order)
             .where(Order.status.in_(ACTIVE_STATUSES))
-            .order_by(Order.created_at.asc(), Order.id.asc())
+            .order_by(*queue_order_by())
         ).scalars()
     )
 
 
 def per_page_seconds(db: Session) -> float | None:
-    """近 N 单的「秒/页」，用 created_at -> printed_at 作为单均耗时。"""
+    """近 N 单的「秒/页」，用有效排队时间 -> printed_at 作为单均耗时。"""
     limit = int(_wait_rules().get("recent_orders", 20))
+    start = queue_time_expr()
     rows = list(
         db.execute(
-            select(Order.page_count, Order.created_at, Order.printed_at)
+            select(Order.page_count, start, Order.printed_at)
             .where(Order.status.in_(HISTORY_STATUSES))
             .where(Order.printed_at.is_not(None))
             .where(Order.page_count.is_not(None))
@@ -53,10 +101,10 @@ def per_page_seconds(db: Session) -> float | None:
 
     total_seconds = 0.0
     total_pages = 0
-    for page_count, created_at, printed_at in rows:
-        if not isinstance(created_at, datetime) or not isinstance(printed_at, datetime):
+    for page_count, started_at, printed_at in rows:
+        if not isinstance(started_at, datetime) or not isinstance(printed_at, datetime):
             continue
-        seconds = (printed_at - created_at).total_seconds()
+        seconds = (printed_at - started_at).total_seconds()
         if seconds <= 0:
             continue
         total_seconds += seconds
@@ -95,10 +143,7 @@ def queue_position(db: Session, order: Order) -> int:
         select(Order.id)
         .where(Order.status.in_(ACTIVE_STATUSES))
         .where(Order.id != order.id)
-        .where(
-            (Order.created_at < order.created_at)
-            | ((Order.created_at == order.created_at) & (Order.id < order.id))
-        )
+        .where(_ahead_condition(order))
     ).scalars()
     return len(list(ahead))
 
@@ -118,7 +163,7 @@ def batch_wait_info(db: Session, orders: list[Order]) -> dict[int, dict]:
     active_rows = db.execute(
         select(Order.id, Order.page_count)
         .where(Order.status.in_(ACTIVE_STATUSES))
-        .order_by(Order.created_at.asc(), Order.id.asc())
+        .order_by(*queue_order_by())
     ).all()
     ratio = per_page_seconds(db)
     index = {row.id: position for position, row in enumerate(active_rows)}
@@ -171,10 +216,7 @@ def order_wait_info(db: Session, order: Order) -> dict:
     if order.status not in ACTIVE_STATUSES:
         return {"queue_position": 0, "estimated_minutes": 0, "queuing_count": total}
 
-    ahead_condition = active_condition & (
-        (Order.created_at < order.created_at)
-        | ((Order.created_at == order.created_at) & (Order.id < order.id))
-    )
+    ahead_condition = active_condition & _ahead_condition(order)
     ahead_count, ahead_pages = db.execute(
         select(
             func.count(),

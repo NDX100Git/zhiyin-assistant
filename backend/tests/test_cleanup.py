@@ -16,6 +16,8 @@ from sqlalchemy import select
 from app.config import settings
 from app.models.ai_report import AiReport
 from app.models.order import Order
+from app.models.order_file_change import CHANGE_PENDING, CHANGE_REJECTED, OrderFileChange
+from app.models.order_file_version import OrderFileVersion
 from app.services.cleanup import run_cleanup
 from app.services.order_state import (
     STATUS_ABNORMAL,
@@ -273,3 +275,124 @@ def test_异常单引用的文件超过额外宽限后回收(db_session, fake_st
 
     assert stats.deleted == 1
     assert "files/abnormal-old.pdf" in fake_storage.deleted
+
+
+def test_待确认换文件引用的新文件不被清理(db_session, fake_storage):
+    """学生刚传的新文件还没被老师确认，即使过了保留期也不能删。"""
+    old_key = "files/2026/02/change-old.pdf"
+    new_key = "files/2026/02/change-new.pdf"
+    fake_storage.put(old_key, EXPIRED_AT)
+    fake_storage.put(new_key, EXPIRED_AT)
+
+    order = _add_order(db_session, old_key, STATUS_QUEUING)
+    db_session.add(
+        OrderFileChange(
+            order_id=order.id,
+            status=CHANGE_PENDING,
+            pending_flag=1,
+            old_file_key=old_key,
+            new_file_key=new_key,
+            new_page_count=20,
+            new_amount_cents=300,
+        )
+    )
+    db_session.flush()
+
+    stats = run_cleanup(db_session, fake_storage, now=NOW)
+
+    assert stats.deleted == 0
+    assert stats.pending_protected == 1
+    assert old_key in fake_storage.objects
+    assert new_key in fake_storage.objects
+    assert fake_storage.deleted == []
+
+
+def test_待确认请求被驳回后新文件按保留期回收(db_session, fake_storage):
+    old_key = "files/2026/02/rejected-old.pdf"
+    new_key = "files/2026/02/rejected-new.pdf"
+    fake_storage.put(old_key, EXPIRED_AT)
+    fake_storage.put(new_key, EXPIRED_AT)
+
+    order = _add_order(db_session, old_key, STATUS_QUEUING)
+    db_session.add(
+        OrderFileChange(
+            order_id=order.id,
+            status=CHANGE_REJECTED,
+            pending_flag=None,
+            old_file_key=old_key,
+            new_file_key=new_key,
+            new_page_count=20,
+            new_amount_cents=300,
+        )
+    )
+    db_session.flush()
+
+    stats = run_cleanup(db_session, fake_storage, now=NOW)
+
+    # 订单当前文件仍受在途保护；被驳回的新文件没有引用，过了保留期就回收
+    assert new_key in fake_storage.deleted
+    assert old_key in fake_storage.objects
+    assert stats.pending_protected == 0
+
+
+def test_历史版本不额外续命_当前版本仍受在途保护(db_session, fake_storage):
+    """换下来的旧文件按原保留期回收；当前生效文件仍按未完结订单保护。"""
+    old_key = "files/2026/02/version-old.pdf"
+    current_key = "files/2026/02/version-current.pdf"
+    fake_storage.put(old_key, EXPIRED_AT)
+    fake_storage.put(current_key, EXPIRED_AT)
+
+    order = _add_order(db_session, current_key, STATUS_QUEUING)
+    db_session.add_all(
+        [
+            OrderFileVersion(
+                order_id=order.id,
+                version_no=1,
+                file_key=old_key,
+                page_count=10,
+                amount_cents=150,
+                is_current=0,
+            ),
+            OrderFileVersion(
+                order_id=order.id,
+                version_no=2,
+                file_key=current_key,
+                page_count=20,
+                amount_cents=300,
+                is_current=1,
+            ),
+        ]
+    )
+    db_session.flush()
+
+    stats = run_cleanup(db_session, fake_storage, now=NOW)
+
+    assert old_key in fake_storage.deleted
+    assert current_key in fake_storage.objects
+    assert stats.deleted == 1
+    assert stats.skipped == 1
+
+
+def test_历史版本在保留期内不提前删除(db_session, fake_storage):
+    old_key = "files/2026/03/version-fresh.pdf"
+    current_key = "files/2026/03/version-current-fresh.pdf"
+    fake_storage.put(old_key, FRESH_AT)
+    fake_storage.put(current_key, FRESH_AT)
+
+    order = _add_order(db_session, current_key, STATUS_QUEUING)
+    db_session.add(
+        OrderFileVersion(
+            order_id=order.id,
+            version_no=1,
+            file_key=old_key,
+            page_count=10,
+            amount_cents=150,
+            is_current=0,
+        )
+    )
+    db_session.flush()
+
+    stats = run_cleanup(db_session, fake_storage, now=NOW)
+
+    assert stats.deleted == 0
+    assert old_key in fake_storage.objects

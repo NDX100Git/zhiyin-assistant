@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS `orders` (
   `pay_method`     VARCHAR(16)  DEFAULT NULL COMMENT 'mock / onsite',
   `paid_at`        DATETIME     DEFAULT NULL,
   `created_at`     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `requeue_at`     DATETIME     DEFAULT NULL COMMENT '换文件后重新排队时间，为空时按创建时间排队',
   `printed_at`     DATETIME     DEFAULT NULL,
   `picked_at`      DATETIME     DEFAULT NULL,
   `remark`         VARCHAR(255) DEFAULT NULL,
@@ -57,6 +58,52 @@ CREATE TABLE IF NOT EXISTS `orders` (
   KEY `idx_status_created` (`status`, `created_at`),
   UNIQUE KEY `uq_pickup_code` (`pickup_code`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='订单主表';
+
+-- 订单文件版本：只存元数据，不复制文件本体；一单同一时刻只有一个生效版本
+CREATE TABLE IF NOT EXISTS `order_file_versions` (
+  `id`           BIGINT       NOT NULL AUTO_INCREMENT,
+  `order_id`     BIGINT       NOT NULL,
+  `version_no`   INT          NOT NULL COMMENT '从 1 递增，每次换文件加一',
+  `file_key`     VARCHAR(255) NOT NULL COMMENT '对象存储路径',
+  `file_name`    VARCHAR(255) DEFAULT NULL,
+  `page_count`   INT          NOT NULL,
+  `amount_cents` INT          NOT NULL DEFAULT 0 COMMENT '该版本价格快照，单位：分',
+  `file_sha256`  VARCHAR(64)  DEFAULT NULL COMMENT '内容指纹，留给去重与同文件判断',
+  `is_current`   TINYINT      NOT NULL DEFAULT 1 COMMENT '一单只能有一个生效版本',
+  `operator`     VARCHAR(32)  DEFAULT NULL COMMENT 'student / admin / system',
+  `note`         VARCHAR(255) DEFAULT NULL,
+  `created_at`   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_order_file_version` (`order_id`, `version_no`),
+  KEY `idx_file_version_key` (`file_key`),
+  KEY `idx_file_version_current` (`order_id`, `is_current`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='订单文件版本，只存元数据';
+
+-- 换文件变更请求：pending_flag 仅在待确认时为 1，配合唯一索引保证一单一个待确认
+CREATE TABLE IF NOT EXISTS `order_file_changes` (
+  `id`                 BIGINT       NOT NULL AUTO_INCREMENT,
+  `order_id`           BIGINT       NOT NULL,
+  `status`             VARCHAR(16)  NOT NULL DEFAULT 'pending' COMMENT 'pending/approved/rejected/cancelled',
+  `pending_flag`       TINYINT      DEFAULT NULL COMMENT '待确认时为 1，处理后置 NULL',
+  `old_file_key`       VARCHAR(255) DEFAULT NULL,
+  `old_file_name`      VARCHAR(255) DEFAULT NULL,
+  `old_page_count`     INT          DEFAULT NULL,
+  `old_amount_cents`   INT          DEFAULT NULL,
+  `new_file_key`       VARCHAR(255) NOT NULL,
+  `new_file_name`      VARCHAR(255) DEFAULT NULL,
+  `new_page_count`     INT          NOT NULL,
+  `new_amount_cents`   INT          NOT NULL COMMENT '系统重算价，单位：分',
+  `final_amount_cents` INT          DEFAULT NULL COMMENT '老师确认后的最终价，单位：分',
+  `reason`             VARCHAR(255) DEFAULT NULL,
+  `requested_by`       VARCHAR(32)  DEFAULT NULL,
+  `reviewed_by`        VARCHAR(64)  DEFAULT NULL,
+  `review_note`        VARCHAR(255) DEFAULT NULL,
+  `created_at`         DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `reviewed_at`        DATETIME     DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_file_change_order_status` (`order_id`, `status`),
+  UNIQUE KEY `uq_file_change_pending` (`order_id`, `pending_flag`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='换文件变更请求';
 
 -- 按日发号器：订单号与取件码都从这一行的 last_seq 出。
 -- INSERT ... ON DUPLICATE KEY UPDATE 一句完成原子自增，并发不会重号。
