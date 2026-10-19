@@ -581,6 +581,111 @@ function orderTrace(trace) {
   return `匹配 ${trace.matched || '无'}；按钮 ${trace.buttons.map((item) => `${item.text}${item.disabled ? '(禁用)' : ''}`).join(' / ')}`
 }
 
+/** 点一个可见元素：按 CSS 选择器找，可选在某个容器内找。 */
+async function clickSelector(page, selector, rootSelector = '') {
+  const result = await page.evaluate(
+    ({ selector, rootSelector }) => {
+      const scope = rootSelector ? document.querySelector(rootSelector) : document
+      if (!scope) return 'no-root'
+      const node = [...scope.querySelectorAll(selector)].find(
+        (element) => element.getClientRects().length > 0,
+      )
+      if (!node) return 'no-node'
+      node.click()
+      return 'ok'
+    },
+    { selector, rootSelector },
+  )
+  if (result !== 'ok') {
+    throw new Error(`找不到可点击的 ${rootSelector || '页面'} 里的 ${selector}（${result}）`)
+  }
+}
+
+/** 等某个可见元素出现（元素存在且已布局）。 */
+async function waitVisible(page, selector, timeout = 20000) {
+  await page.waitForFunction(
+    (selector) =>
+      [...document.querySelectorAll(selector)].some(
+        (element) => element.getClientRects().length > 0,
+      ),
+    { timeout, polling: 200 },
+    selector,
+  )
+}
+
+/** 等页面里某个节点的 class 变成预期的主题类。 */
+async function waitThemeClass(page, selector, themeClass, timeout = 20000) {
+  await page.waitForFunction(
+    (selector, themeClass) => {
+      const node = document.querySelector(selector)
+      return Boolean(node && node.classList.contains(themeClass))
+    },
+    { timeout, polling: 200 },
+    selector,
+    themeClass,
+  )
+}
+
+/** 等 body 上的主题类变成预期值（老师端主题变量挂在 body 上）。 */
+async function waitBodyTheme(page, themeClass, timeout = 20000) {
+  await page.waitForFunction(
+    (themeClass) => document.body.classList.contains(themeClass),
+    { timeout, polling: 200 },
+    themeClass,
+  )
+}
+
+/** 页面上目前有几个可见的确认弹框（ElMessageBox）。 */
+function visibleMessageBoxes(page) {
+  return page.evaluate(
+    () =>
+      [...document.querySelectorAll('.el-message-box')].filter(
+        (element) => element.getClientRects().length > 0,
+      ).length,
+  )
+}
+
+/** 等一条带指定文字的轻提示（ElMessage）出现。 */
+async function waitMessageText(page, text, timeout = 20000) {
+  await page.waitForFunction(
+    (text) =>
+      [...document.querySelectorAll('.el-message')].some(
+        (element) =>
+          element.getClientRects().length > 0 &&
+          (element.innerText || element.textContent || '').includes(text),
+      ),
+    { timeout, polling: 200 },
+    text,
+  )
+}
+
+/** 记录老师端「开始打印」接口调用，用来断言第一次点击真的没有调接口。 */
+function recordStartCalls(page) {
+  const calls = []
+  const handler = (request) => {
+    try {
+      const url = new URL(request.url())
+      if (request.method() === 'POST' && /^\/api\/admin\/order\/\d+\/start$/.test(url.pathname)) {
+        calls.push(url.pathname)
+      }
+    } catch {
+      /* 非 http 请求忽略 */
+    }
+  }
+  page.on('request', handler)
+  return { calls, stop: () => page.off('request', handler) }
+}
+
+/** 等「开始打印」接口被调到的次数不少于 count。 */
+async function waitStartCalls(record, count, timeout = 20000) {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    if (record.calls.length >= count) return record.calls
+    await sleep(200)
+  }
+  throw new Error(`没有等到第 ${count} 次开始打印接口调用（实际 ${record.calls.length} 次）`)
+}
+
 function watchPage(page, label, bucket) {
   page.on('pageerror', (error) => bucket.push(`${label} 页面异常：${error.message}`))
   page.on('console', (message) => {
@@ -847,6 +952,8 @@ async function runViewport(browser, viewport) {
 
     const multiFile = await runMultiFilePhase({ student, teacher, viewport, step })
     const fourFile = await runFourFilePhase({ student, teacher, viewport, step })
+    const theme = await runThemePhase({ student, teacher, viewport, step })
+    const startGuard = await runStartGuardPhase({ student, teacher, viewport, step })
 
     if (problems.length) {
       throw Object.assign(new Error(`页面/接口有 ${problems.length} 条异常记录`), {
@@ -854,7 +961,15 @@ async function runViewport(browser, viewport) {
         stepIndex,
       })
     }
-    return { viewport: label, orderNo: order.orderNo, pickup: order.pickup, multiFile, fourFile }
+    return {
+      viewport: label,
+      orderNo: order.orderNo,
+      pickup: order.pickup,
+      multiFile,
+      fourFile,
+      theme,
+      startGuard,
+    }
   } finally {
     await context.close()
   }
@@ -1105,6 +1220,201 @@ async function runFourFilePhase({ student, teacher, viewport, step }) {
   }, teacher)
 
   return { orderNo: order.orderNo, pickup: order.pickup }
+}
+
+// ---------------------------------------------------------------- 主题入口
+/**
+ * 两端主题入口：学生端「我的」页齿轮、老师端侧边栏（手机是抽屉）。
+ *
+ * 切到第二套 signal 后当前页面类名立刻变，刷新后仍是这一套（存进了各自存储）。
+ * 两个视口都要断言按钮尺寸与横向溢出。
+ */
+async function runThemePhase({ student, teacher, viewport, step }) {
+  const studentTheme = { current: '', persisted: '', options: 0 }
+  const teacherTheme = { current: '', persisted: '', options: 0 }
+
+  await step('主题：学生端齿轮切皮肤并刷新后保持', async () => {
+    await gotoFresh(student, `${STUDENT_URL}/#/pages/mine/mine`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    })
+    await waitBody(student, '全部', 60000)
+    await waitVisible(student, '.theme-entry', 20000)
+    // 齿轮按钮在 390 宽下也不能被压到 44 像素以下
+    await assertTouchButtons(student, '学生端我的页页头', '.page-head')
+    await clickSelector(student, '.theme-entry')
+    await waitVisible(student, '.theme-sheet', 20000)
+    studentTheme.options = await student.$$eval('.theme-sheet .theme-option', (nodes) => nodes.length)
+    if (studentTheme.options !== 3) {
+      throw new Error(`学生端皮肤面板应该三选一，实际 ${studentTheme.options} 项`)
+    }
+    // 面板里的选项与关闭按钮同样不得低于 44 像素
+    await assertTouchButtons(student, '学生端皮肤面板', '.theme-sheet')
+    if (viewport.mobile) await assertNoOverflow(student, '学生端皮肤面板')
+    // 第二套：signal
+    await clickSelector(student, '.theme-option[data-theme="signal"]', '.theme-sheet')
+    await waitThemeClass(student, '.page', 'zi-theme-signal', 20000)
+    studentTheme.current = await student.$eval('.page', (node) =>
+      [...node.classList].find((name) => name.startsWith('zi-theme-')),
+    )
+    if (studentTheme.current !== 'zi-theme-signal') {
+      throw new Error(`学生端切肤后页面类是「${studentTheme.current}」`)
+    }
+    // 刷新（退出重进）后应仍然是这一套
+    await student.reload({ waitUntil: 'domcontentloaded', timeout: 60000 })
+    await waitBody(student, '全部', 60000)
+    await waitThemeClass(student, '.page', 'zi-theme-signal', 30000)
+    studentTheme.persisted = await student.$eval('.page', (node) =>
+      [...node.classList].find((name) => name.startsWith('zi-theme-')),
+    )
+    if (viewport.mobile) await assertNoOverflow(student, '学生端我的页（signal）')
+  })
+
+  await step('主题：老师端侧边栏切皮肤并刷新后保持', async () => {
+    const root = viewport.mobile ? '.drawer-body' : '.aside'
+    if (viewport.mobile) {
+      // 手机端入口在抽屉里：先开抽屉
+      await clickSelector(teacher, '.menu-trigger')
+      await waitVisible(teacher, '.drawer-body', 20000)
+    }
+    await waitVisible(teacher, `${root} .theme-option`, 20000)
+    teacherTheme.options = await teacher.$$eval(
+      `${root} .theme-option`,
+      (nodes) => nodes.length,
+    )
+    if (teacherTheme.options !== 3) {
+      throw new Error(`老师端皮肤入口应该三选一，实际 ${teacherTheme.options} 项`)
+    }
+    // 抽屉里的入口也要够得着：按钮不得低于 44 像素
+    await assertTouchButtons(teacher, '老师端皮肤入口', root)
+    if (viewport.mobile) await assertNoOverflow(teacher, '老师端皮肤抽屉')
+    await clickSelector(teacher, '.theme-option[data-theme="signal"]', root)
+    await waitBodyTheme(teacher, 'zi-theme-signal', 20000)
+    teacherTheme.current = await teacher.evaluate(() =>
+      [...document.body.classList].find((name) => name.startsWith('zi-theme-')),
+    )
+    if (teacherTheme.current !== 'zi-theme-signal') {
+      throw new Error(`老师端切肤后 body 类是「${teacherTheme.current}」`)
+    }
+    await teacher.reload({ waitUntil: 'domcontentloaded', timeout: 60000 })
+    await waitBody(teacher, '接单队列', 60000)
+    await waitBodyTheme(teacher, 'zi-theme-signal', 30000)
+    teacherTheme.persisted = await teacher.evaluate(() =>
+      [...document.body.classList].find((name) => name.startsWith('zi-theme-')),
+    )
+    if (teacherTheme.persisted !== 'zi-theme-signal') {
+      throw new Error(`老师端刷新后 body 类是「${teacherTheme.persisted}」`)
+    }
+    // 刷新后入口仍然在那里（桌面侧边栏直接看得到）
+    if (!viewport.mobile) await waitVisible(teacher, '.aside .theme-option', 20000)
+  }, teacher)
+
+  return { student: studentTheme, teacher: teacherTheme }
+}
+
+// ---------------------------------------------------------------- 开始打印拦截
+/**
+ * 「已替换未确认」订单的两段式拦截。
+ *
+ * 第一下只提示先下载，不弹框、不调 /start，队列不动；
+ * 第二下才弹确认框，确认后照常进入打印中。
+ */
+async function runStartGuardPhase({ student, teacher, viewport, step }) {
+  const order = { orderNo: '', pickup: '', id: 0 }
+  const result = { firstClickStartCalls: 0, secondClickStartCalls: 0, messageBoxes: 0 }
+
+  await step('拦截：下一单并换文件，老师确认后进入已替换未确认', async () => {
+    await gotoFresh(student, `${STUDENT_URL}/#/pages/order/order`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    })
+    await waitBody(student, '选择要打印的文件', 90000)
+    await pickFile(student, '选择文档', FIXTURES.v1)
+    await waitBody(student, '3. 打印方案', 90000)
+    await waitBody(student, '确认下单', 60000)
+    await clickByText(student, '确认下单')
+    await waitBody(student, '下单成功', 60000)
+    Object.assign(order, await readOrderResult(student))
+    order.id = await orderIdFromApi(student, order.orderNo)
+    await clickByText(student, '模拟支付')
+    await waitGone(student, '模拟支付', 30000)
+
+    // 换文件：先进详情再进取换页，完成后回到详情看待确认状态
+    await gotoFresh(student, `${STUDENT_URL}/#/pages/mine/detail?id=${order.id}`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    })
+    await waitBody(student, '取件码 · 凭此码到文印室取件', 60000)
+    await gotoFresh(student, `${STUDENT_URL}/#/pages/mine/replace?id=${order.id}`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    })
+    await waitBody(student, '当前订单', 60000)
+    await pickFile(student, '选择文档', FIXTURES.v2)
+    await waitBody(student, '2. 确认变更', 90000)
+    await clickByText(student, '提交换文件申请')
+    // 整页刷新进来时页面栈里没有上一页，提交后 navigateBack 退不回去，
+    // 先等本页的提交成功标记，再自己走详情页看待确认状态。
+    await waitBody(student, '已提交一份换文件申请', 45000)
+    await gotoFresh(student, `${STUDENT_URL}/#/pages/mine/detail?id=${order.id}`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    })
+    await waitBody(student, '换文件待老师确认', 45000)
+  })
+
+  await step('拦截：老师确认换文件，订单变成已替换未确认', async () => {
+    await searchQueue(teacher, order.pickup)
+    await waitRowText(teacher, order.pickup, '文件待确认', 45000)
+    await clickRowButton(teacher, order.pickup, '确认换文件')
+    await waitBody(teacher, '系统重算价', 30000)
+    await clickDialog(teacher, '通过')
+    await waitRowText(teacher, order.pickup, '已替换', 45000)
+    await waitRowText(teacher, order.pickup, '排队中', 45000)
+  }, teacher)
+
+  await step('拦截：第一次点开始打印只提示、不弹框、不调接口', async () => {
+    const starts = recordStartCalls(teacher)
+    try {
+      await clickRowButton(teacher, order.pickup, '开始打印')
+      await waitMessageText(teacher, '先下载新文件', 20000)
+      // 轻提示已经出来了，再等一拍确认没有后续弹框/接口调用
+      await sleep(800)
+      result.messageBoxes = await visibleMessageBoxes(teacher)
+      result.firstClickStartCalls = starts.calls.length
+      if (result.messageBoxes !== 0) {
+        throw new Error(`第一次点击弹出了 ${result.messageBoxes} 个确认框（不应该弹）`)
+      }
+      if (result.firstClickStartCalls !== 0) {
+        throw new Error(`第一次点击就调了 ${result.firstClickStartCalls} 次开始打印接口`)
+      }
+      // 队列不变：仍在排队中，仍然带着已替换标记
+      await waitRowText(teacher, order.pickup, '排队中', 20000)
+      await waitRowText(teacher, order.pickup, '已替换', 20000)
+    } finally {
+      starts.stop()
+    }
+  }, teacher)
+
+  await step('拦截：第二次点开始打印弹确认，确认后进入打印中', async () => {
+    const starts = recordStartCalls(teacher)
+    try {
+      await clickRowButton(teacher, order.pickup, '开始打印')
+      await waitVisible(teacher, '.el-message-box', 20000)
+      await waitBody(teacher, '仍要现在开始打印吗', 20000)
+      await clickDialog(teacher, '仍然开始')
+      await waitRowText(teacher, order.pickup, '打印中', 45000)
+      const calls = await waitStartCalls(starts, 1, 20000)
+      result.secondClickStartCalls = calls.length
+      if (result.secondClickStartCalls !== 1) {
+        throw new Error(`第二次点击应该调 1 次开始打印接口，实际 ${result.secondClickStartCalls} 次`)
+      }
+    } finally {
+      starts.stop()
+    }
+  }, teacher)
+
+  return { orderNo: order.orderNo, pickup: order.pickup, ...result }
 }
 
 // ---------------------------------------------------------------- 入口

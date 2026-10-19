@@ -7,6 +7,18 @@
       </text>
     </view>
     <!-- #endif -->
+    <!-- 页头：标题左，齿轮右。齿轮固定 88rpx 见方，窄屏下标题自己省略，不挤压 -->
+    <view class="page-head">
+      <view class="head-text">
+        <text class="head-title">我的</text>
+        <text class="head-sub">订单与取件</text>
+      </view>
+      <button class="theme-entry" aria-label="界面皮肤" @click="openThemePanel">
+        <text class="theme-entry-icon">⚙</text>
+        <text class="theme-entry-label">皮肤</text>
+      </button>
+    </view>
+
     <view class="card profile">
       <view class="avatar">{{ initial }}</view>
       <view class="profile-main">
@@ -51,6 +63,28 @@
         <button class="mini ghost" @click="openDetail(order.id)">详情</button>
       </view>
     </view>
+
+    <!-- 皮肤面板：三选一，点一下当前页面立刻换肤，退出重进也记得 -->
+    <view v-if="themePanelOpen" class="theme-mask" @click="closeThemePanel">
+      <view class="theme-sheet" @click.stop>
+        <view class="theme-sheet-head">
+          <text class="theme-sheet-title">界面皮肤</text>
+          <button class="theme-close" @click="closeThemePanel">关闭</button>
+        </view>
+        <button
+          v-for="option in themeOptions"
+          :key="option.value"
+          class="theme-option"
+          :class="{ active: uiTheme === option.value }"
+          :data-theme="option.value"
+          @click="chooseTheme(option.value)"
+        >
+          <text class="theme-name">{{ option.label }}</text>
+          <text class="theme-hint">{{ option.hint }}</text>
+          <text v-if="uiTheme === option.value" class="theme-check">当前</text>
+        </button>
+      </view>
+    </view>
   </view>
 </template>
 
@@ -63,7 +97,7 @@ import { ensureLogin, getCurrentUser } from '@/services/auth'
 import { createPoller, notify, notifyError } from '@/services/notify'
 import { fileCount, fileSummary } from '@/services/orderFiles'
 import { usePullRefresh } from '@/ui/pullRefresh'
-import { useUiTheme } from '@/ui/theme'
+import { UI_THEME_OPTIONS, useUiTheme } from '@/ui/theme'
 
 const tabs = [
   { label: '全部', value: '' },
@@ -80,7 +114,30 @@ const saving = ref(false)
 const nickname = ref('')
 
 const initial = computed(() => (nickname.value || '同').slice(0, 1))
-const { uiThemeClass } = useUiTheme()
+const { uiTheme, uiThemeClass, changeUiTheme } = useUiTheme()
+
+/** 皮肤面板的三选一选项，选中项在面板里会标出来。 */
+const themeOptions = UI_THEME_OPTIONS
+const themePanelOpen = ref(false)
+
+function openThemePanel() {
+  themePanelOpen.value = true
+}
+
+function closeThemePanel() {
+  themePanelOpen.value = false
+}
+
+/** 选皮肤：写存储 + 当前页面立即换肤，不需要手动刷新。 */
+function chooseTheme(theme) {
+  const ok = changeUiTheme(theme)
+  if (!ok) {
+    notify('界面皮肤切换失败，请稍后重试')
+    return
+  }
+  themePanelOpen.value = false
+  notify('界面皮肤已切换', 'success')
+}
 
 function isActive(order) {
   return order.status === 'queuing' || order.status === 'printing'
@@ -228,6 +285,156 @@ function openDetail(id) {
   font-size: 24rpx;
   font-weight: 700;
   letter-spacing: 1rpx;
+}
+
+/* 页头：标题可省略，齿轮按钮固定 88rpx（390 宽下约 45.8px）不挤压标题 */
+.page-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16rpx;
+  margin-bottom: 20rpx;
+}
+.head-text {
+  flex: 1;
+  min-width: 0;
+}
+.head-title {
+  display: block;
+  overflow: hidden;
+  color: var(--zi-ink);
+  font-size: 38rpx;
+  font-weight: 900;
+  letter-spacing: 2rpx;
+  line-height: 1.25;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.head-sub {
+  display: block;
+  margin-top: 2rpx;
+  color: var(--zi-muted);
+  font-size: 22rpx;
+  font-weight: 700;
+  letter-spacing: 1rpx;
+  white-space: nowrap;
+}
+.theme-entry {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 6rpx;
+  width: 88rpx;
+  height: 88rpx;
+  margin: 0;
+  padding: 0;
+  border: var(--zi-button-border);
+  border-radius: var(--zi-button-radius);
+  background: var(--zi-paper);
+  color: var(--zi-ink);
+  line-height: 1;
+}
+.theme-entry-icon {
+  font-size: 38rpx;
+  line-height: 1;
+}
+.theme-entry-label {
+  display: none;
+  font-size: 22rpx;
+  font-weight: 800;
+}
+
+/* 皮肤面板：底部弹出，三选一，每项都高于 44 像素 */
+.theme-mask {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  /* 高于 uni H5 的 tabBar（z-index 998），面板整个铺满底部 */
+  z-index: 999;
+  display: flex;
+  align-items: flex-end;
+  background: rgba(23, 22, 26, 0.42);
+}
+.theme-sheet {
+  width: 100%;
+  padding: 24rpx 24rpx calc(40rpx + env(safe-area-inset-bottom));
+  box-sizing: border-box;
+  border-top: var(--zi-card-border);
+  background: var(--zi-paper);
+  color: var(--zi-ink);
+}
+.theme-sheet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16rpx;
+  margin-bottom: 16rpx;
+}
+.theme-sheet-title {
+  color: var(--zi-ink);
+  font-size: 30rpx;
+  font-weight: 900;
+  letter-spacing: 2rpx;
+}
+.theme-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 88rpx;
+  margin: 0;
+  padding: 0 24rpx;
+  border: 2rpx solid var(--zi-line-strong);
+  border-radius: var(--zi-pill-radius);
+  background: transparent;
+  color: var(--zi-muted);
+  font-size: 24rpx;
+  font-weight: 800;
+  line-height: 1;
+}
+.theme-option {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4rpx 12rpx;
+  width: 100%;
+  min-height: 100rpx;
+  margin: 0 0 12rpx;
+  padding: 16rpx 20rpx;
+  box-sizing: border-box;
+  border: 2rpx solid var(--zi-line-strong);
+  border-radius: var(--zi-radius);
+  background: transparent;
+  text-align: left;
+  line-height: 1.35;
+}
+.theme-option.active {
+  border-color: var(--zi-accent);
+  background: var(--zi-soft);
+}
+.theme-name {
+  color: var(--zi-ink);
+  font-size: 28rpx;
+  font-weight: 900;
+  letter-spacing: 1rpx;
+}
+.theme-hint {
+  flex: 1;
+  min-width: 0;
+  color: var(--zi-muted);
+  font-size: 22rpx;
+  font-weight: 700;
+}
+.theme-check {
+  padding: 2rpx 12rpx;
+  border: 2rpx solid var(--zi-accent);
+  border-radius: var(--zi-pill-radius);
+  color: var(--zi-accent);
+  font-size: 20rpx;
+  font-weight: 900;
+  line-height: 1.4;
 }
 
 .card {
@@ -418,6 +625,33 @@ function openDetail(id) {
   border-color: var(--zi-line-strong);
   background: transparent;
   color: var(--zi-muted);
+}
+
+/* 旧蓝白皮肤：齿轮与面板恢复轻量圆角 */
+.zi-theme-classic .theme-entry {
+  border: none;
+  border-radius: 999rpx;
+  background: var(--zi-soft);
+  color: var(--zi-accent);
+}
+.zi-theme-classic .theme-close {
+  border: none;
+  background: var(--zi-soft);
+  color: var(--zi-accent);
+  font-weight: 600;
+}
+.zi-theme-classic .theme-option {
+  border: none;
+  border-radius: 16rpx;
+  background: var(--zi-soft-2);
+}
+.zi-theme-classic .theme-option.active {
+  background: var(--zi-soft);
+}
+.zi-theme-classic .theme-name,
+.zi-theme-classic .head-title {
+  font-weight: 600;
+  letter-spacing: 0;
 }
 
 /* 旧蓝白皮肤：恢复轻量圆角和填充标签 */
