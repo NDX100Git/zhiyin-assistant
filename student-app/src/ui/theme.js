@@ -7,8 +7,8 @@
  *
  * 换风格有两种方式：
  *   1. 改下面的 DEFAULT_THEME；
- *   2. 在任意页面调用 setUiTheme('press' | 'signal' | 'classic')，
- *      重新进入页面即可看到效果。
+ *   2. 在「我的」页右上角齿轮里选一套（调用 changeUiTheme），当前页面立刻换肤，
+ *      退出重进仍然记住。
  */
 
 import { computed, ref } from 'vue'
@@ -19,6 +19,13 @@ export const UI_THEME_KEY = 'zhiyin_ui_theme'
 export const UI_THEMES = ['press', 'signal', 'classic']
 
 export const DEFAULT_THEME = 'press'
+
+/** 「我的」页皮肤面板的三选一选项（只描述观感，不改任何业务文案）。 */
+export const UI_THEME_OPTIONS = [
+  { value: 'press', label: '纸面工单', hint: '米白网格纸 · 墨线表格' },
+  { value: 'signal', label: '信号牌', hint: '黑底反白取件码 · 红色块面' },
+  { value: 'classic', label: '旧蓝白', hint: '浅蓝白底 · 圆角卡片' },
+]
 
 /** 读取当前主题；读不到或值不合法时回到默认主题。 */
 export function getUiTheme() {
@@ -78,7 +85,19 @@ function applyNativeTheme(theme) {
   }
 }
 
-/** 页面里统一用这个组合式函数，主题变化在重新进入页面时生效。 */
+/** 立即换肤：写存储并同步原生导航栏颜色，不需要手动刷新页面。 */
+export function applyUiTheme(theme) {
+  if (UI_THEMES.indexOf(theme) < 0) return false
+  const saved = setUiTheme(theme)
+  applyNativeTheme(theme)
+  return saved
+}
+
+/**
+ * 页面里统一用这个组合式函数。
+ * changeUiTheme 让当前页面立刻换肤（根节点 class 跟着变），
+ * 同时把选择写进存储，退出重进仍然记得。
+ */
 export function useUiTheme() {
   const uiTheme = ref(getUiTheme())
   const uiThemeClass = computed(() => themeClass(uiTheme.value))
@@ -86,5 +105,10 @@ export function useUiTheme() {
     uiTheme.value = getUiTheme()
     applyNativeTheme(uiTheme.value)
   })
-  return { uiTheme, uiThemeClass }
+  function changeUiTheme(theme) {
+    if (!applyUiTheme(theme)) return false
+    uiTheme.value = theme
+    return true
+  }
+  return { uiTheme, uiThemeClass, changeUiTheme }
 }

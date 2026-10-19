@@ -17,6 +17,26 @@
           <span>收单与公告</span>
         </el-menu-item>
       </el-menu>
+
+      <!-- 界面皮肤入口：侧边栏底部三选一，点一下立即换肤并记住 -->
+      <div class="theme-block">
+        <div class="theme-title">界面皮肤</div>
+        <div class="theme-options">
+          <button
+            v-for="option in themeOptions"
+            :key="option.value"
+            type="button"
+            class="theme-option"
+            :class="{ 'is-active': uiTheme === option.value }"
+            :data-theme="option.value"
+            :title="option.hint"
+            @click="chooseTheme(option.value)"
+          >
+            <span class="theme-name">{{ option.label }}</span>
+            <span class="theme-hint">{{ option.hint }}</span>
+          </button>
+        </div>
+      </div>
     </el-aside>
 
     <el-container>
@@ -63,6 +83,25 @@
             <span>收单与公告</span>
           </el-menu-item>
         </el-menu>
+        <!-- 手机抽屉里的皮肤入口：按钮不小于 44 像素，一只手能够到 -->
+        <div class="theme-block drawer-theme">
+          <div class="theme-title">界面皮肤</div>
+          <div class="theme-options">
+            <button
+              v-for="option in themeOptions"
+              :key="option.value"
+              type="button"
+              class="theme-option"
+              :class="{ 'is-active': uiTheme === option.value }"
+              :data-theme="option.value"
+              :title="option.hint"
+              @click="chooseTheme(option.value)"
+            >
+              <span class="theme-name">{{ option.label }}</span>
+              <span class="theme-hint">{{ option.hint }}</span>
+            </button>
+          </div>
+        </div>
         <el-button class="drawer-logout" @click="logout">退出登录</el-button>
       </div>
     </el-drawer>
@@ -74,11 +113,21 @@ import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { DataBoard, Menu, Money, Setting } from '@element-plus/icons-vue'
 import { useIsMobile } from '../composables/useIsMobile'
+import { UI_THEME_OPTIONS, applyUiTheme, getUiTheme } from '../theme'
 
 const route = useRoute()
 const router = useRouter()
 const isMobile = useIsMobile()
 const drawerVisible = ref(false)
+
+/** 皮肤三选一：当前选中项在入口里标出来，点一下立即生效。 */
+const themeOptions = UI_THEME_OPTIONS
+const uiTheme = ref(getUiTheme())
+
+function chooseTheme(theme) {
+  if (!applyUiTheme(theme)) return
+  uiTheme.value = theme
+}
 
 const adminName = computed(() => {
   const raw = localStorage.getItem('zhiyin_admin_user')
@@ -206,6 +255,64 @@ function logout() {
   min-height: 44px;
 }
 
+/* 皮肤入口：三项竖排，每项不小于 44 像素，一点即换 */
+.theme-block {
+  margin: 18px 12px 0;
+  padding-top: 12px;
+  border-top: 2px solid var(--zi-aside-hover);
+}
+.theme-title {
+  margin-bottom: 8px;
+  color: var(--zi-aside-active);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+.theme-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.theme-option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 2px;
+  width: 100%;
+  min-height: 44px;
+  padding: 6px 10px;
+  border: 2px solid var(--zi-aside-hover);
+  border-radius: 0;
+  background: transparent;
+  color: var(--zi-aside-text);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.theme-option.is-active {
+  border-color: var(--zi-accent);
+  background: var(--zi-accent);
+  color: var(--zi-accent-ink);
+}
+.theme-name {
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1.3;
+}
+.theme-hint {
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.3;
+  opacity: 0.78;
+}
+.theme-option.is-active .theme-hint {
+  opacity: 0.9;
+}
+.drawer-theme {
+  margin: 12px 16px 0;
+}
+
 /* 窄屏：标题缩小、右侧信息收起，把宽度全留给队列 */
 .is-mobile .header {
   padding: 0 10px;
@@ -243,5 +350,17 @@ function logout() {
 .zi-theme-classic .title {
   font-weight: 600;
   letter-spacing: 0;
+}
+.zi-theme-classic .theme-option {
+  border: none;
+  border-radius: 8px;
+  background: var(--zi-aside-hover);
+  font-weight: 500;
+}
+.zi-theme-classic .theme-option.is-active {
+  background: var(--zi-accent);
+}
+.zi-theme-classic .theme-name {
+  font-weight: 600;
 }
 </style>

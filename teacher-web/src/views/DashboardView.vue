@@ -581,6 +581,20 @@ const fileChangeDialog = reactive({
 const filesDialog = reactive({ visible: false, order: null, files: [] })
 
 /**
+ * 「已替换未确认」订单的两段式拦截计数。
+ *
+ * 计数跟着当前操作的订单走：换到别的订单就从头算（第一下仍然是硬阻止），
+ * 同一单里第一下只提醒先下载，第二下及以后才弹确认框允许强打。
+ */
+const startGuard = reactive({ orderId: null, blocks: 0 })
+
+function resetStartGuard(row) {
+  if (startGuard.orderId === row.id) return
+  startGuard.orderId = row.id
+  startGuard.blocks = 0
+}
+
+/**
  * 弹窗里「这一份文件」的新旧页数与行金额。
  *
  * 后端给了 `*_file_*` 就用它（多文件时这才是被替换那一份自己的数），
@@ -741,6 +755,11 @@ function openFiles(row) {
 function markRowSeen(row) {
   row.files_unconfirmed = false
   row.files_seen_at = new Date().toISOString()
+  // 已确认看到新文件，这一单回到「第一次点击就弹常规确认」，拦截计数清零
+  if (startGuard.orderId === row.id) {
+    startGuard.orderId = null
+    startGuard.blocks = 0
+  }
 }
 
 /** 操作列的整单下载：等同于下载第 1 份。 */
@@ -761,11 +780,18 @@ async function markSeen(row) {
 }
 
 async function start(row) {
+  resetStartGuard(row)
   if (hasUnseenChange(row)) {
-    // 换过文件：先提醒老师本地可能还是旧版本
+    // 第一下只拦不弹框：老师本地很可能还是旧文件，先让他重新下载
+    if (startGuard.blocks === 0) {
+      startGuard.blocks = 1
+      ElMessage.warning('这单文件已替换，请先下载新文件再打印')
+      return
+    }
+    // 第二下及以后：老师已经知道情况，确认后允许强打
     try {
       await ElMessageBox.confirm(
-        '这单换过文件，你本地可能还是旧版本，建议先重新下载再打印。',
+        '这单换过文件，你本地可能还是旧版本，仍要现在开始打印吗？',
         '文件已替换',
         { confirmButtonText: '仍然开始', cancelButtonText: '先下载', type: 'warning' },
       )
