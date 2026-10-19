@@ -84,17 +84,20 @@ async def ai_ocr(
 async def ai_convert(
     payload: ConvertRequest,
     _slot: None = Depends(ai_slot),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
     """用 pdf2docx 转换（不调用大模型），返回新文件的 file_key 与签名链接。
 
     转换是纯 CPU 活，同样走 AI 专用池：它慢起来也会顶满公共线程池。
+    生成的文件记在当前用户名下，学生才能在「移除」时把对象一起删掉。
     """
     if payload.target.lower() != "docx":
         raise BusinessError("V1 只支持转换为 docx", code=40079)
     return ok(
-        await run_ai_job(convert_pdf_to_docx, db, payload.file_key, payload.file_name)
+        await run_ai_job(
+            convert_pdf_to_docx, db, payload.file_key, payload.file_name, user=user
+        )
     )
 
 
@@ -102,10 +105,20 @@ async def ai_convert(
 async def ai_fix(
     payload: FixRequest,
     _slot: None = Depends(ai_slot),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    """AI 只输出结构化修改指令，真正的修改由 python-docx 执行，生成修复副本。"""
+    """AI 只输出结构化修改指令，真正的修改由 python-docx 执行，生成修复副本。
+
+    修复副本同样记在当前用户名下，学生才能把它撤回。
+    """
     return ok(
-        await run_ai_job(fix_document, db, payload.file_key, payload.issue_ids, payload.file_name)
+        await run_ai_job(
+            fix_document,
+            db,
+            payload.file_key,
+            payload.issue_ids,
+            payload.file_name,
+            user=user,
+        )
     )

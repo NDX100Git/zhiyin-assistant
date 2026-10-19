@@ -26,8 +26,10 @@ from docx.shared import Pt
 from sqlalchemy.orm import Session
 
 from app.config import BACKEND_DIR, get_format_rules
+from app.models.user import User
 from app.services.converter import pdf_to_docx_file
 from app.services.doc_parser import get_cached_report, save_report
+from app.services.file_service import record_generated_upload
 from app.services.llm import chat_json
 from app.services.storage import build_object_key, get_storage
 from app.utils.exceptions import BusinessError
@@ -317,8 +319,13 @@ def fix_document(
     file_key: str,
     issue_ids: list[str],
     file_name: str | None = None,
+    *,
+    user: User | None = None,
 ) -> dict:
-    """按勾选的问题生成修复副本。"""
+    """按勾选的问题生成修复副本。
+
+    传入 `user` 时把修复副本写进上传记录，归属当前用户；否则学生无法撤回它。
+    """
     if not file_key:
         raise BusinessError("缺少文件标识", code=40073)
     if not issue_ids:
@@ -384,6 +391,15 @@ def fix_document(
         "notes": notes,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
     }
+    if user is not None:
+        record_generated_upload(
+            db,
+            user,
+            file_key=new_key,
+            file_name=source_name,
+            size=size,
+            content_type=MIME_BY_EXT["docx"],
+        )
     save_report(db, new_key, result, "fix")
     logger.info("文档修复完成：%s -> %s（执行 %d 条指令）", file_key, new_key, len(applied))
     return result

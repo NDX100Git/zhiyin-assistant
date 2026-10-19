@@ -16,7 +16,9 @@ from app.config import get_order_rules, settings
 from app.models.order import Order
 from app.models.payment_log import PaymentLog
 from app.models.queue_session import QueueSession
+from app.models.uploaded_file import UploadedFile
 from app.models.user import User
+from app.services import queue_snapshot
 from app.services.file_change_service import (
     batch_pending_changes,
     create_initial_version,
@@ -41,7 +43,6 @@ from app.services.order_state import (
 )
 from app.services.payment import get_payment_provider
 from app.services.pricing import calc_amount_cents
-from app.services import queue_snapshot
 from app.services.queue_service import batch_wait_info, new_order_wait_info, order_wait_info
 from app.services.session_service import current_session_info, get_or_create_session
 from app.services.storage import get_storage
@@ -141,11 +142,30 @@ def _validate_file_freshness(file_key: str) -> None:
         )
 
 
+def _validate_file_owner(db: Session, user: User, items: list[dict]) -> None:
+    """下单时校验文件归属：有上传记录的必须是本人。
+
+    文件标识本身就长成 `files/...`，单靠格式校验挡不住「拿别人的文件标识下单」。
+    迁移前的历史文件没有上传记录，无法判断归属，继续放行，不能因为补校验把老数据
+    的正常下单挡掉。不区分「不存在」与「是别人的」，避免泄露别人的文件标识。
+    """
+    keys = [item["file_key"] for item in items]
+    rows = db.execute(
+        select(UploadedFile.file_key, UploadedFile.user_id).where(
+            UploadedFile.file_key.in_(keys)
+        )
+    ).all()
+    for _file_key, owner_id in rows:
+        if int(owner_id) != int(user.id):
+            raise BusinessError("文件不存在或不属于当前用户，请重新上传", code=40404)
+
+
 def create_order(db: Session, user: User, payload) -> Order:
     """下单：支持单文件旧写法与文件清单新写法，状态置 pending_pay。"""
     rules = get_order_rules()
     _validate_create(payload, rules["limits"])
     items = normalize_file_items(payload, rules["limits"])
+    _validate_file_owner(db, user, items)
     for item in items:
         _validate_file_freshness(item["file_key"])
 

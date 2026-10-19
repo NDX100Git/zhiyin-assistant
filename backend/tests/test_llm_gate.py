@@ -229,3 +229,31 @@ def test_异步闸门满时也拒绝(monkeypatch) -> None:
         await first
 
     asyncio.run(main())
+
+
+def test_取消排队中的异步调用不占死名额(monkeypatch) -> None:
+    """取消发生在排队期间时，线程事后拿到的名额必须还回去。
+
+    `asyncio.to_thread` 只负责发起排队：调用方取消后线程照旧继续等，最终仍会拿到
+    名额。不处理的话这个名额再没人归还，几次取消之后异步模型调用就全被自己的
+    上限挡住——表现为「AI 功能忽然一直提示人多」。
+    """
+    counter = _Counter()
+    fake = _FakeAsyncClient(_FakeAsyncCompletions(delay=0.0, counter=counter))
+    monkeypatch.setattr(llm, "get_async_client", lambda: fake)
+    monkeypatch.setattr(llm, "is_configured", lambda: True)
+    monkeypatch.setattr(settings, "llm_max_concurrency", 1)
+    monkeypatch.setattr(settings, "llm_queue_wait_seconds", 1.0)
+
+    async def scenario() -> str:
+        holder = llm._acquire_slot(1.0)  # 先占住唯一名额
+        queued = asyncio.create_task(llm.achat(_messages()))
+        await asyncio.sleep(0.1)  # 让它排到线程里等
+        queued.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+        llm._release_slot(holder)  # 放开的瞬间，排队线程仍会把这个名额拿到手
+        await asyncio.sleep(0.2)  # 等线程处理完这个孤儿名额
+        return await llm.achat(_messages())  # 名额已归还，这里必须成功
+
+    assert asyncio.run(scenario()) == "好的"

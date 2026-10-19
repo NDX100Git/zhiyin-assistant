@@ -136,6 +136,46 @@ def _release_slot(semaphore: threading.BoundedSemaphore) -> None:
     semaphore.release()
 
 
+def _release_orphan_slot(task: asyncio.Future) -> None:
+    """排队期间被取消的调用：线程事后拿到的名额要就地归还。"""
+    if task.cancelled():
+        return
+    if task.exception() is not None:
+        # 排队超时之类的失败，本来就没拿到名额，不用归还
+        return
+    semaphore = task.result()
+    if semaphore is not None:
+        _release_slot(semaphore)
+
+
+async def _acquire_slot_async(wait_seconds: float) -> threading.BoundedSemaphore:
+    """异步排队拿名额，且任务被取消时不留孤儿名额。
+
+    `asyncio.to_thread` 只把排队丢进线程：调用方取消之后线程照旧继续等，最终
+    仍会拿到名额。若直接放弃等待，这个名额就永远悬在那儿没人归还，几次取消之后
+    异步模型调用的并发上限被吃光，后续调用全部排队超时。
+
+    所以这里记一个「调用方已经走了」的标志：线程拿到名额时看到标志就当场归还；
+    标志与拿到名额正好擦肩而过时，由回调归还。两条路互斥，名额只还一次。
+    """
+    abandoned = threading.Event()
+
+    def worker() -> threading.BoundedSemaphore | None:
+        semaphore = _acquire_slot(wait_seconds)
+        if abandoned.is_set():
+            _release_slot(semaphore)
+            return None
+        return semaphore
+
+    task = asyncio.ensure_future(asyncio.to_thread(worker))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        abandoned.set()
+        task.add_done_callback(_release_orphan_slot)
+        raise
+
+
 def _chat_with_retry(client: OpenAI, kwargs: dict[str, Any]) -> str:
     attempts = max(1, int(settings.llm_max_attempts))
     last_error: Exception | None = None
@@ -219,10 +259,8 @@ async def achat(
     """
     kwargs = _build_kwargs(messages, json_mode, thinking, temperature)
 
-    # acquire 会阻塞，放到线程里等，不卡事件循环；拿到的名额在 finally 归还
-    slot = await asyncio.to_thread(
-        _acquire_slot, float(settings.llm_queue_wait_seconds)
-    )
+    # 排队在别的线程里等，不卡事件循环；取消时名额也会被还掉；拿到的名额在 finally 归还
+    slot = await _acquire_slot_async(float(settings.llm_queue_wait_seconds))
     try:
         attempts = max(1, int(settings.llm_max_attempts))
         last_error: Exception | None = None

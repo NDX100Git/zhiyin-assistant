@@ -67,19 +67,27 @@ async def ai_slot() -> AsyncIterator[None]:
 
     这是 FastAPI 依赖，必须排在数据库相关依赖**之前**：签名里写在前面，
     FastAPI 就先解它，排队期间不会占数据库连接。
+
+    归还放在一个 finally 里，且只释放拿到的那个信号量对象：正常结束、排队超时、
+    请求被取消（学生关页面、网关断开）都走同一条路，不会把名额留在池子里。
     """
     wait_seconds = float(settings.ai_queue_wait_seconds)
+    semaphore = _semaphore()
+    acquired = False
     try:
-        async with asyncio.timeout(wait_seconds):
-            await _semaphore().acquire()
-    except TimeoutError:
-        logger.warning("AI 名额排队超过 %.1f 秒，直接拒绝", wait_seconds)
-        raise BusinessError("当前使用 AI 的人较多，请稍后重试", code=50034) from None
+        try:
+            async with asyncio.timeout(wait_seconds):
+                await semaphore.acquire()
+                # 标记写在 timeout 内部：拿到名额之后无论怎么退出，finally 都能归还
+                acquired = True
+        except TimeoutError:
+            logger.warning("AI 名额排队超过 %.1f 秒，直接拒绝", wait_seconds)
+            raise BusinessError("当前使用 AI 的人较多，请稍后重试", code=50034) from None
 
-    try:
         yield
     finally:
-        _semaphore().release()
+        if acquired:
+            semaphore.release()
 
 
 async def run_ai_job(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:

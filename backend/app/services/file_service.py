@@ -92,6 +92,32 @@ def _record_upload(
     return now
 
 
+def record_generated_upload(
+    db: Session | None,
+    user: User,
+    *,
+    file_key: str,
+    file_name: str,
+    size: int,
+    content_type: str,
+) -> None:
+    """把服务端生成的文件（AI 修复、PDF 转 Word）也写进上传记录。
+
+    对象存储不记归属，只有上传记录能回答「这个文件是谁的」。少了这一行，
+    学生点「移除」会被归属校验挡住：界面上文件消失了，对象却一直留在桶里。
+    """
+    if db is None:
+        return
+    _record_upload(
+        db,
+        user,
+        file_key=file_key,
+        file_name=file_name,
+        size=size,
+        content_type=content_type,
+    )
+
+
 def store_upload(user: User, upload: UploadFile, db: Session | None = None) -> dict:
     """校验并保存上传文件，返回上传结果（含 30 分钟签名 URL）。"""
     rules = get_upload_rules()

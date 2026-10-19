@@ -137,3 +137,56 @@ def test_名额用完会归还(monkeypatch) -> None:
                 await ai_pool.run_ai_job(lambda: None)
 
     asyncio.run(scenario())
+
+
+def test_取消排队中的请求会归还名额(monkeypatch) -> None:
+    """学生关页面、网关断开都会让请求被取消：排队中的名额不能留在池子里。"""
+    monkeypatch.setattr(settings, "ai_max_workers", 1)
+    monkeypatch.setattr(settings, "ai_queue_wait_seconds", 0.5)
+
+    async def hold() -> None:
+        async with slot():
+            await asyncio.sleep(5)
+
+    async def scenario() -> None:
+        running = asyncio.create_task(hold())
+        await asyncio.sleep(0.05)  # 先占住唯一名额
+        queued = asyncio.create_task(hold())
+        await asyncio.sleep(0.05)  # 第二个任务在事件循环里排队
+        queued.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+
+        # 名额都还回来了：这里排队超时上限只有半秒，卡住就说明漏了
+        async with slot():
+            pass
+
+    asyncio.run(scenario())
+
+
+def test_取消执行中的请求会归还名额(monkeypatch) -> None:
+    """名额已经拿到、活还在线程里跑的时候取消，同样要归还。"""
+    monkeypatch.setattr(settings, "ai_max_workers", 1)
+    monkeypatch.setattr(settings, "ai_queue_wait_seconds", 0.5)
+    release = threading.Event()
+
+    async def job() -> None:
+        async with slot():
+            await ai_pool.run_ai_job(release.wait, 5)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(job())
+        await asyncio.sleep(0.1)  # 名额已到手，线程卡在慢活里
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        async with slot():
+            pass
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()  # 放开线程，别把慢活留到别的用例里

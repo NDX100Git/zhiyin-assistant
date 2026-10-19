@@ -353,6 +353,60 @@ def test_文件替换后标记待确认_老师确认看到后清除(client):
     assert forbidden["code"] == 40300
 
 
+def upload_pdf(client, headers, name: str = "待下单.pdf") -> dict:
+    """走真实上传接口，让文件有上传记录（下单归属校验靠它）。"""
+    body = client.post(
+        "/api/file/upload", files={"file": (name, PDF_BYTES, "application/pdf")}, headers=headers
+    ).json()
+    assert body["code"] == 0, body
+    return body["data"]
+
+
+def test_下单拒绝别人的已记录文件(client, db_session, test_storage):
+    """文件标识格式对但属于别人：下单要拦下，不能靠格式校验放行。"""
+    owner = student_headers(client, "order-owner-file")
+    other = student_headers(client, "order-other-file")
+    uploaded = upload_pdf(client, owner, "别人的论文.pdf")
+
+    body = client.post(
+        "/api/order/create",
+        json=_create_payload(
+            [_file_item("别人的论文.pdf", 2, uploaded["file_key"])]
+        ),
+        headers=other,
+    ).json()
+
+    assert body["code"] == 40404
+    assert "不属于当前用户" in body["message"]
+    # 被拒的请求不能留下半个订单
+    assert db_session.execute(select(Order)).first() is None
+
+
+def test_下单放行自己的已记录文件(client, db_session, test_storage):
+    headers = student_headers(client, "order-own-file")
+    uploaded = upload_pdf(client, headers, "我的论文.pdf")
+
+    order = create_order(
+        client, headers, [_file_item("我的论文.pdf", 2, uploaded["file_key"])]
+    )
+
+    assert order["files"][0]["file_key"] == uploaded["file_key"]
+    assert order["files"][0]["file_index"] == 1
+
+
+def test_下单放行没有上传记录的历史文件(client, db_session):
+    """迁移前的老文件没有上传记录，无法判断归属：继续放行，不能挡掉正常下单。"""
+    headers = student_headers(client, "order-legacy-file")
+    legacy_key = _file_key("legacy")
+    assert db_session.execute(
+        select(UploadedFile).where(UploadedFile.file_key == legacy_key)
+    ).scalar_one_or_none() is None
+
+    order = create_order(client, headers, [_file_item("历史文件.pdf", 2, legacy_key)])
+
+    assert order["files"][0]["file_key"] == legacy_key
+
+
 def test_撤回未下单文件删除对象与上传记录(client, db_session, test_storage):
     headers = student_headers(client, "withdraw-owner")
     uploaded = client.post(
