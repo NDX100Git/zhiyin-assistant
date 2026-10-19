@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     llm_max_attempts: int = 2
     llm_max_concurrency: int = 4
     llm_queue_wait_seconds: float = 3.0
+    # AI 任务专用线程池大小与排队上限。公共线程池只留给交易链路，
+    # AI 再慢也只占这几个名额；排队等不到就早失败，不占线程。
+    ai_max_workers: int = 4
+    ai_queue_wait_seconds: float = 30.0
 
     # 管理员（阶段 4 使用）
     admin_username: str = "admin"

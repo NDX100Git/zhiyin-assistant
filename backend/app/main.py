@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.database import init_db
 from app.routers import admin, ai, auth, file, home, notice, order
+from app.services.ai_pool import shutdown_ai_pool
 from app.services.cleanup import cleanup_loop
 from app.utils.exceptions import register_exception_handlers
 from app.utils.response import ok
@@ -54,6 +55,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
             cleanup_task.cancel()
             with suppress(asyncio.CancelledError):
                 await cleanup_task
+        shutdown_ai_pool()
 
 
 app = FastAPI(
