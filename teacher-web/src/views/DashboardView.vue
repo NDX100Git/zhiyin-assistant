@@ -1,5 +1,5 @@
 <template>
-  <div class="dashboard">
+  <div class="dashboard" :class="{ 'is-mobile': isMobile }">
     <div class="stats">
       <div class="stat">
         <div class="stat-label">今日接单</div>
@@ -19,7 +19,7 @@
       </div>
     </div>
 
-    <div class="page-card toolbar">
+    <div class="page-card toolbar" :class="{ stacked: isMobile }">
       <div class="left">
         <el-select v-model="filters.status" placeholder="全部状态" clearable style="width: 140px">
           <el-option v-for="item in statusOptions" :key="item.value" :label="item.label" :value="item.value" />
@@ -61,6 +61,7 @@
       </div>
 
       <el-table
+        v-if="!isMobile"
         v-loading="loading"
         :data="orders"
         row-key="id"
@@ -125,9 +126,55 @@
           </template>
         </el-table-column>
       </el-table>
+
+      <!-- 手机上八列宽表会被压扁，改成一条订单一张卡，取件码和按钮优先 -->
+      <div v-else class="order-cards" v-loading="loading">
+        <div v-for="row in orders" :key="row.id" class="order-card">
+          <div class="oc-head">
+            <span class="oc-code">{{ row.pickup_code }}</span>
+            <el-tag :type="statusType(row.status)" effect="light">{{ row.status_label }}</el-tag>
+          </div>
+          <div class="oc-line muted">{{ row.order_no }} · {{ fileFormatter(row) }}</div>
+          <div class="oc-line">
+            {{ row.page_count }} 页 · {{ row.print_side === 2 ? '双面' : '单面' }} ·
+            {{ row.color_mode === 1 ? '彩色' : '黑白' }} · {{ row.copies }} 份
+          </div>
+          <div class="oc-line">
+            <span class="money">{{ yuan(row.amount_cents) }}</span>
+            <span class="muted">{{ row.paid ? '已支付' : '待收款' }}</span>
+          </div>
+          <div class="oc-actions">
+            <el-button size="large" @click="download(row)">下载</el-button>
+            <el-button v-if="row.status === 'queuing'" size="large" type="primary" @click="start(row)">
+              开始打印
+            </el-button>
+            <el-button v-if="row.status === 'printing'" size="large" type="success" @click="openComplete(row)">
+              打印完成
+            </el-button>
+            <el-button v-if="row.status === 'ready'" size="large" type="success" @click="openVerify(row)">
+              核销
+            </el-button>
+            <el-button
+              v-if="['queuing', 'printing', 'ready'].includes(row.status)"
+              size="large"
+              type="warning"
+              @click="openAbnormal(row)"
+            >
+              异常
+            </el-button>
+            <el-button v-if="row.status === 'abnormal'" size="large" type="primary" @click="recover(row)">
+              恢复排队
+            </el-button>
+            <el-button v-if="row.status === 'abnormal'" size="large" type="danger" @click="closeAbnormal(row)">
+              关闭异常单
+            </el-button>
+          </div>
+        </div>
+        <el-empty v-if="!loading && orders.length === 0" description="没有订单" />
+      </div>
     </div>
 
-    <el-dialog v-model="completeDialog.visible" title="打印完成" width="420px">
+    <el-dialog v-model="completeDialog.visible" title="打印完成" :width="isMobile ? '92%' : '420px'">
       <div v-if="completeDialog.order">
         <el-descriptions :column="1" size="small" border>
           <el-descriptions-item label="订单号">{{ completeDialog.order.order_no }}</el-descriptions-item>
@@ -156,7 +203,7 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="verifyDialog.visible" title="核销取件" width="420px">
+    <el-dialog v-model="verifyDialog.visible" title="核销取件" :width="isMobile ? '92%' : '420px'">
       <div v-if="verifyDialog.order">
         <el-descriptions :column="1" size="small" border>
           <el-descriptions-item label="订单号">{{ verifyDialog.order.order_no }}</el-descriptions-item>
@@ -179,7 +226,7 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="abnormalDialog.visible" title="标记异常" width="420px">
+    <el-dialog v-model="abnormalDialog.visible" title="标记异常" :width="isMobile ? '92%' : '420px'">
       <el-input
         v-model="abnormalDialog.reason"
         type="textarea"
@@ -198,6 +245,7 @@
 
 <script setup>
 import { onMounted, onUnmounted, reactive, ref } from 'vue'
+import { useIsMobile } from '../composables/useIsMobile'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   batchComplete,
@@ -230,6 +278,7 @@ const stats = reactive({
   ready_count: 0,
   abnormal_count: 0,
 })
+const isMobile = useIsMobile()
 const orders = ref([])
 
 /** 文件名可能为空（接口未带），表格里给个占位，避免整列看着像坏掉。 */
@@ -517,6 +566,84 @@ document.addEventListener('visibilitychange', () => {
 }
 .table-card {
   padding-top: 14px;
+}
+
+/* 手机版：统计换两列，工具栏竖排，订单换成卡片 */
+.is-mobile .table-head {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+.is-mobile .table-head :deep(.el-button) {
+  width: 100%;
+  min-height: 44px;
+}
+.is-mobile .stats {
+  grid-template-columns: repeat(2, 1fr);
+}
+.is-mobile .toolbar.stacked {
+  flex-direction: column;
+  align-items: stretch;
+}
+.is-mobile .toolbar.stacked .left,
+.is-mobile .toolbar.stacked .right {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+.is-mobile .toolbar.stacked :deep(.el-select),
+.is-mobile .toolbar.stacked :deep(.el-input) {
+  width: 100% !important;
+}
+.is-mobile .toolbar.stacked :deep(.el-button) {
+  width: 100%;
+  min-height: 44px;
+}
+.order-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.order-card {
+  padding: 14px;
+  background: var(--zi-paper);
+  border: var(--zi-card-border);
+  border-left: 6px solid var(--zi-accent);
+  border-radius: var(--zi-radius);
+}
+.oc-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.oc-code {
+  font-family: Menlo, Consolas, monospace;
+  font-size: 22px;
+  font-weight: 900;
+  letter-spacing: 0.02em;
+  color: var(--zi-accent);
+  word-break: break-all;
+}
+.oc-line {
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--zi-ink);
+}
+.oc-line .muted {
+  margin-left: 6px;
+}
+.oc-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.oc-actions :deep(.el-button) {
+  flex: 1 1 44%;
+  min-height: 44px;
+  margin-left: 0;
 }
 .table-head {
   display: flex;

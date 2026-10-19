@@ -1,6 +1,6 @@
 <template>
-  <el-container class="layout">
-    <el-aside width="200px" class="aside">
+  <el-container class="layout" :class="{ 'is-mobile': isMobile }">
+    <el-aside v-if="!isMobile" width="200px" class="aside">
       <div class="brand">智印助手</div>
       <div class="brand-sub">文印室后台</div>
       <el-menu :default-active="route.path" router>
@@ -21,7 +21,18 @@
 
     <el-container>
       <el-header class="header">
-        <div class="title">{{ route.meta.title || '工作台' }}</div>
+        <div class="title-wrap">
+          <el-button
+            v-if="isMobile"
+            class="menu-trigger"
+            text
+            aria-label="打开菜单"
+            @click="drawerVisible = true"
+          >
+            <el-icon :size="22"><Menu /></el-icon>
+          </el-button>
+          <div class="title">{{ route.meta.title || '工作台' }}</div>
+        </div>
         <div class="right">
           <el-tag type="success" effect="plain" size="small">服务在线</el-tag>
           <span class="admin">{{ adminName }}</span>
@@ -32,16 +43,42 @@
         <router-view />
       </el-main>
     </el-container>
+
+    <!-- 手机上侧边栏改成抽屉：柜台前一只手就能切页面，不占宽度 -->
+    <el-drawer v-model="drawerVisible" direction="ltr" size="240px" :with-header="false">
+      <div class="drawer-body">
+        <div class="brand">智印助手</div>
+        <div class="brand-sub">文印室后台</div>
+        <el-menu :default-active="route.path" router @select="drawerVisible = false">
+          <el-menu-item index="/dashboard">
+            <el-icon><DataBoard /></el-icon>
+            <span>工作台</span>
+          </el-menu-item>
+          <el-menu-item index="/transactions">
+            <el-icon><Money /></el-icon>
+            <span>收款流水</span>
+          </el-menu-item>
+          <el-menu-item index="/settings">
+            <el-icon><Setting /></el-icon>
+            <span>收单与公告</span>
+          </el-menu-item>
+        </el-menu>
+        <el-button class="drawer-logout" @click="logout">退出登录</el-button>
+      </div>
+    </el-drawer>
   </el-container>
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DataBoard, Money, Setting } from '@element-plus/icons-vue'
+import { DataBoard, Menu, Money, Setting } from '@element-plus/icons-vue'
+import { useIsMobile } from '../composables/useIsMobile'
 
 const route = useRoute()
 const router = useRouter()
+const isMobile = useIsMobile()
+const drawerVisible = ref(false)
 
 const adminName = computed(() => {
   const raw = localStorage.getItem('zhiyin_admin_user')
@@ -131,6 +168,57 @@ function logout() {
 .main {
   background: transparent;
   padding: 18px;
+}
+.title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.menu-trigger {
+  padding: 0 6px;
+  color: var(--zi-ink);
+}
+.drawer-body {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 18px 0;
+  background: var(--zi-aside-bg);
+}
+.drawer-body :deep(.el-menu) {
+  border-right: none;
+  background: transparent;
+  --el-menu-bg-color: transparent;
+  --el-menu-text-color: var(--zi-aside-text);
+  --el-menu-active-color: var(--zi-aside-active);
+  --el-menu-hover-bg-color: var(--zi-aside-hover);
+}
+.drawer-body :deep(.el-menu-item) {
+  height: 52px;
+  font-weight: 700;
+}
+.drawer-body :deep(.el-menu-item.is-active) {
+  background: var(--zi-accent);
+  color: var(--zi-accent-ink);
+}
+.drawer-logout {
+  margin: auto 16px 8px;
+  min-height: 44px;
+}
+
+/* 窄屏：标题缩小、右侧信息收起，把宽度全留给队列 */
+.is-mobile .header {
+  padding: 0 10px;
+}
+.is-mobile .title {
+  font-size: 17px;
+}
+.is-mobile .admin,
+.is-mobile .right :deep(.el-tag) {
+  display: none;
+}
+.is-mobile .main {
+  padding: 10px;
 }
 
 /* 旧蓝白皮肤 */
