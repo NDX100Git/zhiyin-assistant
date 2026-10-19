@@ -216,6 +216,19 @@ def _pick(item: dict, key: str, default):
     return default if value is None else value
 
 
+def item_amount_cents(item: dict[str, Any]) -> int:
+    """清单项的行金额（分）= 单价 × 该份文档页数 × 该份份数。
+
+    报价、下单落库与换文件重算都从这里取数，不存在第二套算价公式。
+    """
+    return calc_amount_cents(
+        int(item["page_count"]),
+        int(item["print_side"]),
+        int(item["color_mode"]),
+        int(item["copies"]),
+    )
+
+
 def items_totals(items: list[dict[str, Any]]) -> tuple[int, int, int]:
     """清单汇总：(文档总页数, 打印总页数, 系统总价)。下单时用它写订单兼容字段。"""
     total_pages = 0
@@ -226,10 +239,38 @@ def items_totals(items: list[dict[str, Any]]) -> tuple[int, int, int]:
         copies = int(item["copies"])
         total_pages += page_count
         total_print_pages += page_count * copies
-        amount_cents += calc_amount_cents(
-            page_count, int(item["print_side"]), int(item["color_mode"]), copies
-        )
+        amount_cents += item_amount_cents(item)
     return total_pages, total_print_pages, amount_cents
+
+
+def quote_items(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """把规范化后的清单算成报价视图：逐份行金额 + 文档页数/打印页数/总额。
+
+    返回结构与订单文件项同一套键名（FILE_VIEW_KEYS），学生端与老师端
+    可以拿同一套归一化逻辑读报价与订单，不必区分两个来源。
+    """
+    total_pages, total_print_pages, amount_cents = items_totals(items)
+    files = [
+        {
+            "file_index": int(item["file_index"]),
+            "file_key": item["file_key"],
+            "file_name": item.get("file_name"),
+            "page_count": int(item["page_count"]),
+            "print_pages": int(item["page_count"]) * int(item["copies"]),
+            "print_side": int(item["print_side"]),
+            "color_mode": int(item["color_mode"]),
+            "paper_size": item["paper_size"],
+            "copies": int(item["copies"]),
+            "amount_cents": item_amount_cents(item),
+        }
+        for item in items
+    ]
+    return {
+        "files": files,
+        "page_count": total_pages,
+        "print_page_count": total_print_pages,
+        "amount_cents": amount_cents,
+    }
 
 
 def normalize_file_items(payload, limits: dict) -> list[dict[str, Any]]:
@@ -417,9 +458,11 @@ __all__ = [
     "file_to_dict",
     "files_view",
     "is_file_unconfirmed",
+    "item_amount_cents",
     "items_totals",
     "line_amount_cents",
     "normalize_file_items",
+    "quote_items",
     "recalc_order_totals",
     "resolve_file_row",
     "row_print_params",

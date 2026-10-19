@@ -33,6 +33,7 @@ from app.services.order_file_service import (
     is_file_unconfirmed,
     items_totals,
     normalize_file_items,
+    quote_items,
     validate_print_params,
 )
 from app.services.order_state import (
@@ -137,7 +138,7 @@ def _validate_file_freshness(file_key: str) -> None:
 
 
 def _validate_file_owner(db: Session, user: User, items: list[dict]) -> None:
-    """下单时逐个校验文件归属：没有上传记录、或记录不是本人，一律拒绝。
+    """逐个校验文件归属：没有上传记录、或记录不是本人，一律拒绝。
 
     文件标识本身就长成 `files/...`，单靠格式校验挡不住「拿别人的文件标识下单」。
     历史文件缺少上传记录时同样不能确认归属，因此直接拒绝并要求重新上传；
@@ -158,14 +159,24 @@ def _validate_file_owner(db: Session, user: User, items: list[dict]) -> None:
             raise BusinessError("文件不存在或不属于当前用户，请重新上传", code=40404)
 
 
-def create_order(db: Session, user: User, payload) -> Order:
-    """下单：支持单文件旧写法与文件清单新写法，状态置 pending_pay。"""
+def _prepare_items(db: Session, user: User, payload) -> list[dict]:
+    """下单与报价共用的入场校验：参数、清单归一化、归属、文件新鲜度。
+
+    两个接口必须走这同一条路径：报价只是“只算不落库”，一旦两边各写一套，
+    页面上的估价与真实扣款就会分叉。
+    """
     rules = get_order_rules()
     _validate_create(payload, rules["limits"])
     items = normalize_file_items(payload, rules["limits"])
     _validate_file_owner(db, user, items)
     for item in items:
         _validate_file_freshness(item["file_key"])
+    return items
+
+
+def create_order(db: Session, user: User, payload) -> Order:
+    """下单：支持单文件旧写法与文件清单新写法，状态置 pending_pay。"""
+    items = _prepare_items(db, user, payload)
 
     # 截单不拒绝下单：仅把订单排到下一个打印时段（首页会给出提示）
     session_info = current_session_info(db)
@@ -237,6 +248,18 @@ def create_order(db: Session, user: User, payload) -> Order:
     logger.info("创建订单成功：%s 取件码 %s 金额 %s 分", order.order_no, order.pickup_code,
                 order.amount_cents)
     return order
+
+
+def quote_order(db: Session, user: User, payload) -> dict:
+    """服务端报价：与下单同一套校验与同一套计费，只算不落库。
+
+    不建订单、不写订单文件行、不碰队列快照，也不生成订单号；
+    校验（含越界参数与文件归属）与下单走同一条 `_prepare_items`，
+    行金额与三种合计走 `order_file_service.quote_items`，前端拿到的数字
+    与随后下单时落库的数字是同一次计算的结果。
+    """
+    items = _prepare_items(db, user, payload)
+    return quote_items(items)
 
 
 def get_owned_order(db: Session, user: User, order_id: int) -> Order:

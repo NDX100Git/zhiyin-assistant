@@ -28,25 +28,33 @@
 
       <view class="card">
         <view class="row"><text class="k">订单号</text><text class="v">{{ order.order_no }}</text></view>
-        <!-- 多文件订单一单一个取件码：清单逐份列出，老师按这份清单打印 -->
+        <!-- 多文件订单一单一个取件码：清单逐份列出参数、文档页数、打印页数与行金额 -->
         <view v-if="files.length > 1" class="file-block">
-          <text class="k">文件（{{ files.length }} 份 · 共 {{ pagesTotal }} 页）</text>
+          <text class="k">文件（{{ files.length }} 份 · 文档 {{ pagesTotal }} 页 · 打印 {{ printPagesTotal }} 页）</text>
           <view v-for="(item, index) in files" :key="item.file_index" class="file-line">
             <text class="file-index">{{ index + 1 }}</text>
-            <text class="file-name">{{ item.file_name }}</text>
-            <text class="file-pages">{{ item.page_count }} 页</text>
+            <view class="file-line-main">
+              <text class="file-name">{{ item.file_name }}</text>
+              <text class="file-params">{{ paramSummary(item) }}</text>
+              <text class="file-pages">文档 {{ item.page_count }} 页 · 打印 {{ item.print_pages }} 页</text>
+            </view>
+            <text class="file-amount">{{ formatMoney(item.amount_cents) }}</text>
           </view>
         </view>
         <view v-else class="row">
           <text class="k">文件</text>
           <text class="v">{{ files.length ? files[0].file_name : (order.file_name || '论文文档') }}</text>
         </view>
-        <view class="row"><text class="k">页数</text><text class="v">{{ pagesTotal }} 页</text></view>
+        <view class="row"><text class="k">文档页数</text><text class="v">{{ pagesTotal }} 页</text></view>
+        <view class="row"><text class="k">打印页数</text><text class="v">{{ printPagesTotal }} 页</text></view>
         <view v-if="fileChangedAt" class="row">
           <text class="k">文件状态</text>
           <text class="v">{{ teacherUnconfirmed(order) ? '已替换，等老师重新下载确认' : '已替换，老师已确认' }}</text>
         </view>
-        <view class="row"><text class="k">打印</text><text class="v">{{ order.print_side === 2 ? '双面' : '单面' }} · {{ order.color_mode === 1 ? '彩色' : '黑白' }} · {{ order.copies }} 份</text></view>
+        <view class="row">
+          <text class="k">打印</text>
+          <text class="v">{{ printSummary }}</text>
+        </view>
         <view class="row"><text class="k">金额</text><text class="v money">{{ formatMoney(order.amount_cents) }}{{ order.paid ? '（已支付）' : '（未支付）' }}</text></view>
         <view class="row"><text class="k">下单时间</text><text class="v">{{ formatTime(order.created_at) }}</text></view>
         <view v-if="order.cancel_reason" class="row"><text class="k">取消原因</text><text class="v">{{ order.cancel_reason }}</text></view>
@@ -105,7 +113,7 @@ import { POLL_INTERVAL } from '@/config'
 import { request } from '@/services/api'
 import { ensureLogin } from '@/services/auth'
 import { createPoller, notify, notifyError } from '@/services/notify'
-import { changeTarget, orderFiles, teacherUnconfirmed, totalPages } from '@/services/orderFiles'
+import { changeTarget, orderFiles, paramSummary, teacherUnconfirmed, totalPages, totalPrintPages } from '@/services/orderFiles'
 import { usePullRefresh } from '@/ui/pullRefresh'
 import { useUiTheme } from '@/ui/theme'
 
@@ -122,6 +130,14 @@ const fileChange = computed(() => (order.value && order.value.file_change) || nu
 /** 当前生效的文件清单（多文件订单多行，老订单自动兜底成一行）。 */
 const files = computed(() => orderFiles(order.value))
 const pagesTotal = computed(() => totalPages(order.value))
+const printPagesTotal = computed(() => totalPrintPages(order.value))
+/** 整单打印参数：单文件直接念这一份的参数，多文件逐份设置。 */
+const printSummary = computed(() => {
+  if (files.value.length > 1) return '逐份设置，见上方文件清单'
+  if (files.value.length === 1) return paramSummary(files.value[0])
+  const current = order.value || {}
+  return `${current.print_side === 2 ? '双面' : '单面'} · ${current.color_mode === 1 ? '彩色' : '黑白'} · ${current.copies} 份`
+})
 const fileChangedAt = computed(() => (order.value && order.value.file_changed_at) || '')
 /** 这次换文件针对哪一份，多文件时说清「第 N 个文件」。 */
 const changeInfo = computed(() => changeTarget(order.value))
@@ -473,14 +489,15 @@ function goOrder() {
 /* 多文件清单：与 .row 同一套分隔线，逐份列出顺序、文件名与页数 */
 .file-block {
   display: flex;
-  align-items: flex-start;
+  flex-direction: column;
   padding: 18rpx 0;
   border-bottom: 2rpx solid var(--zi-line);
   font-size: 28rpx;
 }
 .file-block .k {
-  flex: 0 0 150rpx;
-  width: 150rpx;
+  flex: 0 0 auto;
+  width: auto;
+  margin-bottom: 6rpx;
 }
 .file-line {
   display: flex;
@@ -504,11 +521,31 @@ function goOrder() {
   line-height: 1.6;
   word-break: break-all;
 }
-.file-pages {
+.file-line-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.file-params {
+  color: var(--zi-ink);
+  font-size: 22rpx;
+  line-height: 1.6;
+}
+.file-amount {
+  flex: 0 0 auto;
   margin-left: 14rpx;
+  color: var(--zi-ink);
+  font-size: 26rpx;
+  font-weight: 900;
+  white-space: nowrap;
+}
+.file-pages {
+  margin-left: 0;
   color: var(--zi-muted);
   font-size: 24rpx;
-  white-space: nowrap;
+  line-height: 1.6;
+  word-break: break-all;
 }
 
 .card-head {

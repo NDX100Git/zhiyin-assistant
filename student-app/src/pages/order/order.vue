@@ -16,19 +16,74 @@
       </view>
 
       <view v-if="files.length" class="file-list">
-        <view v-for="(item, index) in files" :key="item.uid" class="file-row">
-          <view class="file-main">
-            <text class="file-name">
-              {{ files.length > 1 ? `${index + 1}. ` : '' }}{{ item.file_name }}
-            </text>
-            <text class="file-meta">
-              {{ item.page_count ? `${item.page_count} 页` : '读取页数中…' }}
-              <text v-if="item.size"> · {{ formatSize(item.size) }}</text>
-            </text>
+        <view
+          v-for="(item, index) in files"
+          :key="item.uid"
+          class="file-row"
+          :data-file-index="index + 1"
+        >
+          <view class="file-head">
+            <view class="file-main">
+              <text class="file-name">
+                {{ files.length > 1 ? `${index + 1}. ` : '' }}{{ item.file_name }}
+              </text>
+              <text class="file-meta">
+                {{ item.page_count ? `${item.page_count} 页` : '读取页数中…' }}
+                <text v-if="item.size"> · {{ formatSize(item.size) }}</text>
+              </text>
+            </view>
+            <!-- 移除 = 撤回这份还没下单的上传文件，服务端同时删对象与上传记录 -->
+            <view class="file-remove" :class="{ busy: removingUid === item.uid }" @click="removeFile(index)">
+              {{ removingUid === item.uid ? '撤回中' : '移除' }}
+            </view>
           </view>
-          <!-- 移除 = 撤回这份还没下单的上传文件，服务端同时删对象与上传记录 -->
-          <view class="file-remove" :class="{ busy: removingUid === item.uid }" @click="removeFile(index)">
-            {{ removingUid === item.uid ? '撤回中' : '移除' }}
+          <!--
+            多文件时每份文件单独设单双面、颜色、纸张、份数；
+            行金额与打印页数只从服务端报价取，页面不乘单价。
+          -->
+          <view v-if="!singleFile" class="file-params">
+            <view class="file-param">
+              <text class="file-param-label">单双面</text>
+              <view class="seg">
+                <view class="seg-item" :class="{ on: item.print_side === 1 }" @click.stop="setFileParam(index, 'print_side', 1)">单面</view>
+                <view class="seg-item" :class="{ on: item.print_side === 2 }" @click.stop="setFileParam(index, 'print_side', 2)">双面</view>
+              </view>
+            </view>
+            <view class="file-param">
+              <text class="file-param-label">颜色</text>
+              <view class="seg">
+                <view class="seg-item" :class="{ on: item.color_mode === 0 }" @click.stop="setFileParam(index, 'color_mode', 0)">黑白</view>
+                <view class="seg-item" :class="{ on: item.color_mode === 1 }" @click.stop="setFileParam(index, 'color_mode', 1)">彩色</view>
+              </view>
+            </view>
+            <view class="file-param">
+              <text class="file-param-label">纸张</text>
+              <view class="seg">
+                <view
+                  v-for="paper in paperSizes"
+                  :key="paper"
+                  class="seg-item"
+                  :class="{ on: item.paper_size === paper }"
+                  @click.stop="setFileParam(index, 'paper_size', paper)"
+                >{{ paper }}</view>
+              </view>
+            </view>
+            <view class="file-param">
+              <text class="file-param-label">份数</text>
+              <view class="stepper-wrap">
+                <text class="stepper" @click.stop="changeFileCopies(index, -1)">－</text>
+                <text class="copy-num">{{ item.copies }}</text>
+                <text class="stepper" @click.stop="changeFileCopies(index, 1)">＋</text>
+              </view>
+            </view>
+            <view class="file-quote">
+              <text class="file-print-pages">
+                {{ lineOf(index) ? `打印 ${lineOf(index).print_pages} 页` : '打印页数读取中…' }}
+              </text>
+              <text class="file-amount">
+                {{ lineOf(index) ? formatMoney(lineOf(index).amount_cents) : '金额读取中…' }}
+              </text>
+            </view>
           </view>
         </view>
       </view>
@@ -128,54 +183,84 @@
       </button>
     </view>
 
-    <view v-if="plan" class="card">
+    <view v-if="plan" class="card plan-card">
       <view class="card-head">
         <text class="card-title">3. 打印方案</text>
         <text class="tag">
-          {{ planUsesAi ? 'AI 优化方案' : '基础方案' }} · 共 {{ totalPages }} 页{{ files.length > 1 ? ` · ${files.length} 个文件` : '' }}
+          {{ planUsesAi ? 'AI 优化方案' : '基础方案' }} · 共 {{ docPages }} 页{{ files.length > 1 ? ` · ${files.length} 个文件` : '' }}
         </text>
       </view>
       <text class="ai-recommend">当前方案：{{ plan.recommend.print_side === 2 ? '双面' : '单面' }} · {{ plan.recommend.color_mode === 1 ? '彩色' : '黑白' }} · {{ layoutLabel(plan.recommend.layout) }}</text>
-      <view class="opt-row">
-        <text class="opt-label">单双面</text>
-        <view class="seg">
-          <view class="seg-item" :class="{ on: printSide === 1 }" @click.stop="choose('print_side', 1)">单面</view>
-          <view class="seg-item" :class="{ on: printSide === 2 }" @click.stop="choose('print_side', 2)">双面</view>
+      <!-- 单文件维持旧界面：参数在订单级设一次，提交时继承给那一份 -->
+      <template v-if="singleFile">
+        <view class="opt-row">
+          <text class="opt-label">单双面</text>
+          <view class="seg">
+            <view class="seg-item" :class="{ on: printSide === 1 }" @click.stop="choose('print_side', 1)">单面</view>
+            <view class="seg-item" :class="{ on: printSide === 2 }" @click.stop="choose('print_side', 2)">双面</view>
+          </view>
+        </view>
+        <view class="opt-row">
+          <text class="opt-label">颜色</text>
+          <view class="seg">
+            <view class="seg-item" :class="{ on: colorMode === 0 }" @click.stop="choose('color_mode', 0)">黑白</view>
+            <view class="seg-item" :class="{ on: colorMode === 1 }" @click.stop="choose('color_mode', 1)">彩色</view>
+          </view>
+        </view>
+        <view class="opt-row">
+          <text class="opt-label">版式</text>
+          <view class="seg">
+            <view v-for="item in layouts" :key="item.value" class="seg-item" :class="{ on: layout === item.value }" @click.stop="choose('layout', item.value)">{{ item.label }}</view>
+          </view>
+        </view>
+        <view class="opt-row">
+          <text class="opt-label">份数</text>
+          <view class="stepper-wrap">
+            <text class="stepper" @click.stop="changeCopies(-1)">－</text>
+            <text class="copy-num">{{ copies }}</text>
+            <text class="stepper" @click.stop="changeCopies(1)">＋</text>
+          </view>
+        </view>
+      </template>
+      <view v-else class="multi-tip">
+        <text class="multi-tip-text">多文件逐份设置：每份的单双面、颜色、纸张、份数在上面文件清单里单独改，行金额与整单金额按服务端报价。</text>
+        <view class="opt-row">
+          <text class="opt-label">版式</text>
+          <view class="seg">
+            <view v-for="item in layouts" :key="item.value" class="seg-item" :class="{ on: layout === item.value }" @click.stop="choose('layout', item.value)">{{ item.label }}</view>
+          </view>
         </view>
       </view>
-      <view class="opt-row">
-        <text class="opt-label">颜色</text>
-        <view class="seg">
-          <view class="seg-item" :class="{ on: colorMode === 0 }" @click.stop="choose('color_mode', 0)">黑白</view>
-          <view class="seg-item" :class="{ on: colorMode === 1 }" @click.stop="choose('color_mode', 1)">彩色</view>
+      <!-- 页数与金额全部来自 /api/order/quote，页面不乘单价 -->
+      <view class="quote-summary">
+        <view class="quote-row">
+          <text class="quote-k">文档页数</text>
+          <text class="quote-v">{{ docPages }} 页</text>
+        </view>
+        <view class="quote-row">
+          <text class="quote-k">打印页数</text>
+          <text class="quote-v">{{ printPages === null ? '读取中…' : `${printPages} 页` }}</text>
+        </view>
+        <view class="quote-row">
+          <text class="quote-k">应付金额</text>
+          <text class="quote-v money">{{ formatMoney(quoteAmount) }}</text>
         </view>
       </view>
-      <view class="opt-row">
-        <text class="opt-label">版式</text>
-        <view class="seg">
-          <view v-for="item in layouts" :key="item.value" class="seg-item" :class="{ on: layout === item.value }" @click.stop="choose('layout', item.value)">{{ item.label }}</view>
-        </view>
-      </view>
-      <view class="opt-row">
-        <text class="opt-label">份数</text>
-        <view class="stepper-wrap">
-          <text class="stepper" @click.stop="changeCopies(-1)">－</text>
-          <text class="copy-num">{{ copies }}</text>
-          <text class="stepper" @click.stop="changeCopies(1)">＋</text>
-        </view>
-      </view>
+      <text v-if="quoteError" class="quote-error">
+        服务端报价失败：{{ quoteError }}；上面显示的是上一次服务端算出的金额，改参数后会自动重试。
+      </text>
       <text class="plan-reason">{{ singleFile ? 'AI 建议理由' : '方案估算依据' }}：{{ plan.reason }}</text>
       <view v-if="singleFile" class="savings">
         <text>纸张 {{ plan.original_sheets }} → {{ plan.sheets_needed }} 张</text>
         <text class="green">省 {{ plan.saved_sheets }} 张</text>
-        <text class="money">预计 {{ formatMoney(plan.amount_cents) }}</text>
+        <text class="money">预计 {{ formatMoney(quoteAmount) }}</text>
       </view>
       <view v-else class="savings">
-        <text>{{ files.length }} 个文件 · 共 {{ totalPages }} 页 × {{ copies }} 份</text>
-        <text class="money">预计 {{ formatMoney(quoteCents) }}</text>
+        <text>{{ files.length }} 个文件 · 文档 {{ docPages }} 页 · 打印 {{ printPages === null ? '—' : printPages }} 页</text>
+        <text class="money">预计 {{ formatMoney(quoteAmount) }}</text>
       </view>
-      <button class="primary block" :disabled="busy" @click="createOrder">
-        {{ files.length > 1 ? `确认下单（${files.length} 个文件 · ${totalPages} 页）` : '确认下单' }}
+      <button class="primary block" :disabled="busy || !plan || !!quoteError" @click="createOrder">
+        {{ files.length > 1 ? `确认下单（${files.length} 个文件 · ${docPages} 页）` : '确认下单' }}
       </button>
     </view>
 
@@ -194,10 +279,11 @@
 </template>
 
 <script setup>
-import { computed, ref } from 'vue'
-import { deleteUploadedFile, request, uploadFile } from '@/services/api'
+import { computed, onUnmounted, ref } from 'vue'
+import { deleteUploadedFile, quoteOrder, request, uploadFile } from '@/services/api'
 import { ensureLogin } from '@/services/auth'
 import { MAX_FILES_PER_PICK, chooseDocuments, chooseImage, loadDemoDocument } from '@/services/filePicker'
+import { PAPER_SIZES } from '@/services/orderFiles'
 import { notify, notifyError } from '@/services/notify'
 import { useUiTheme } from '@/ui/theme'
 
@@ -215,7 +301,9 @@ const checking = ref(false)
 
 /**
  * 本轮要打印的文件清单（多文件合成一单）。
- * 每个元素：`{uid, file_key, file_name, size, page_count}`；uid 只给列表 key 用。
+ * 每个元素：
+ * `{uid, file_key, file_name, size, page_count, print_side, color_mode, paper_size, copies}`。
+ * uid 只给列表 key 用；四个逐份参数在这里存本地选择，提交时随清单一起交给服务端。
  * 还没下单，所以这里随时可以移除——移除时会调后端的撤回接口。
  */
 const files = ref([])
@@ -254,25 +342,109 @@ const totalPages = computed(() =>
   files.value.reduce((sum, item) => sum + (Number(item.page_count) || 0), 0)
 )
 
-/** 方案与体检都针对第一份文件取参数，多文件只借用它的单价与推荐值。 */
+/** 方案与体检都针对第一份文件取参数，多文件只借用它的推荐值。 */
 const primaryFile = computed(() => files.value[0] || null)
 
+/** 纸张规格选项：与后端 allowed_paper_sizes 同口径。 */
+const paperSizes = PAPER_SIZES
+
 /**
- * 多文件合计金额。
+ * 服务端报价结果（`{files, page_count, print_page_count, amount_cents}`）。
  *
- * 打印方案接口只算单份文件（且按 impression 取整），下单与后端计费用的是
- * 「单价 × 总页数 × 份数」，所以这里从方案里反推单价，再乘总页数，
- * 保证界面数字与真实扣款一致，不让“预计”和“应付”打打。
+ * 行金额、文档页数、打印页数、整单总额全部取这里的数，页面不做任何乘法。
  */
-const quoteCents = computed(() => {
-  const current = plan.value
-  if (!current) return 0
-  if (files.value.length <= 1) return Number(current.amount_cents) || 0
-  const impressions = Number(current.impressions) || 0
-  const unit = impressions > 0 ? Math.round(Number(current.amount_cents) / impressions) : 0
-  if (!unit) return Number(current.amount_cents) || 0
-  return unit * totalPages.value * copies.value
+const quote = ref(null)
+/** 报价失败的原因：失败时保留上一次结果，并把原因写清楚。 */
+const quoteError = ref('')
+let quoteTimer = null
+let quoteSeq = 0
+
+/** 当前报价里对应第 index 份文件的那一行（按 file_key 对，不靠下标猜）。 */
+function lineOf(index) {
+  const item = files.value[index]
+  if (!item || !quote.value || !Array.isArray(quote.value.files)) return null
+  return quote.value.files.find((row) => row.file_key === item.file_key) || null
+}
+
+/** 整单金额（分）：有报价用报价，单文件还没报价时用打印方案（也是服务端给的）。 */
+const quoteAmount = computed(() => {
+  if (quote.value) return Number(quote.value.amount_cents) || 0
+  return plan.value ? Number(plan.value.amount_cents) || 0 : 0
 })
+/** 文档页数（各份页数之和）。 */
+const docPages = computed(() =>
+  quote.value ? Number(quote.value.page_count) || 0 : totalPages.value
+)
+/** 打印页数（各份 page_count × copies 之和）；还没报价时为 null，不编数字。 */
+const printPages = computed(() =>
+  quote.value ? Number(quote.value.print_page_count) || 0 : null
+)
+
+/**
+ * 报价请求体：与下单完全同一份。
+ *
+ * 单文件不传逐份参数，由订单级参数继承（旧流程不变）；多文件逐份传自己的四项。
+ */
+function quotePayload() {
+  const multi = files.value.length > 1
+  return {
+    files: files.value.map((item, index) => {
+      const base = {
+        file_key: item.file_key,
+        file_name: item.file_name,
+        page_count: Math.max(1, Number(item.page_count) || 1),
+        file_index: index + 1,
+      }
+      if (!multi) return base
+      return {
+        ...base,
+        print_side: item.print_side,
+        color_mode: item.color_mode,
+        paper_size: item.paper_size,
+        copies: item.copies,
+      }
+    }),
+    print_side: printSide.value === 1 ? 1 : 2,
+    color_mode: colorMode.value === 1 ? 1 : 0,
+    copies: Math.max(1, Number(copies.value) || 1),
+    paper_size: 'A4',
+  }
+}
+
+/**
+ * 改参数后 300 ms 内只发一次报价。
+ *
+ * 连点单双面、加减份数会产生很多次变更，逐次请求既浪费也会让界面抢屏。
+ */
+function scheduleQuote() {
+  if (quoteTimer) clearTimeout(quoteTimer)
+  quoteTimer = setTimeout(() => {
+    quoteTimer = null
+    refreshQuote()
+  }, 300)
+}
+
+/** 调服务端报价；失败时保留上一次结果并记下原因，不静默显示错误金额。 */
+async function refreshQuote() {
+  if (!files.value.length) {
+    quote.value = null
+    quoteError.value = ''
+    return
+  }
+  // 页数还没读到就报不了价（page_count 必须 ≥ 1）
+  if (files.value.some((item) => !(Number(item.page_count) >= 1))) return
+  const seq = ++quoteSeq
+  try {
+    const data = await quoteOrder(quotePayload())
+    // 已经有更新的请求发出去了，旧结果直接丢掉
+    if (seq !== quoteSeq) return
+    quote.value = data
+    quoteError.value = ''
+  } catch (error) {
+    if (seq !== quoteSeq) return
+    quoteError.value = error.message || '报价失败，请稍后重试'
+  }
+}
 
 const severitySummary = computed(() => {
   const counts = (report.value && report.value.by_severity) || {}
@@ -316,6 +488,16 @@ function resetCheck() {
   planUsesAi.value = false
 }
 
+/** 新加入的一份文件：逐份参数先取当前订单级的值，之后各改各的。 */
+function defaultFileParams() {
+  return {
+    print_side: printSide.value === 1 ? 1 : 2,
+    color_mode: colorMode.value === 1 ? 1 : 0,
+    paper_size: 'A4',
+    copies: Math.max(1, Number(copies.value) || 1),
+  }
+}
+
 /** 把一次上传结果加进清单；重复选同一个文件不重复入单。 */
 function pushFile(data) {
   const fileKey = data.file_key
@@ -328,6 +510,7 @@ function pushFile(data) {
     file_name: data.file_name || '文档',
     size: Number(data.size) || 0,
     page_count: 0,
+    ...defaultFileParams(),
   })
   return true
 }
@@ -348,17 +531,20 @@ async function fillPageCounts() {
   }
 }
 
-/** 清单变了：体检结果作废，重新按当前参数出基础方案。 */
+/** 清单变了：体检结果作废，重新按当前参数出基础方案，并重新报价。 */
 async function afterFilesChanged() {
   resetCheck()
   if (files.value.length === 0) {
     plan.value = null
+    quote.value = null
+    quoteError.value = ''
     stepIndex.value = 0
     return
   }
   await fillPageCounts()
   stepIndex.value = 1
   await loadPlan(false)
+  scheduleQuote()
 }
 
 async function pickDocuments() {
@@ -466,6 +652,7 @@ async function runCheck() {
     selectedIssues.value = []
     wantFix.value = false
     await loadPlan(true)
+    scheduleQuote()
   } catch (error) {
     notifyError(error)
   } finally {
@@ -510,6 +697,26 @@ async function choose(field, value) {
   if (field === 'color_mode') colorMode.value = value
   if (field === 'layout') layout.value = value
   await loadPlan(planUsesAi.value)
+  // 单文件的金额靠订单级参数算，改完重算报价
+  scheduleQuote()
+}
+
+/** 多文件时某一份的单双面 / 颜色 / 纸张：只改这一份，然后重算整单报价。 */
+function setFileParam(index, field, value) {
+  const item = files.value[index]
+  if (!item || item[field] === value) return
+  item[field] = value
+  scheduleQuote()
+}
+
+/** 多文件时某一份的份数加减：1..50，与该份的份数限制一致。 */
+function changeFileCopies(index, delta) {
+  const item = files.value[index]
+  if (!item) return
+  const next = Math.max(1, Math.min(50, (Number(item.copies) || 1) + delta))
+  if (next === item.copies) return
+  item.copies = next
+  scheduleQuote()
 }
 
 function toggleIssue(id) {
@@ -568,26 +775,17 @@ async function changeCopies(delta) {
   if (next === copies.value) return
   copies.value = next
   await loadPlan(planUsesAi.value)
+  scheduleQuote()
 }
 
 async function createOrder() {
   if (busy.value || !plan.value || files.value.length === 0) return
   busy.value = true
   try {
-    // 文件清单是权威字段；单文件时同时带上旧的顶层字段，老后端也能跑
-    const payload = {
-      files: files.value.map((item, index) => ({
-        file_key: item.file_key,
-        file_name: item.file_name,
-        page_count: Math.max(1, Number(item.page_count) || 1),
-        file_index: index + 1,
-      })),
-      print_side: plan.value.recommend.print_side,
-      color_mode: plan.value.recommend.color_mode,
-      copies: copies.value,
-      paper_size: 'A4',
-    }
+    // 文件清单是权威字段；逐份参数随清单一起交给服务端（与报价接口同一份参数）
+    const payload = quotePayload()
     if (files.value.length === 1) {
+      // 单文件同时带上旧的顶层字段，老后端也能跑
       payload.file_key = files.value[0].file_key
       payload.file_name = files.value[0].file_name
       payload.page_count = Math.max(1, Number(files.value[0].page_count) || 1)
@@ -618,6 +816,12 @@ async function payOrder() {
 function goMine() {
   uni.switchTab({ url: '/pages/mine/mine' })
 }
+
+// 页面关掉时把未发出的报价防抖请求取消掉
+onUnmounted(() => {
+  if (quoteTimer) clearTimeout(quoteTimer)
+  quoteTimer = null
+})
 </script>
 
 <style scoped>
@@ -802,12 +1006,62 @@ function goMine() {
 }
 .file-row {
   display: flex;
-  align-items: center;
+  flex-direction: column;
   margin-bottom: 12rpx;
   padding: 18rpx;
   border: 2rpx solid var(--zi-line);
   border-radius: var(--zi-radius);
   background: var(--zi-soft);
+}
+.file-head {
+  display: flex;
+  align-items: center;
+}
+/* 逐份参数：每份文件自己一块，宽度不够时换行，390 宽不横向溢出 */
+.file-params {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10rpx 16rpx;
+  margin-top: 14rpx;
+  padding-top: 12rpx;
+  border-top: 2rpx dashed var(--zi-line);
+}
+.file-param {
+  display: flex;
+  align-items: center;
+  flex: 1 1 100%;
+}
+.file-param-label {
+  flex: 0 0 96rpx;
+  color: var(--zi-muted);
+  font-size: 22rpx;
+  font-weight: 700;
+}
+.file-param .seg {
+  flex: 1;
+}
+.file-param .seg-item {
+  font-size: 22rpx;
+  padding: 8rpx 0;
+}
+.file-quote {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex: 1 1 100%;
+  margin-top: 4rpx;
+  padding-top: 10rpx;
+  border-top: 2rpx solid var(--zi-line);
+}
+.file-print-pages {
+  color: var(--zi-muted);
+  font-size: 22rpx;
+  font-weight: 700;
+}
+.file-amount {
+  color: var(--zi-ink);
+  font-size: 26rpx;
+  font-weight: 900;
 }
 .file-main {
   flex: 1;
@@ -1071,6 +1325,54 @@ function goMine() {
   margin-top: 14rpx;
   color: var(--zi-muted);
   font-size: 24rpx;
+  line-height: 1.6;
+}
+/* 服务端报价汇总：文档页数 / 打印页数 / 应付金额 */
+.quote-summary {
+  margin-top: 18rpx;
+  padding: 16rpx 18rpx;
+  border: 2rpx solid var(--zi-line-strong);
+  border-radius: var(--zi-radius);
+  background: var(--zi-soft-2);
+}
+.quote-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6rpx 0;
+}
+.quote-k {
+  color: var(--zi-muted);
+  font-size: 24rpx;
+  font-weight: 700;
+}
+.quote-v {
+  color: var(--zi-ink);
+  font-size: 26rpx;
+  font-weight: 900;
+}
+.quote-v.money {
+  font-size: 32rpx;
+}
+.quote-error {
+  display: block;
+  margin-top: 12rpx;
+  color: var(--zi-danger);
+  font-size: 22rpx;
+  font-weight: 700;
+  line-height: 1.6;
+}
+/* 多文件时参数逐份设置，订单级只留版式 */
+.multi-tip {
+  margin-top: 14rpx;
+}
+.multi-tip-text {
+  display: block;
+  padding: 14rpx 16rpx;
+  border: 2rpx dashed var(--zi-line-strong);
+  border-radius: var(--zi-radius);
+  color: var(--zi-muted);
+  font-size: 22rpx;
   line-height: 1.6;
 }
 .savings {

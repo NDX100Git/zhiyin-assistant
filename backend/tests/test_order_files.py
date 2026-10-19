@@ -10,7 +10,7 @@ import itertools
 from datetime import date
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.config import settings
 from app.migrations import run_migrations
@@ -916,3 +916,172 @@ def test_对外文件项统一同一套键(client, test_storage):
     assert all(set(item) == expected | {"signed_url"} for item in job_files)
     view_files = started["data"]["order"]["files"]
     assert [set(item) for item in view_files] == [expected, expected]
+
+
+# ---------------------------------------------------------------- 服务端报价接口
+
+
+def quote(client, headers, files: list[dict], **overrides) -> dict:
+    """调报价接口：文件项与下单完全同一份写法，只算不落库。"""
+    return client.post(
+        "/api/order/quote", json=_create_payload(files, **overrides), headers=headers
+    ).json()
+
+
+def test_报价逐份行金额与三种合计(client):
+    """两份参数不同：行金额、文档页数、打印页数、总额都由服务端算，且与下单一致。"""
+    headers = student_headers(client, "quote-per-file")
+    files = [
+        # 2 页 × 单面黑白 15 分 × 3 份 = 90 分，打印 6 页
+        _params("正文.pdf", 2, print_side=1, color_mode=0, paper_size="A4", copies=3),
+        # 3 页 × 双面彩色 80 分 × 2 份 = 480 分，打印 6 页
+        _params("图册.pdf", 3, print_side=2, color_mode=1, paper_size="B5", copies=2),
+    ]
+    for item in files:
+        register_upload(item["file_key"], item.get("file_name"), _user_id(headers))
+
+    body = quote(client, headers, files)
+    assert body["code"] == 0, body
+    data = body["data"]
+
+    assert [item["file_index"] for item in data["files"]] == [1, 2]
+    assert [item["amount_cents"] for item in data["files"]] == [90, 480]
+    assert [item["print_pages"] for item in data["files"]] == [6, 6]
+    assert [
+        (item["page_count"], item["print_side"], item["color_mode"], item["paper_size"],
+         item["copies"])
+        for item in data["files"]
+    ] == [(2, 1, 0, "A4", 3), (3, 2, 1, "B5", 2)]
+    assert data["page_count"] == 5
+    assert data["print_page_count"] == 12
+    assert data["amount_cents"] == 570
+    # 报价项与订单文件项是同一套键名，前端用一套归一化逻辑
+    from app.services.order_file_service import FILE_VIEW_KEYS
+
+    assert [set(item) for item in data["files"]] == [set(FILE_VIEW_KEYS)] * 2
+
+    # 同一份参数下单，落库金额与报价逐项相等
+    order = create_order(client, headers, files)
+    assert [item["amount_cents"] for item in order["files"]] == [
+        item["amount_cents"] for item in data["files"]
+    ]
+    assert order["print_page_count"] == data["print_page_count"]
+    assert order["page_count"] == data["page_count"]
+    assert order["amount_cents"] == data["amount_cents"]
+
+
+def test_报价不传逐份参数继承订单级(client):
+    """逐份参数为空时沿用订单级同名字段，只覆盖传了的那一项。"""
+    headers = student_headers(client, "quote-inherit")
+    files = [_file_item("甲.pdf", 2), _params("乙.pdf", 3, copies=2)]
+    for item in files:
+        register_upload(item["file_key"], item.get("file_name"), _user_id(headers))
+
+    body = quote(
+        client, headers, files, print_side=1, color_mode=1, paper_size="B5", copies=4
+    )
+    assert body["code"] == 0, body
+    first, second = body["data"]["files"]
+    assert (first["print_side"], first["color_mode"], first["paper_size"], first["copies"]) == (
+        1,
+        1,
+        "B5",
+        4,
+    )
+    assert (second["print_side"], second["color_mode"], second["paper_size"]) == (1, 1, "B5")
+    assert second["copies"] == 2
+    # 彩色单面 80 分：2 × 4 份 = 640 分；3 × 2 份 = 480 分
+    assert [first["amount_cents"], second["amount_cents"]] == [640, 480]
+    assert body["data"]["amount_cents"] == 1120
+    assert body["data"]["print_page_count"] == 8 + 6
+
+
+def test_报价越界参数报与下单相同的码(client):
+    """报价与下单同一套校验：错误码与中文提示逐条相同。"""
+    headers = student_headers(client, "quote-bad-params")
+
+    def both(items: list[dict]) -> tuple[dict, dict]:
+        for item in items:
+            register_upload(item["file_key"], item.get("file_name"), _user_id(headers))
+        return quote(client, headers, items), client.post(
+            "/api/order/create", json=_create_payload(items), headers=headers
+        ).json()
+
+    for item in (
+        _params("a.pdf", 2, print_side=3),
+        _params("a.pdf", 2, color_mode=2),
+        _params("a.pdf", 2, copies=0),
+        _params("a.pdf", 2, copies=51),
+        _params("a.pdf", 2, paper_size="A0"),
+    ):
+        quoted, created = both([item])
+        assert quoted["code"] != 0
+        assert quoted["code"] == created["code"]
+        assert quoted["message"] == created["message"]
+
+    too_many = [_file_item(f"many-{index}.pdf", 1) for index in range(21)]
+    quoted, created = both(too_many)
+    assert quoted["code"] == created["code"] == 40048
+
+
+def test_报价别人的文件与没有记录的文件都是40404(client):
+    """归属校验与下单一致：不存在与是别人的返回同一条提示与同一个码。"""
+    headers = student_headers(client, "quote-owner")
+    other = student_headers(client, "quote-owner-other")
+    mine = _file_item("我的.pdf", 2)
+    stolen = _file_item("别人的.pdf", 2)
+    register_upload(mine["file_key"], mine["file_name"], _user_id(headers))
+    register_upload(stolen["file_key"], stolen["file_name"], _user_id(other))
+
+    quoted = quote(client, headers, [stolen])
+    assert quoted["code"] == 40404
+    created = client.post(
+        "/api/order/create", json=_create_payload([stolen]), headers=headers
+    ).json()
+    assert created["code"] == 40404
+    assert quoted["message"] == created["message"]
+
+    unknown = quote(client, headers, [_file_item("没上传过.pdf", 2)])
+    assert unknown["code"] == 40404
+    assert unknown["message"] == quoted["message"]
+
+
+def test_报价不落库(client, db_session):
+    """报价只算不写：订单表与订单文件表条数都不变，队列容量也不动。"""
+    from app.models.queue_session import QueueSession
+
+    headers = student_headers(client, "quote-readonly")
+    files = [
+        _params("正文.pdf", 2, print_side=1, color_mode=0, copies=3),
+        _params("图册.pdf", 3, print_side=2, color_mode=1, copies=2),
+    ]
+    for item in files:
+        register_upload(item["file_key"], item.get("file_name"), _user_id(headers))
+
+    def counts() -> tuple[int, int, int]:
+        return (
+            int(db_session.execute(select(func.count()).select_from(Order)).scalar_one()),
+            int(
+                db_session.execute(select(func.count()).select_from(OrderFile)).scalar_one()
+            ),
+            int(
+                db_session.execute(select(func.count()).select_from(QueueSession)).scalar_one()
+            ),
+        )
+
+    db_session.expire_all()
+    before = counts()
+    for _ in range(3):
+        body = quote(client, headers, files)
+        assert body["code"] == 0, body
+    db_session.expire_all()
+    assert counts() == before
+    # 报价确实算出了数：不是“什么都没做所以没写”
+    assert body["data"]["amount_cents"] == 570
+
+
+def test_报价需要登录(client):
+    body = client.post(
+        "/api/order/quote", json=_create_payload([_file_item("a.pdf", 2)])
+    ).json()
+    assert body["code"] == 40100

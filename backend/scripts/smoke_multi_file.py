@@ -198,27 +198,59 @@ def main() -> int:
             doc_pages = 2 + 3 + 5
             print_pages = 2 * 3 + 3 * 2 + 5 * 1
 
+            payload = {
+                "files": [
+                    {"file_key": first["file_key"], "file_name": first["file_name"],
+                     "page_count": 2, "print_side": 1, "color_mode": 0,
+                     "paper_size": "A4", "copies": 3},
+                    {"file_key": second["file_key"], "file_name": second["file_name"],
+                     "page_count": 3, "print_side": 2, "color_mode": 1,
+                     "paper_size": "A3", "copies": 2},
+                    {"file_key": third["file_key"], "file_name": third["file_name"],
+                     "page_count": 5},
+                ],
+                "print_side": 2,
+                "color_mode": 0,
+                "copies": 1,
+                "paper_size": "A4",
+            }
+
+            # 报价口径：先调 /api/order/quote，逐份行金额与打印页数必须与上面按
+            # config/pricing.json 算出的期望值一致，并且报价不落库（订单条数不变）。
+            # 下单接口随后返回的数字必须与报价逐项相等，前端展示与扣款才是同一个数。
+            before_total = int(
+                call(client, "GET", "/api/order/list", headers=sh).get("total") or 0
+            )
+            quote = call(client, "POST", "/api/order/quote", headers=sh, json=payload)
+            expect_file_view(quote.get("files") or [], "服务端报价")
+            expect(
+                [int(item["amount_cents"]) for item in quote["files"]]
+                == [first_amount, second_amount, third_amount],
+                f"报价逐份行金额不对："
+                f"{[(item['file_index'], item['amount_cents']) for item in quote['files']]}",
+            )
+            expect(
+                [int(item["print_pages"]) for item in quote["files"]] == [6, 6, 5],
+                f"报价逐份打印页数不对：{[item['print_pages'] for item in quote['files']]}",
+            )
+            expect(
+                (int(quote["page_count"]), int(quote["print_page_count"]),
+                 int(quote["amount_cents"]))
+                == (doc_pages, print_pages, total_amount),
+                f"报价三种合计不对：{quote['page_count']} 页 / "
+                f"{quote['print_page_count']} 打印页 / {quote['amount_cents']} 分",
+            )
+            after_total = int(
+                call(client, "GET", "/api/order/list", headers=sh).get("total") or 0
+            )
+            expect(after_total == before_total, "报价写库了：报价前后订单条数变了")
+
             order = call(
                 client,
                 "POST",
                 "/api/order/create",
                 headers=sh,
-                json={
-                    "files": [
-                        {"file_key": first["file_key"], "file_name": first["file_name"],
-                         "page_count": 2, "print_side": 1, "color_mode": 0,
-                         "paper_size": "A4", "copies": 3},
-                        {"file_key": second["file_key"], "file_name": second["file_name"],
-                         "page_count": 3, "print_side": 2, "color_mode": 1,
-                         "paper_size": "A3", "copies": 2},
-                        {"file_key": third["file_key"], "file_name": third["file_name"],
-                         "page_count": 5},
-                    ],
-                    "print_side": 2,
-                    "color_mode": 0,
-                    "copies": 1,
-                    "paper_size": "A4",
-                },
+                json=payload,
             )
             order_id = int(order["id"])
             order_no = order["order_no"]
@@ -256,6 +288,24 @@ def main() -> int:
             expect(
                 int(order["amount_cents"]) == total_amount,
                 f"整单金额应为 {total_amount} 分，实际 {order['amount_cents']} 分",
+            )
+            # 下单返回的数字与报价逐项相等（同一套计费，不是两套算法）
+            expect(
+                [int(item["amount_cents"]) for item in order["files"]]
+                == [int(item["amount_cents"]) for item in quote["files"]],
+                "下单金额与报价不一致",
+            )
+            expect(
+                [int(item["print_pages"]) for item in order["files"]]
+                == [int(item["print_pages"]) for item in quote["files"]],
+                "下单打印页数与报价不一致",
+            )
+            expect(
+                (int(order["page_count"]), int(order["print_page_count"]),
+                 int(order["amount_cents"]))
+                == (int(quote["page_count"]), int(quote["print_page_count"]),
+                    int(quote["amount_cents"])),
+                "下单合计与报价不一致",
             )
             step("多文件下单：逐份参数计价、文档页数与打印页数分开、一单一码")
 

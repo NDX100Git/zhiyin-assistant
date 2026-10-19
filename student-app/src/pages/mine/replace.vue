@@ -11,12 +11,16 @@
         <view class="row"><text class="k">订单号</text><text class="v">{{ order.order_no }}</text></view>
         <view class="row"><text class="k">取件码</text><text class="v">{{ order.pickup_code }} · 换文件后不变</text></view>
         <view v-if="files.length > 1" class="file-block">
-          <text class="k">当前文件</text>
+          <text class="k">当前文件（{{ files.length }} 份 · 文档 {{ pagesTotal }} 页 · 打印 {{ printPagesTotal }} 页）</text>
           <view class="file-body">
             <view v-for="(item, index) in files" :key="item.file_index" class="file-line">
               <text class="file-index">{{ index + 1 }}</text>
-              <text class="file-name">{{ item.file_name }}</text>
-              <text class="file-pages">{{ item.page_count }} 页</text>
+              <view class="file-line-main">
+                <text class="file-name">{{ item.file_name }}</text>
+                <text class="file-params">{{ paramSummary(item) }}</text>
+                <text class="file-pages">文档 {{ item.page_count }} 页 · 打印 {{ item.print_pages }} 页</text>
+              </view>
+              <text class="file-amount">{{ formatMoney(item.amount_cents) }}</text>
             </view>
           </view>
         </view>
@@ -24,7 +28,8 @@
           <text class="k">当前文件</text>
           <text class="v">{{ files.length ? files[0].file_name : (order.file_name || '论文文档') }}</text>
         </view>
-        <view class="row"><text class="k">当前页数</text><text class="v">{{ pagesTotal }} 页</text></view>
+        <view class="row"><text class="k">文档页数</text><text class="v">{{ pagesTotal }} 页</text></view>
+        <view class="row"><text class="k">打印页数</text><text class="v">{{ printPagesTotal }} 页</text></view>
         <view class="row">
           <text class="k">当前金额</text>
           <text class="v money">{{ formatMoney(order.amount_cents) }}{{ order.paid ? '（已支付）' : '（未支付）' }}</text>
@@ -54,7 +59,7 @@
             <text class="target-index">{{ index + 1 }}</text>
             <view class="target-main">
               <text class="target-name">{{ item.file_name }}</text>
-              <text class="target-meta">{{ item.page_count }} 页 · 第 {{ item.file_index }} 份</text>
+              <text class="target-meta">{{ paramSummary(item) }} · 文档 {{ item.page_count }} 页 · 打印 {{ item.print_pages }} 页 · 第 {{ item.file_index }} 份</text>
             </view>
             <text class="target-check">{{ targetIndex === index ? '已选' : '选它' }}</text>
           </view>
@@ -88,10 +93,20 @@
             <text class="v">{{ targetLabel }}</text>
           </view>
           <view class="row"><text class="k">新页数</text><text class="v">{{ pageCount }} 页</text></view>
-          <view v-if="files.length > 1" class="row">
-            <text class="k">换后总页数</text>
-            <text class="v">{{ nextTotalPages }} 页（整单按新清单重算金额）</text>
+          <view v-if="targetFile" class="row">
+            <text class="k">这份参数</text>
+            <text class="v">{{ paramSummary(targetFile) }}（换文件不改参数）</text>
           </view>
+          <!-- 换后金额由服务端报价接口算，页面不乘单价 -->
+          <view v-if="quoted" class="row">
+            <text class="k">换后金额</text>
+            <text class="v money">{{ formatMoney(quoted.amount_cents) }}</text>
+          </view>
+          <view v-if="quoted" class="row">
+            <text class="k">换后页数</text>
+            <text class="v">文档 {{ quoted.page_count }} 页 · 打印 {{ quoted.print_page_count }} 页</text>
+          </view>
+          <text v-if="quoteError" class="quote-error">{{ quoteError }}（以老师确认后服务端重算为准）</text>
           <view class="row"><text class="k">订单号</text><text class="v">{{ order.order_no }}（不变）</text></view>
 
           <textarea
@@ -123,11 +138,11 @@
 <script setup>
 import { onLoad } from '@dcloudio/uni-app'
 import { computed, ref } from 'vue'
-import { request, uploadFile } from '@/services/api'
+import { quoteOrder, request, uploadFile } from '@/services/api'
 import { ensureLogin } from '@/services/auth'
 import { chooseDocument, loadDemoDocument } from '@/services/filePicker'
 import { notify, notifyError } from '@/services/notify'
-import { orderFiles, totalPages } from '@/services/orderFiles'
+import { orderFiles, paramSummary, totalPages, totalPrintPages } from '@/services/orderFiles'
 import { useUiTheme } from '@/ui/theme'
 
 /** 允许换文件的状态：待支付直接生效，排队中与异常单走老师确认。 */
@@ -159,6 +174,7 @@ const immediate = computed(() => !!order.value && order.value.status === 'pendin
 /** 当前文件清单：多文件订单逐份列出，要换哪份必须由学生显式选。 */
 const files = computed(() => orderFiles(order.value))
 const pagesTotal = computed(() => totalPages(order.value))
+const printPagesTotal = computed(() => totalPrintPages(order.value))
 const multiFile = computed(() => files.value.length > 1)
 /** 单文件订单不用选，直接就是那唯一一份；多文件必须选过（targetIndex 从 -1 起）。 */
 const hasTarget = computed(() => files.value.length > 0 && targetIndex.value >= 0)
@@ -168,18 +184,70 @@ const targetLabel = computed(() =>
   targetFile.value ? `第 ${targetFile.value.file_index} 个文件：${targetFile.value.file_name}` : '未选择',
 )
 
-/** 换完这单的总页数：替掉目标那一份的页数，其余不变，与后端重算口径一致。 */
-const nextTotalPages = computed(() => {
-  const replaced = files.value.reduce((sum, item, index) => {
-    if (index === targetIndex.value) return sum
-    return sum + (Number(item.page_count) || 0)
-  }, 0)
-  return replaced + Math.max(1, Number(pageCount.value) || 1)
-})
+/**
+ * 换完之后的整单报价（`{files, page_count, print_page_count, amount_cents}`）。
+ *
+ * 只换目标那一份的文件内容，其余份的参数与行金额照旧；金额由服务端算，
+ * 页面不乘单价，也不自己抬页数×份数的结论。
+ */
+const quoted = ref(null)
+const quoteError = ref('')
+let quoteSeq = 0
+
+/** 把「目标那一份换成新文件」之后的完整清单交给报价接口。 */
+async function refreshQuote() {
+  if (!order.value || !targetFile.value || !fileKey.value) {
+    quoted.value = null
+    quoteError.value = ''
+    return
+  }
+  if (!(Number(pageCount.value) >= 1)) return
+  const target = targetFile.value
+  const list = files.value.map((item) =>
+    item.file_index === target.file_index
+      ? {
+          file_key: fileKey.value,
+          file_name: fileName.value,
+          page_count: Number(pageCount.value),
+          print_side: item.print_side,
+          color_mode: item.color_mode,
+          paper_size: item.paper_size,
+          copies: item.copies,
+        }
+      : {
+          file_key: item.file_key,
+          file_name: item.file_name,
+          page_count: Math.max(1, Number(item.page_count) || 1),
+          print_side: item.print_side,
+          color_mode: item.color_mode,
+          paper_size: item.paper_size,
+          copies: item.copies,
+        },
+  )
+  const seq = ++quoteSeq
+  try {
+    const data = await quoteOrder({
+      files: list,
+      print_side: order.value.print_side === 1 ? 1 : 2,
+      color_mode: order.value.color_mode === 1 ? 1 : 0,
+      copies: Math.max(1, Number(order.value.copies) || 1),
+      paper_size: order.value.paper_size || 'A4',
+    })
+    if (seq !== quoteSeq) return
+    quoted.value = data
+    quoteError.value = ''
+  } catch (error) {
+    if (seq !== quoteSeq) return
+    // 拿不到报价时不给数字，只把服务端的话原样告诉学生
+    quoted.value = null
+    quoteError.value = error.message || '服务端报价失败'
+  }
+}
 
 function selectTarget(index) {
   targetIndex.value = index
   notify(`已选择第 ${index + 1} 个文件`, 'success')
+  refreshQuote()
 }
 
 const blockedReason = computed(() => {
@@ -231,6 +299,7 @@ async function useUploaded(data) {
       data: { file_key: fileKey.value },
     })
     pageCount.value = Math.max(1, Number(result.page_count) || 1)
+    await refreshQuote()
   } catch (error) {
     fileKey.value = ''
     notifyError(error)
@@ -440,14 +509,15 @@ onLoad(async (options) => {
 /* 多文件清单与「选哪一份」列表：整行可点，触控高度不小于 96rpx */
 .file-block {
   display: flex;
-  align-items: flex-start;
+  flex-direction: column;
   padding: 16rpx 0;
   border-bottom: 2rpx solid var(--zi-line);
   font-size: 28rpx;
 }
 .file-block .k {
-  flex: 0 0 150rpx;
-  width: 150rpx;
+  flex: 0 0 auto;
+  width: auto;
+  margin-bottom: 6rpx;
 }
 .file-body {
   flex: 1;
@@ -475,11 +545,39 @@ onLoad(async (options) => {
   line-height: 1.6;
   word-break: break-all;
 }
-.file-pages {
+.file-line-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.file-params {
+  color: var(--zi-ink);
+  font-size: 22rpx;
+  line-height: 1.6;
+}
+.file-amount {
+  flex: 0 0 auto;
   margin-left: 14rpx;
-  color: var(--zi-muted);
-  font-size: 24rpx;
+  color: var(--zi-ink);
+  font-size: 26rpx;
+  font-weight: 900;
   white-space: nowrap;
+}
+.file-pages {
+  margin-left: 0;
+  color: var(--zi-muted);
+  font-size: 22rpx;
+  line-height: 1.6;
+  word-break: break-all;
+}
+.quote-error {
+  display: block;
+  margin-top: 12rpx;
+  color: var(--zi-danger);
+  font-size: 22rpx;
+  font-weight: 700;
+  line-height: 1.6;
 }
 .target-row {
   display: flex;

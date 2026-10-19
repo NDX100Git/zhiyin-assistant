@@ -80,12 +80,20 @@
           <template #default="{ row }">
             <div class="file-cell">
               <div v-for="file in fileRows(row).lines" :key="file.key" class="file-line">
-                <span v-if="file.label" class="file-seq">#{{ file.seq }}</span>
-                <span class="file-name" :title="file.file_name">{{ file.file_name }}</span>
-                <span class="file-pages muted">{{ file.page_count ? file.page_count + ' 页' : '' }}</span>
-                <el-button link type="primary" class="file-dl" @click="downloadOne(row, file)">
-                  下载
-                </el-button>
+                <div class="file-line-top">
+                  <span v-if="file.label" class="file-seq">#{{ file.seq }}</span>
+                  <span class="file-name" :title="file.file_name">{{ file.file_name }}</span>
+                  <span class="file-pages muted">{{ file.page_count ? file.page_count + ' 页' : '' }}</span>
+                  <el-button link type="primary" class="file-dl" @click="downloadOne(row, file)">
+                    下载
+                  </el-button>
+                </div>
+                <!-- 逐份参数与行金额：老师按这份的份数、单双面、颜色、纸张上机 -->
+                <div class="file-line-meta">
+                  <span class="file-params">{{ paramSummary(file) }}</span>
+                  <span class="muted file-print-pages">打印 {{ file.print_pages }} 页</span>
+                  <span class="file-amount money">{{ yuan(file.amount_cents) }}</span>
+                </div>
               </div>
               <!-- 超过三份时给明确入口：点开逐份列出，每份都能单独下载 -->
               <div v-if="fileRows(row).rest > 0" class="file-more">
@@ -100,13 +108,11 @@
         </el-table-column>
         <el-table-column label="打印参数" width="150">
           <template #default="{ row }">
-            <div>
-              {{ row.print_side === 2 ? '双面' : '单面' }} ·
-              {{ row.color_mode === 1 ? '彩色' : '黑白' }} ·
-              {{ row.copies }} 份
+            <!-- 单文件：就是这一份的参数；多文件：逐份参数见左侧文件列 -->
+            <div>{{ paramSummary(orderFiles(row)[0]) || '—' }}</div>
+            <div class="muted">
+              文档 {{ totalPages(row) || row.page_count }} 页 · 打印 {{ totalPrintPages(row) }} 页
             </div>
-            <!-- 页数列并进来了：多文件时整单页数是各份之和，老师看这一行就够 -->
-            <div class="muted">共 {{ totalPages(row) || row.page_count }} 页</div>
           </template>
         </el-table-column>
         <el-table-column label="状态" width="110">
@@ -206,6 +212,10 @@
                 <span v-if="isMultiFile(row)" class="oc-file-seq">第 {{ file.seq }} 个文件</span>
                 <span class="oc-file-name">{{ file.file_name }}</span>
                 <span class="muted">{{ file.page_count ? file.page_count + ' 页' : '页数未知' }}</span>
+                <span class="oc-file-params">{{ paramSummary(file) }}</span>
+                <span class="oc-file-amount">
+                  打印 {{ file.print_pages }} 页 · <span class="money">{{ yuan(file.amount_cents) }}</span>
+                </span>
               </div>
               <el-button size="large" class="oc-file-dl" @click="downloadOne(row, file)">
                 下载
@@ -213,8 +223,7 @@
             </div>
           </div>
           <div class="oc-line">
-            {{ totalPages(row) || row.page_count }} 页 · {{ row.print_side === 2 ? '双面' : '单面' }} ·
-            {{ row.color_mode === 1 ? '彩色' : '黑白' }} · {{ row.copies }} 份
+            文档 {{ totalPages(row) || row.page_count }} 页 · 打印 {{ totalPrintPages(row) }} 页
           </div>
           <div class="oc-line">
             <span class="money">{{ yuan(row.amount_cents) }}</span>
@@ -364,13 +373,19 @@
       <div v-if="filesDialog.order" class="files-dialog-body">
         <div class="files-dialog-meta">
           {{ filesDialog.order.order_no }} · {{ filesDialog.order.pickup_code }} ·
-          {{ filesDialog.files.length }} 份文件 · 共 {{ totalPages(filesDialog.order) }} 页
+          {{ filesDialog.files.length }} 份文件 · 文档 {{ totalPages(filesDialog.order) }} 页 ·
+          打印 {{ totalPrintPages(filesDialog.order) }} 页 ·
+          {{ yuan(totalAmountCents(filesDialog.order)) }}
         </div>
         <div v-for="file in filesDialog.files" :key="file.seq" class="files-dialog-row">
           <span class="files-dialog-seq">#{{ file.seq }}</span>
           <div class="files-dialog-main">
             <span class="files-dialog-name">{{ file.file_name }}</span>
             <span class="muted">{{ file.page_count ? file.page_count + ' 页' : '页数未知' }}</span>
+            <span class="files-dialog-params">
+              {{ paramSummary(file) }} · 打印 {{ file.print_pages }} 页 ·
+              <span class="money">{{ yuan(file.amount_cents) }}</span>
+            </span>
           </div>
           <el-button
             size="large"
@@ -483,7 +498,10 @@ import {
   hasUnseenChange,
   isMultiFile,
   orderFiles,
+  paramSummary,
+  totalAmountCents,
   totalPages,
+  totalPrintPages,
 } from '../api/orderFiles'
 
 const statusOptions = [
@@ -1105,10 +1123,36 @@ async function submitBatchComplete() {
 }
 .file-line {
   display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  line-height: 1.5;
+}
+.file-line-top {
+  display: flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
+}
+/* 逐份参数行：单双面 · 颜色 · 纸张 · 份数 + 打印页数 + 行金额 */
+.file-line-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
   line-height: 1.5;
+}
+.file-params {
+  color: var(--zi-ink);
+  font-weight: 700;
+}
+.file-print-pages {
+  font-size: 12px;
+}
+.file-amount {
+  font-size: 12px;
+  font-weight: 900;
 }
 .file-seq {
   flex: none;
@@ -1186,6 +1230,24 @@ async function submitBatchComplete() {
   min-height: 44px;
   margin-left: 0;
   padding: 0 18px;
+}
+/* 手机上每份的参数与行金额：可折行，390 宽不横向溢出 */
+.oc-file-params {
+  color: var(--zi-ink);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.oc-file-amount {
+  color: var(--zi-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.files-dialog-params {
+  display: block;
+  color: var(--zi-ink);
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-all;
 }
 .oc-flag-action :deep(.el-button) {
   min-height: 44px;

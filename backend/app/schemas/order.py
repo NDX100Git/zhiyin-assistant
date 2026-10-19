@@ -40,6 +40,14 @@ class OrderCreateRequest(BaseModel):
     remark: str | None = Field(default=None, description="备注，如加急、装订")
 
 
+class OrderQuoteRequest(OrderCreateRequest):
+    """报价请求：与下单的请求体完全一致。
+
+    继承而不是复制字段，保证「报价」与「下单」的入参永远同一套定义；
+    页面改参数时只调报价，点下单时把同一份参数原样交给创建接口。
+    """
+
+
 class OrderCancelRequest(BaseModel):
     reason: str | None = Field(default=None, description="取消原因")
 

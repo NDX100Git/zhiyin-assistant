@@ -239,6 +239,23 @@ async function waitBody(page, text, timeout = 45000) {
   )
 }
 
+/**
+ * 点一次按钮，若目标文字还在就再点一次。
+ *
+ * uni H5 偶尔会把一次 DOM click 吃掉（页面已渲染但没触发处理函数），
+ * 这里只在「文字仍在」时重试，断言本身不变：没消失就是失败。
+ */
+async function clickByTextRetry(page, text, { attempts = 3, settle = 3000 } = {}) {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    await clickByText(page, text)
+    await sleep(600)
+    const still = await page.evaluate((text) => document.body.innerText.includes(text), text)
+    if (!still) return attempt
+    await sleep(settle)
+  }
+  return attempts
+}
+
 async function waitGone(page, text, timeout = 45000) {
   await page.waitForFunction(
     (text) => document.body && !document.body.innerText.includes(text),
@@ -540,6 +557,143 @@ function checkDownload(download, openedUrl, expected) {
   }
 }
 
+/** 链接要求的金额文本：页面与接口用同一种写法，比对前统一。 */
+function money(cents) {
+  return `¥${((Number(cents) || 0) / 100).toFixed(2)}`
+}
+
+/** 记录学生端的报价请求体：页面自己调报价用的就是下单参数。 */
+function recordQuoteRequests(page) {
+  const items = []
+  const handler = (request) => {
+    try {
+      const url = new URL(request.url())
+      if (request.method() !== 'POST' || url.pathname !== '/api/order/quote') return
+      items.push({ payload: JSON.parse(request.postData() || 'null') })
+    } catch {
+      /* 非 JSON 请求忽略 */
+    }
+  }
+  page.on('request', handler)
+  return { items, stop: () => page.off('request', handler) }
+}
+
+/**
+ * 脚本自己调一次报价接口（用页面登录态与同一份参数），不写死任何数字。
+ * 页面上的行金额与总额必须等于这次服务端返回值。
+ */
+async function quoteFromPage(page, payload) {
+  return page.evaluate(
+    async ({ backendUrl, payload }) => {
+      const key = Object.keys(localStorage).find((item) => item.includes('zhiyin_token'))
+      const token = key ? localStorage.getItem(key) : ''
+      if (!token) return { code: -1, message: 'localStorage 里没有 token' }
+      const response = await fetch(`${backendUrl}/api/order/quote`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify(payload),
+      })
+      return response.json()
+    },
+    { backendUrl: BACKEND_URL, payload },
+  )
+}
+
+/** 学生端下单页：清单里每份文件自己的参数、打印页数与行金额。 */
+async function readFileParams(page) {
+  return page.evaluate(() =>
+    [...document.querySelectorAll('.file-row')].map((row) => ({
+      index: Number(row.getAttribute('data-file-index')),
+      name: ((row.querySelector('.file-name') || {}).textContent || '').trim(),
+      segments: [...row.querySelectorAll('.seg-item.on')].map((element) =>
+        (element.textContent || '').trim(),
+      ),
+      copies: ((row.querySelector('.copy-num') || {}).textContent || '').trim(),
+      printPages: ((row.querySelector('.file-print-pages') || {}).textContent || '').trim(),
+      amount: ((row.querySelector('.file-amount') || {}).textContent || '').trim(),
+    })),
+  )
+}
+
+/** 学生端下单页：打印方案卡上的三行服务端数字。 */
+async function readQuoteSummary(page) {
+  return page.evaluate(() => {
+    const result = {}
+    for (const row of document.querySelectorAll('.quote-summary .quote-row')) {
+      const key = ((row.querySelector('.quote-k') || {}).textContent || '').trim()
+      const value = ((row.querySelector('.quote-v') || {}).textContent || '').trim()
+      if (key) result[key] = value
+    }
+    return result
+  })
+}
+
+/** 点清单里第 index 份文件自己的参数按钮（单面 / 彩色 / A4 / ＋ / －）。 */
+async function clickFileOption(page, fileIndex, text) {
+  const result = await page.evaluate(
+    ({ fileIndex, text }) => {
+      const row = document.querySelector(`.file-row[data-file-index="${fileIndex}"]`)
+      if (!row) return 'no-row'
+      const nodes = [...row.querySelectorAll('.seg-item, .stepper')].filter(
+        (element) => element.getClientRects().length > 0,
+      )
+      const target = nodes.find((element) => (element.textContent || '').trim() === text)
+      if (!target) return 'no-option'
+      target.click()
+      return 'ok'
+    },
+    { fileIndex, text },
+  )
+  if (result !== 'ok') {
+    throw new Error(`第 ${fileIndex} 份文件里找不到可点的「${text}」（${result}）`)
+  }
+}
+
+/** 学生端详情/换文件页：按份列出的文件名、参数、页数与行金额。 */
+async function readDetailFiles(page) {
+  return page.evaluate(() =>
+    [...document.querySelectorAll('.file-line')].map((row) => ({
+      name: ((row.querySelector('.file-name') || {}).textContent || '').trim(),
+      params: ((row.querySelector('.file-params') || {}).textContent || '').trim(),
+      pages: ((row.querySelector('.file-pages') || {}).textContent || '').trim(),
+      amount: ((row.querySelector('.file-amount') || {}).textContent || '').trim(),
+    })),
+  )
+}
+
+/** 学生端详情页的整单行（文档页数 / 打印页数 / 金额）。 */
+async function readDetailRows(page) {
+  return page.evaluate(() => {
+    const result = {}
+    for (const row of document.querySelectorAll('.row')) {
+      const key = ((row.querySelector('.k') || {}).textContent || '').trim()
+      const value = ((row.querySelector('.v') || {}).textContent || '').trim()
+      if (key) result[key] = value
+    }
+    return result
+  })
+}
+
+/** 从页面带 token 读订单详情，拿到服务端落库的逐份参数与金额。 */
+async function orderDetailFromApi(page, orderId) {
+  const data = await page.evaluate(
+    async ({ backendUrl, orderId }) => {
+      const key = Object.keys(localStorage).find((item) => item.includes('zhiyin_token'))
+      const token = key ? localStorage.getItem(key) : ''
+      if (!token) return { error: 'localStorage 里没有 token' }
+      const response = await fetch(`${backendUrl}/api/order/${orderId}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      const body = await response.json()
+      if (body.code !== 0) return { error: `订单详情返回 ${body.code} ${body.message}` }
+      return body.data
+    },
+    { backendUrl: BACKEND_URL, orderId },
+  )
+  if (!data || data.error) throw new Error(`没有取到订单详情：${JSON.stringify(data)}`)
+  return data
+}
+
 async function assertNoOverflow(page, label) {
   const metrics = await page.evaluate(() => ({
     viewport: window.innerWidth,
@@ -805,7 +959,7 @@ async function runViewport(browser, viewport) {
     })
 
     await step('模拟支付', async () => {
-      await clickByText(student, '模拟支付')
+      await clickByTextRetry(student, '模拟支付')
       await waitGone(student, '模拟支付', 30000)
     })
 
@@ -983,6 +1137,8 @@ async function runViewport(browser, viewport) {
  */
 async function runMultiFilePhase({ student, teacher, viewport, step }) {
   const order = { orderNo: '', pickup: '', id: 0 }
+  // 页面自己调的报价入参与返回：后续下单、详情、换文件都用它当基准数
+  const pricing = { payload: null, quote: null }
 
   await step('多文件：一次选两份 PDF', async () => {
     await gotoFresh(student, `${STUDENT_URL}/#/pages/order/order`, {
@@ -997,19 +1153,209 @@ async function runMultiFilePhase({ student, teacher, viewport, step }) {
     await waitBody(student, '确认下单', 60000)
   })
 
+  await step('多文件：逐份设参数，行金额与总额等于服务端报价', async () => {
+    const quotes = recordQuoteRequests(student)
+    try {
+      // 第一份保持单面 + 黑白 + 1 份；第二份改成双面 + 彩色 + 2 份
+      await clickFileOption(student, 1, '单面')
+      await clickFileOption(student, 1, '黑白')
+      await clickFileOption(student, 2, '双面')
+      await clickFileOption(student, 2, '彩色')
+      await clickFileOption(student, 2, '＋')
+      // 300 ms 防抖 + 一次往返：等最后那次报价回来再读页面
+      await sleep(1500)
+      await waitVisible(student, '.file-row[data-file-index="2"] .file-amount', 20000)
+      if (!quotes.items.length) throw new Error('页面没有调用 /api/order/quote')
+      pricing.payload = quotes.items[quotes.items.length - 1].payload
+    } finally {
+      quotes.stop()
+    }
+
+    // 防抖后的入参就是页面当前的选择，先把它钉住，避免拿到旧一次的报价
+    const sent = pricing.payload
+    const rowsSent = sent && Array.isArray(sent.files) ? sent.files : []
+    if (rowsSent.length !== 2) {
+      throw new Error(`报价入参应该有两份文件：${JSON.stringify(sent)}`)
+    }
+    const expectSent = [
+      { print_side: 1, color_mode: 0, copies: 1 },
+      { print_side: 2, color_mode: 1, copies: 2 },
+    ]
+    expectSent.forEach((expect, index) => {
+      const file = rowsSent[index]
+      if (
+        file.print_side !== expect.print_side ||
+        file.color_mode !== expect.color_mode ||
+        file.copies !== expect.copies
+      ) {
+        throw new Error(
+          `第 ${index + 1} 份的报价参数不对：${JSON.stringify(file)}，预期 ${JSON.stringify(expect)}`,
+        )
+      }
+    })
+
+    // 脚本自己再调一次接口：同一份参数必须得到同一组数字
+    const body = await quoteFromPage(student, sent)
+    if (!body || body.code !== 0) throw new Error(`报价接口返回 ${JSON.stringify(body)}`)
+    pricing.quote = body.data
+
+    const rows = await readFileParams(student)
+    if (rows.length !== 2) throw new Error(`清单里应有两份文件，实际 ${rows.length}`)
+    if (!rows[0].segments.includes('单面') || !rows[0].segments.includes('黑白')) {
+      throw new Error(`第 1 份的参数不是单面黑白：${JSON.stringify(rows[0])}`)
+    }
+    if (rows[0].copies !== '1') throw new Error(`第 1 份份数应为 1，实际「${rows[0].copies}」`)
+    if (!rows[1].segments.includes('双面') || !rows[1].segments.includes('彩色')) {
+      throw new Error(`第 2 份的参数不是双面彩色：${JSON.stringify(rows[1])}`)
+    }
+    if (rows[1].copies !== '2') throw new Error(`第 2 份份数应为 2，实际「${rows[1].copies}」`)
+
+    // 页面上的行金额、逐份打印页数、总额三样全部等于服务端报价
+    pricing.quote.files.forEach((file, index) => {
+      const row = rows[index]
+      if (row.amount !== money(file.amount_cents)) {
+        throw new Error(
+          `第 ${index + 1} 份行金额显示「${row.amount}」，报价是 ${money(file.amount_cents)}`,
+        )
+      }
+      if (!row.printPages.includes(`${file.print_pages} 页`)) {
+        throw new Error(
+          `第 ${index + 1} 份打印页数显示「${row.printPages}」，报价是 ${file.print_pages} 页`,
+        )
+      }
+    })
+    const sum = pricing.quote.files.reduce((acc, file) => acc + Number(file.amount_cents), 0)
+    if (sum !== pricing.quote.amount_cents) {
+      throw new Error(
+        `报价自己就不自洽：逐份之和 ${sum} 分，整单 ${pricing.quote.amount_cents} 分`,
+      )
+    }
+    const summary = await readQuoteSummary(student)
+    const expectedSummary = {
+      文档页数: `${pricing.quote.page_count} 页`,
+      打印页数: `${pricing.quote.print_page_count} 页`,
+      应付金额: money(pricing.quote.amount_cents),
+    }
+    for (const [key, value] of Object.entries(expectedSummary)) {
+      if (summary[key] !== value) {
+        throw new Error(`页面「${key}」显示「${summary[key] || '无'}」，报价是「${value}」`)
+      }
+    }
+  })
+
   await step('多文件：下单并支付', async () => {
     await clickByText(student, '确认下单')
     await waitBody(student, '下单成功', 60000)
     Object.assign(order, await readOrderResult(student))
     order.id = await orderIdFromApi(student, order.orderNo)
-    await clickByText(student, '模拟支付')
+    await clickByTextRetry(student, '模拟支付')
     await waitGone(student, '模拟支付', 30000)
+  })
+
+  await step('多文件：学生详情按份显示参数与行金额', async () => {
+    await gotoFresh(student, `${STUDENT_URL}/#/pages/mine/detail?id=${order.id}`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    })
+    await waitBody(student, '文件（2 份', 60000)
+
+    // 订单落库的逐份金额必须就是刚才报价那组数（同一套计费，不是两套算法）
+    const detail = await orderDetailFromApi(student, order.id)
+    if (detail.files.length !== 2) {
+      throw new Error(`订单详情应有 2 份文件，实际 ${detail.files.length}`)
+    }
+    detail.files.forEach((file, index) => {
+      const quoted = pricing.quote.files[index]
+      if (Number(file.amount_cents) !== Number(quoted.amount_cents)) {
+        throw new Error(
+          `第 ${index + 1} 份落库行金额 ${file.amount_cents} 分，报价 ${quoted.amount_cents} 分`,
+        )
+      }
+      if (Number(file.print_pages) !== Number(quoted.print_pages)) {
+        throw new Error(
+          `第 ${index + 1} 份落库打印页数 ${file.print_pages}，报价 ${quoted.print_pages}`,
+        )
+      }
+    })
+
+    const rows = await readDetailFiles(student)
+    if (rows.length !== 2) throw new Error(`详情页应逐份列出 2 份，实际 ${rows.length}`)
+    const expectedParams = ['单面 · 黑白', '双面 · 彩色']
+    rows.forEach((row, index) => {
+      const quoted = pricing.quote.files[index]
+      if (!row.name.includes(index === 0 ? 'thesis-v1.pdf' : 'thesis-v3.pdf')) {
+        throw new Error(`第 ${index + 1} 份文件名不对：「${row.name}」`)
+      }
+      if (!row.params.includes(expectedParams[index])) {
+        throw new Error(`第 ${index + 1} 份参数显示「${row.params}」，预期含「${expectedParams[index]}」`)
+      }
+      if (!row.params.includes(`${quoted.copies} 份`)) {
+        throw new Error(`第 ${index + 1} 份份数显示「${row.params}」，预期 ${quoted.copies} 份`)
+      }
+      if (!row.pages.includes(`文档 ${quoted.page_count} 页`)) {
+        throw new Error(`第 ${index + 1} 份文档页数显示「${row.pages}」`)
+      }
+      if (!row.pages.includes(`打印 ${quoted.print_pages} 页`)) {
+        throw new Error(`第 ${index + 1} 份打印页数显示「${row.pages}」`)
+      }
+      if (row.amount !== money(quoted.amount_cents)) {
+        throw new Error(
+          `第 ${index + 1} 份行金额显示「${row.amount}」，报价是 ${money(quoted.amount_cents)}`,
+        )
+      }
+    })
+
+    const totals = await readDetailRows(student)
+    const expectTotals = {
+      文档页数: `${pricing.quote.page_count} 页`,
+      打印页数: `${pricing.quote.print_page_count} 页`,
+    }
+    for (const [key, value] of Object.entries(expectTotals)) {
+      if (totals[key] !== value) {
+        throw new Error(`详情页「${key}」显示「${totals[key] || '无'}」，报价是「${value}」`)
+      }
+    }
+    if (!(totals['金额'] || '').includes(money(pricing.quote.amount_cents))) {
+      throw new Error(`详情页总额显示「${totals['金额'] || '无'}」与报价不符`)
+    }
+    if (viewport.mobile) await assertNoOverflow(student, '学生端多文件详情（逐份参数）')
   })
 
   await step('多文件：老师端队列列出两份文件', async () => {
     await searchQueue(teacher, order.pickup)
     await waitRowText(teacher, order.pickup, 'thesis-v1.pdf')
     await waitRowText(teacher, order.pickup, 'thesis-v3.pdf')
+    // 每一份自己的单双面、颜色、纸张、份数、打印页数与行金额
+    const lines = await teacher.evaluate((code) => {
+      const row = [...document.querySelectorAll('.order-card, .el-table__row, tr')].find((element) =>
+        (element.innerText || '').includes(code),
+      )
+      if (!row) return null
+      return [...row.querySelectorAll('.file-line, .oc-file')].map((element) =>
+        (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim(),
+      )
+    }, order.pickup)
+    if (!lines || lines.length !== 2) {
+      throw new Error(`老师端没有逐份列出两份：${JSON.stringify(lines)}`)
+    }
+    const expectedLines = ['单面 · 黑白', '双面 · 彩色']
+    lines.forEach((line, index) => {
+      const quoted = pricing.quote.files[index]
+      if (!line.includes(expectedLines[index])) {
+        throw new Error(`老师端第 ${index + 1} 份参数显示「${line}」`)
+      }
+      if (!line.includes(`${quoted.copies} 份`)) {
+        throw new Error(`老师端第 ${index + 1} 份没显示份数 ${quoted.copies}`)
+      }
+      if (!line.includes(`打印 ${quoted.print_pages} 页`)) {
+        throw new Error(`老师端第 ${index + 1} 份没显示打印页数 ${quoted.print_pages}`)
+      }
+      if (!line.includes(money(quoted.amount_cents))) {
+        throw new Error(
+          `老师端第 ${index + 1} 份没显示行金额 ${money(quoted.amount_cents)}：「${line}」`,
+        )
+      }
+    })
     if (viewport.mobile) {
       await assertNoOverflow(teacher, '老师端多文件队列')
       await assertTouchButtons(teacher, '老师端多文件队列', '.order-card')
@@ -1091,6 +1437,71 @@ async function runMultiFilePhase({ student, teacher, viewport, step }) {
     ) {
       throw new Error(`学生端多文件顺序不对：${JSON.stringify(names)}`)
     }
+
+    // 换完第二份后：第一份的参数与行金额不动，第二份按原参数重算，
+    // 整单总额等于服务端报价（脚本用当前清单再报一次价来对）。
+    const detail = await orderDetailFromApi(student, order.id)
+    const body = await quoteFromPage(student, {
+      files: detail.files.map((file) => ({
+        file_key: file.file_key,
+        file_name: file.file_name,
+        page_count: file.page_count,
+        print_side: file.print_side,
+        color_mode: file.color_mode,
+        paper_size: file.paper_size,
+        copies: file.copies,
+      })),
+      print_side: detail.print_side,
+      color_mode: detail.color_mode,
+      copies: detail.copies,
+      paper_size: detail.paper_size,
+    })
+    if (!body || body.code !== 0) {
+      throw new Error(`换文件后报价接口返回 ${JSON.stringify(body)}`)
+    }
+    const quoted = body.data
+    if (Number(quoted.amount_cents) !== Number(detail.amount_cents)) {
+      throw new Error(
+        `整单总额与服务端报价不一致：订单 ${detail.amount_cents} 分，报价 ${quoted.amount_cents} 分`,
+      )
+    }
+    if (Number(quoted.files[0].amount_cents) !== Number(pricing.quote.files[0].amount_cents)) {
+      throw new Error(
+        `第一份行金额被改了：换前 ${pricing.quote.files[0].amount_cents} 分，` +
+          `换后 ${quoted.files[0].amount_cents} 分`,
+      )
+    }
+    if (Number(quoted.files[1].print_side) !== 2 || Number(quoted.files[1].color_mode) !== 1) {
+      throw new Error(`第二份换文件后参数被改了：${JSON.stringify(quoted.files[1])}`)
+    }
+    if (Number(quoted.files[1].copies) !== 2) {
+      throw new Error(`第二份换文件后份数被改成 ${quoted.files[1].copies}`)
+    }
+
+    const rows = await readDetailFiles(student)
+    if (rows.length !== 2) throw new Error(`详情页应逐份列出 2 份，实际 ${rows.length}`)
+    if (!rows[0].params.includes('单面 · 黑白') || !rows[0].params.includes('1 份')) {
+      throw new Error(`第一份的参数变了：「${rows[0].params}」`)
+    }
+    if (rows[0].amount !== money(quoted.files[0].amount_cents)) {
+      throw new Error(`第一份行金额显示「${rows[0].amount}」，服务端是 ${money(quoted.files[0].amount_cents)}`)
+    }
+    if (!rows[1].params.includes('双面 · 彩色') || !rows[1].params.includes('2 份')) {
+      throw new Error(`第二份的参数没沿用原值：「${rows[1].params}」`)
+    }
+    if (rows[1].amount !== money(quoted.files[1].amount_cents)) {
+      throw new Error(`第二份行金额显示「${rows[1].amount}」，服务端是 ${money(quoted.files[1].amount_cents)}`)
+    }
+    if (!rows[1].pages.includes(`打印 ${quoted.files[1].print_pages} 页`)) {
+      throw new Error(`第二份打印页数显示「${rows[1].pages}」`)
+    }
+    const totals = await readDetailRows(student)
+    if (!(totals['金额'] || '').includes(money(quoted.amount_cents))) {
+      throw new Error(`详情页总额显示「${totals['金额'] || '无'}」，服务端报价 ${money(quoted.amount_cents)}`)
+    }
+    if (totals['打印页数'] !== `${quoted.print_page_count} 页`) {
+      throw new Error(`详情页打印页数显示「${totals['打印页数'] || '无'}」`)
+    }
     if (viewport.mobile) await assertNoOverflow(student, '学生端多文件详情')
   })
 
@@ -1121,7 +1532,7 @@ async function runFourFilePhase({ student, teacher, viewport, step }) {
     await waitBody(student, '下单成功', 60000)
     Object.assign(order, await readOrderResult(student))
     order.id = await orderIdFromApi(student, order.orderNo)
-    await clickByText(student, '模拟支付')
+    await clickByTextRetry(student, '模拟支付')
     await waitGone(student, '模拟支付', 30000)
   })
 
@@ -1336,7 +1747,7 @@ async function runStartGuardPhase({ student, teacher, viewport, step }) {
     await waitBody(student, '下单成功', 60000)
     Object.assign(order, await readOrderResult(student))
     order.id = await orderIdFromApi(student, order.orderNo)
-    await clickByText(student, '模拟支付')
+    await clickByTextRetry(student, '模拟支付')
     await waitGone(student, '模拟支付', 30000)
 
     // 换文件：先进详情再进取换页，完成后回到详情看待确认状态
