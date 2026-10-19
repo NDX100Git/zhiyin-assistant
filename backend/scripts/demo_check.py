@@ -1,10 +1,10 @@
 """演示自检：一条命令走完 12 步演示链路，每步打印一句可直接当录屏旁白的中文。
 
-用法（后端已起，默认 8208）：
+用法（后端已起，默认 8000）：
 
     python scripts/demo_check.py
-    python scripts/demo_check.py --base-url http://127.0.0.1:8208
-    ZHIYIN_BASE_URL=http://127.0.0.1:8208 python scripts/demo_check.py
+    python scripts/demo_check.py --base-url http://127.0.0.1:8000
+    ZHIYIN_BASE_URL=http://127.0.0.1:8000 python scripts/demo_check.py
 
 老师账号从 backend/.env 读 ADMIN_USERNAME 与 ADMIN_PASSWORD。
 脚本自己生成 PDF，不依赖任何外部文件；任一步失败都会点名卡在哪一步，退出码非 0。
@@ -26,7 +26,7 @@ import httpx
 import pymupdf
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_BASE_URL = "http://127.0.0.1:8208"
+DEFAULT_BASE_URL = "http://127.0.0.1:8000"
 # 一句旁白最多 30 字：录屏时一句话讲完一步，多了会跟不上手速
 NARRATION_LIMIT = 30
 
@@ -471,7 +471,7 @@ def main() -> int:
             health = call(demo.client, "GET", "/api/health")
         except httpx.HTTPError as error:
             print(f"连不上后端 {args.base_url}：{error}")
-            print("先把后端起起来：bash backend/scripts/dev_up.sh（默认 8208）")
+            print("先把后端起起来：bash backend/scripts/dev_up.sh（默认 8000）")
             return 1
         if health.get("status") != "up":
             print(f"后端没就绪：{args.base_url}/api/health 返回 {health}")

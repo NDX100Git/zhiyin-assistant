@@ -25,9 +25,9 @@ LOG_DIR="$RUN_DIR/logs"
 
 PY="${PY:-/home/twilightrain/WorkZone/Temp/zhiyin-venv/bin/python}"
 NPM="${NPM:-$(command -v npm || true)}"
-BACKEND_PORT="${BACKEND_PORT:-8208}"
-STUDENT_PORT="${STUDENT_PORT:-3207}"
-TEACHER_PORT="${TEACHER_PORT:-3208}"
+BACKEND_PORT="${BACKEND_PORT:-8000}"
+STUDENT_PORT="${STUDENT_PORT:-5173}"
+TEACHER_PORT="${TEACHER_PORT:-5174}"
 
 info() { printf '%s\n' "$*"; }
 warn() { printf '!! %s\n' "$*" >&2; }
