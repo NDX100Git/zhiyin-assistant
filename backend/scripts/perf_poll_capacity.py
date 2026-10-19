@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -35,8 +36,7 @@ from sqlalchemy import text as sql_text  # noqa: E402
 from sqlalchemy.engine import make_url  # noqa: E402
 
 from app.config import settings  # noqa: E402
-from scripts import stress_extreme  # noqa: E402
-from scripts.stress_extreme import _bulk_fill, _login, _percentile  # noqa: E402
+from scripts.stress_extreme import _login, _percentile  # noqa: E402
 
 # 一万人 / 30 秒；学生端默认轮询间隔见 student-app/src/config/index.js
 ONLINE_USERS = 10000
@@ -113,7 +113,8 @@ def _upload_probe_pdf(base_url: str, token: str) -> str:
     """上传一份真实 PDF，压测订单引用它。
 
     下单会校验对象存储里文件还在、且没超过下单宽限期；假 key 会被 40053 拒掉，
-    所以压测也必须走一次真实上传。所有压测订单共用这一份文件，只为量读取容量。
+    所以压测也必须走一次真实上传。下单还校验文件归属，所以每个压测用户各传一份，
+    不共用别人上传的文件。
     """
     import fitz
 
@@ -132,6 +133,67 @@ def _upload_probe_pdf(base_url: str, token: str) -> str:
     if body.get("code") != 0:
         raise SystemExit(f"上传压测文件失败：{body.get('code')} {body.get('message')}")
     return body["data"]["file_key"]
+
+
+def _fill_orders(
+    base_url: str, file_keys: list[str], tokens: list[str], total: int, workers: int
+) -> tuple[dict[int, int], float]:
+    """多线程不限速下单，返回 ({错误码: 次数}, 用时)。
+
+    每个 token 用自己的文件下单：下单校验文件归属，拿别人的 key 会被 40404 拒掉。
+    """
+    codes: dict[int, int] = {}
+    lock = threading.Lock()
+    done = 0
+    milestone = 1000
+    phase_started = time.perf_counter()
+
+    def worker(worker_id: int) -> None:
+        nonlocal done, milestone, phase_started
+        local: dict[int, int] = {}
+        index = 0
+        while True:
+            with lock:
+                if done >= total:
+                    break
+                done += 1
+                current = done
+            slot = (worker_id * 7 + index) % len(tokens)
+            index += 1
+            payload = {
+                "file_key": file_keys[slot],
+                "file_name": "perf-probe.pdf",
+                "page_count": 1,
+                "print_side": 2,
+                "color_mode": 0,
+                "copies": 1,
+                "paper_size": "A4",
+            }
+            body = _client(base_url).post(
+                "/api/order/create",
+                headers={"Authorization": f"Bearer {tokens[slot]}"},
+                json=payload,
+            ).json()
+            code = int(body.get("code", -1))
+            local[code] = local.get(code, 0) + 1
+            if current % milestone == 0:
+                now = time.perf_counter()
+                with lock:
+                    print(
+                        f"    {current:>6} 单，本段用时 {now - phase_started:5.1f} s，"
+                        f"约 {milestone / (now - phase_started):5.1f} 单/秒"
+                    )
+                    milestone += 1000
+                    phase_started = now
+        with lock:
+            for code, count in local.items():
+                codes[code] = codes.get(code, 0) + count
+
+    started = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(worker, range(workers)))
+    print(f"    {total:>6} 单，全部提交完毕")
+    return codes, time.perf_counter() - started
 
 
 def _git_commit() -> str:
@@ -208,26 +270,25 @@ def main() -> int:
 
     tokens = [_login(args.base_url, f"poll-{index:04d}") for index in range(max(levels) + 2)]
 
+    fill_note = "跳过灌数据，复用库里已有订单"
     if args.skip_fill:
         print("按参数跳过灌数据，复用库里已有订单")
     else:
-        file_key = _upload_probe_pdf(args.base_url, tokens[0])
-        stress_extreme.ORDER_BODY = {
-            **stress_extreme.ORDER_BODY,
-            "file_key": file_key,
-            "file_name": "perf-probe.pdf",
-            "page_count": 1,
-        }
-        print(f"  压测文件：{file_key}")
         print(f"\n阶段一：灌 {args.total} 单（{args.workers} 个并发连接）")
-        started = time.perf_counter()
-        errors, _latencies = _bulk_fill(args.base_url, tokens, args.total, args.workers)
-        elapsed = time.perf_counter() - started
+        file_keys = [_upload_probe_pdf(args.base_url, token) for token in tokens]
+        print(f"  压测文件：{len(file_keys)} 份，每个压测用户各一份")
+        codes, elapsed = _fill_orders(
+            args.base_url, file_keys, tokens, args.total, args.workers
+        )
         print(
             f"  完成 {args.total} 单，用时 {elapsed:.1f} s，均速 "
-            f"{args.total / elapsed:.1f} 单/秒，失败 {errors} 单"
+            f"{args.total / elapsed:.1f} 单/秒，错误码分布 "
+            f"{{{', '.join(f'{code}: {count}' for code, count in sorted(codes.items()))}}}"
         )
-        if errors:
+        fill_note = (
+            f"灌入 {args.total} 单，用时 {elapsed:.1f} 秒，均速 {args.total / elapsed:.1f} 单/秒"
+        )
+        if codes.get(0, 0) != args.total:
             print("  有下单失败，读取容量结果不可信；先修下单链路再复测")
             return 1
 
@@ -292,6 +353,7 @@ def main() -> int:
         "",
         f"- 服务地址：`{args.base_url}`",
         f"- 数据库：`{db_name}`，排队订单 {queued} 单",
+        f"- 准备：{fill_note}",
         f"- 代码提交：`{_git_commit()}`",
         f"- 系统：{platform.platform()}，CPU {os.cpu_count()} 核",
         f"- Python：{platform.python_version()}",

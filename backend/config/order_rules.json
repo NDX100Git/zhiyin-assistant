@@ -23,7 +23,9 @@
   },
   "wait": {
     "recent_orders": 20,
-    "default_seconds_per_order": 60
+    "default_seconds_per_order": 60,
+    "queue_snapshot_seconds": 1.5,
+    "_note": "queue_snapshot_seconds 是队列快照的有效期上限；会改变队列的动作都会立即失效快照，这个值只兜底。配 0 表示每次请求都重新读队。"
   },
   "limits": {
     "max_copies": 50,

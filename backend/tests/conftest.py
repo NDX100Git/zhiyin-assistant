@@ -66,6 +66,10 @@ def clean_tables(engine):
     with engine.begin() as conn:
         for table in reversed(Base.metadata.sorted_tables):
             conn.execute(text(f"TRUNCATE TABLE `{table.name}`"))
+    # 队列快照是进程内缓存，TRUNCATE 不会触发失效，用例之间必须显式清掉
+    from app.services import queue_snapshot
+
+    queue_snapshot.reset()
 
 
 @pytest.fixture

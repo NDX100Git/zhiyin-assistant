@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.models.order import Order
 from app.models.print_log import PrintLog
+from app.services import queue_snapshot
 from app.services.notifier import get_notifier
 from app.utils.exceptions import BusinessError
 
@@ -141,5 +142,8 @@ def change_status(
         },
         order_id=order.id,
     )
+    # 进出队列的状态变化（支付入队、取消出队、开始打印、打印完成、异常恢复）
+    # 会让旧的队列快照立刻过期；调用方紧接着会提交，学生下次轮询就能看到新位置
+    queue_snapshot.invalidate()
     db.flush()
     return order

@@ -13,7 +13,7 @@ from app.models.user import User
 from app.schemas.order import OrderCancelRequest, OrderCreateRequest, OrderFileReplaceRequest
 from app.services import file_change_service, order_service
 from app.services.session_service import order_notice
-from app.utils.response import ok
+from app.utils.response import ok, ok_json
 from app.utils.security import get_current_user
 
 router = APIRouter()
@@ -41,7 +41,8 @@ def list_orders(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    return ok(order_service.list_orders(db, user, status, page, page_size))
+    # 30 秒轮询的最高频读接口：返回值已是纯 JSON 类型，直出省掉一层通用编码
+    return ok_json(order_service.list_orders(db, user, status, page, page_size))
 
 
 @router.get("/{order_id}", summary="订单详情（含排队位置）", response_model=None)

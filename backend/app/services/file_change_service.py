@@ -30,6 +30,7 @@ from app.models.order_file_change import (
 )
 from app.models.order_file_version import OrderFileVersion
 from app.models.payment_log import PaymentLog
+from app.services import queue_snapshot
 from app.services.notifier import get_notifier
 from app.services.order_file_service import (
     ensure_files,
@@ -626,6 +627,7 @@ def _approve_change(
             "message": price_note,
         },
     )
+    queue_snapshot.invalidate()  # 换了排到队尾，旧快照里的位置立刻作废
     db.commit()
     db.refresh(order)
     logger.info(

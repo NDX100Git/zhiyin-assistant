@@ -41,6 +41,7 @@ from app.services.order_state import (
 )
 from app.services.payment import get_payment_provider
 from app.services.pricing import calc_amount_cents
+from app.services import queue_snapshot
 from app.services.queue_service import batch_wait_info, new_order_wait_info, order_wait_info
 from app.services.session_service import current_session_info, get_or_create_session
 from app.services.storage import get_storage
@@ -214,6 +215,7 @@ def create_order(db: Session, user: User, payload) -> Order:
         order_id=order.id,
     )
 
+    queue_snapshot.invalidate()  # 下单同样让旧的队列快照作废
     db.commit()
     db.refresh(order)
     logger.info("创建订单成功：%s 取件码 %s 金额 %s 分", order.order_no, order.pickup_code,

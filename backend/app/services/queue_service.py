@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import math
+import threading
+import time
 from datetime import datetime
 
 from sqlalchemy import case, func, select
@@ -17,10 +19,15 @@ from sqlalchemy.orm import Session
 
 from app.config import get_order_rules
 from app.models.order import Order
+from app.services import queue_snapshot
 from app.services.order_state import STATUS_COMPLETED, STATUS_PRINTING, STATUS_QUEUING, STATUS_READY
+from app.services.queue_snapshot import QueueSnapshot
 
 ACTIVE_STATUSES = (STATUS_QUEUING, STATUS_PRINTING)
 HISTORY_STATUSES = (STATUS_READY, STATUS_COMPLETED)
+
+# 重建快照的互斥锁：同一刻只让一个请求扫全队
+_build_lock = threading.Lock()
 
 
 def _wait_rules() -> dict:
@@ -148,35 +155,76 @@ def queue_position(db: Session, order: Order) -> int:
     return len(list(ahead))
 
 
-def batch_wait_info(db: Session, orders: list[Order]) -> dict[int, dict]:
-    """一次算好一批订单的排队位置与等待时间，返回 {订单 id: 排队信息}。
+def _read_active_rows(db: Session) -> list:
+    """读整队的订单 id 与页数，按队列顺序。
 
-    列表接口必须走这个函数：原先每行调一次 order_wait_info，每次都要把整个队列
-    读成 ORM 对象，一页 50 行就是 50 遍全队列扫描。实测一万单排队时老师端队列
-    一页要 7.7 秒，学生列表 3.1 秒。
+    只取两列，不把整个队列读成 ORM 对象：一万单时读对象要一百多毫秒，
+    读两列是十几毫秒。
     """
-    if not orders:
-        return {}
-
-    # 只取三列，不把整个队列读成 ORM 对象：一万单时读对象要一百多毫秒，
-    # 读三列是十几毫秒，而列表接口的并发恰恰卡在这段时间上
-    active_rows = db.execute(
+    return db.execute(
         select(Order.id, Order.page_count)
         .where(Order.status.in_(ACTIVE_STATUSES))
         .order_by(*queue_order_by())
     ).all()
-    ratio = per_page_seconds(db)
-    index = {row.id: position for position, row in enumerate(active_rows)}
 
+
+def _build_snapshot(db: Session) -> QueueSnapshot:
+    """读一次整队，算出位置、前序页数前缀和与单均耗时。"""
+    started_at = time.monotonic()  # 有效期从读库那一刻算起，不含后续计算
+    active_rows = _read_active_rows(db)
+
+    positions: dict[int, int] = {}
     # 前缀和：前面每个位置的累计页数，避免逐行切片累加
     prefix_pages = [0] * (len(active_rows) + 1)
-    for position, row in enumerate(active_rows):
-        prefix_pages[position + 1] = prefix_pages[position] + int(row.page_count or 0)
+    for position, (order_id, page_count) in enumerate(active_rows):
+        positions[order_id] = position
+        prefix_pages[position + 1] = prefix_pages[position] + int(page_count or 0)
 
-    total = len(active_rows)
+    return QueueSnapshot(
+        positions=positions,
+        prefix_pages=tuple(prefix_pages),
+        total=len(active_rows),
+        seconds_per_page=per_page_seconds(db),
+        built_at=started_at,
+    )
+
+
+def queue_state(db: Session) -> QueueSnapshot:
+    """取队列快照：有效期内直接复用，过期或刚失效时重新读一次库。
+
+    重建时只放一个请求进去：一万单的一份快照要几十毫秒，有效期一到，
+    十几个并发请求同时冲进来重建会把数据库打成一堆重复的全队扫描，
+    后面排队的等它建好直接复用即可。
+    """
+    snapshot = queue_snapshot.current()
+    if snapshot is not None:
+        return snapshot
+
+    with _build_lock:
+        snapshot = queue_snapshot.current()
+        if snapshot is not None:
+            return snapshot
+        built_generation = queue_snapshot.generation()
+        snapshot = _build_snapshot(db)
+        queue_snapshot.store(snapshot, built_generation)
+        return snapshot
+
+
+def batch_wait_info(db: Session, orders: list[Order]) -> dict[int, dict]:
+    """一次算好一批订单的排队位置与等待时间，返回 {订单 id: 排队信息}。
+
+    列表接口必须走这个函数：原先每行调一次 order_wait_info，每行都要把整个队列
+    扫一遍，一页 50 行就是 50 遍全队列扫描。现在整队位置来自共享快照，一页只查表。
+    """
+    if not orders:
+        return {}
+
+    snapshot = queue_state(db)
+    rules = _wait_rules()  # 一次读取，避免每行读一遍配置文件
+    total = snapshot.total
     result: dict[int, dict] = {}
     for order in orders:
-        position = index.get(order.id)
+        position = snapshot.position_of(order.id)
         if position is None:
             result[order.id] = {
                 "queue_position": 0,
@@ -184,9 +232,11 @@ def batch_wait_info(db: Session, orders: list[Order]) -> dict[int, dict]:
                 "queuing_count": total,
             }
             continue
-        ahead_pages = prefix_pages[position]
+        ahead_pages = snapshot.prefix_pages[position]
         own_pages = int(order.page_count or 0)
-        minutes = _minutes_for(ratio, ahead_pages + own_pages, position + 1)
+        minutes = _minutes_for(
+            snapshot.seconds_per_page, ahead_pages + own_pages, position + 1, rules
+        )
         result[order.id] = {
             "queue_position": position,
             "estimated_minutes": minutes,
@@ -195,8 +245,10 @@ def batch_wait_info(db: Session, orders: list[Order]) -> dict[int, dict]:
     return result
 
 
-def _minutes_for(ratio: float | None, pages: int, order_count: int) -> int:
-    rules = _wait_rules()
+def _minutes_for(
+    ratio: float | None, pages: int, order_count: int, rules: dict | None = None
+) -> int:
+    rules = rules if rules is not None else _wait_rules()
     default_seconds = int(rules.get("default_seconds_per_order", 60))
     if ratio is not None:
         seconds = ratio * pages
@@ -236,9 +288,16 @@ def order_wait_info(db: Session, order: Order) -> dict:
 
 
 def new_order_wait_info(db: Session) -> dict:
-    """新下单的预计等待（排在整个队列之后）。"""
-    active = list_active_orders(db)
+    """新下单的预计等待（排在整个队列之后）。
+
+    首页每次刷新都会问一次，所以同样走快照，不再把整队读成对象。
+    """
+    snapshot = queue_state(db)
+    if snapshot.total == 0:
+        return {"queuing_count": 0, "estimated_minutes": 0}
     return {
-        "queuing_count": len(active),
-        "estimated_minutes": estimate_minutes(db, active),
+        "queuing_count": snapshot.total,
+        "estimated_minutes": _minutes_for(
+            snapshot.seconds_per_page, snapshot.total_pages, snapshot.total
+        ),
     }
