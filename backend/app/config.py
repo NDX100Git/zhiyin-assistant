@@ -74,7 +74,13 @@ class Settings(BaseSettings):
     # 业务参数
     jwt_secret: str = "change_me"
     jwt_expire_minutes: int = 720
-    file_expire_hours: int = 24
+    # 上传文件的物理保留小时数。必须大于下单宽限期（下方 order_file_grace_hours），
+    # 否则学生拿到的是一份已被删掉的引用。启动时会自检并提示。
+    file_expire_hours: int = 72
+    # 上传后允许多久之内下单；超过就提示重新上传（宽限期口径，产品定）
+    order_file_grace_hours: int = 48
+    # 异常单引用的文件额外保留天数。异常单没有自动超时，不设上限会无限期占空间
+    abnormal_file_grace_days: int = 3
     # 体检报告缓存（ai_reports）的保留天数，过期由定时任务清理
     report_retention_days: int = 7
     signed_url_expire_minutes: int = 30

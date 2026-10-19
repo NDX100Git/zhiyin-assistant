@@ -64,6 +64,10 @@ class FakeStorage(FileStorage):
     def read_bytes(self, key: str) -> bytes:
         raise NotImplementedError("单测替身不支持读取")
 
+    def stat_modified(self, key: str) -> datetime | None:
+        obj = self.objects.get(key)
+        return obj.last_modified if obj else None
+
     def list_objects(self, prefix: str = "") -> list[StoredObject]:
         if self.list_error is not None:
             raise self.list_error
@@ -241,3 +245,31 @@ def test_对象存储列举失败只记失败不崩溃(db_session, fake_storage)
 
     assert stats.failed == 1
     assert stats.deleted == 0
+
+
+def test_异常单引用的文件在额外宽限期内保留(db_session, fake_storage) -> None:
+    """异常单没有自动超时，所以给三天额外宽限，而不是无限期保留。"""
+    now = datetime(2026, 3, 1, 12, 0, 0)
+    # 三天宽限 + 二十四小时保留 = 四天，这里取三天多，仍在宽限内
+    old = now - timedelta(hours=settings.file_expire_hours + 30)
+    fake_storage.put("files/abnormal-recent.pdf", old)
+    _add_order(db_session, "files/abnormal-recent.pdf", STATUS_ABNORMAL)
+
+    stats = run_cleanup(db_session, fake_storage, now=now)
+
+    assert stats.deleted == 0
+    assert stats.skipped == 1
+    assert "files/abnormal-recent.pdf" in fake_storage.objects
+
+
+def test_异常单引用的文件超过额外宽限后回收(db_session, fake_storage) -> None:
+    now = datetime(2026, 3, 1, 12, 0, 0)
+    # 保留期加三天宽限再多一天，已经超出上限
+    old = now - timedelta(hours=settings.file_expire_hours + 24 * 3 + 24)
+    fake_storage.put("files/abnormal-old.pdf", old)
+    _add_order(db_session, "files/abnormal-old.pdf", STATUS_ABNORMAL)
+
+    stats = run_cleanup(db_session, fake_storage, now=now)
+
+    assert stats.deleted == 1
+    assert "files/abnormal-old.pdf" in fake_storage.deleted

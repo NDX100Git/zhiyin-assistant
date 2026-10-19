@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import BinaryIO
 
 from minio import Minio
+from minio.error import S3Error
 
 from app.config import settings
 from app.services.storage.base import FileStorage, StoredObject
@@ -77,6 +78,17 @@ class MinioStorage(FileStorage):
             if response is not None:
                 response.close()
                 response.release_conn()
+
+    def stat_modified(self, key: str) -> datetime | None:
+        """查对象修改时间；不存在返回 None，由调用方给出人话提示。"""
+        self.ensure_bucket()
+        try:
+            stat = self._client.stat_object(self._bucket, key)
+        except S3Error as exc:
+            if exc.code in {"NoSuchKey", "NoSuchObject", "NoSuchBucket"}:
+                return None
+            raise
+        return stat.last_modified
 
     def list_objects(self, prefix: str = "") -> list[StoredObject]:
         """递归列出对象。MinIO 返回的 last_modified 是带时区的 UTC 时间。"""

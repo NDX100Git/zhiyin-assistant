@@ -6,13 +6,13 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.config import get_order_rules
+from app.config import get_order_rules, settings
 from app.models.order import Order
 from app.models.payment_log import PaymentLog
 from app.models.queue_session import QueueSession
@@ -30,6 +30,7 @@ from app.services.payment import get_payment_provider
 from app.services.pricing import calc_amount_cents
 from app.services.queue_service import batch_wait_info, new_order_wait_info, order_wait_info
 from app.services.session_service import current_session_info, get_or_create_session
+from app.services.storage import get_storage
 from app.utils.exceptions import BusinessError
 
 logger = logging.getLogger(__name__)
@@ -107,10 +108,31 @@ def _validate_create(payload, limits: dict) -> None:
         raise BusinessError(f"备注最多 {limits['max_remark_length']} 个字符", code=40047)
 
 
+def _validate_file_freshness(file_key: str) -> None:
+    """下单时校验文件还在、且没超过下单宽限期。
+
+    文件在上传后一段时间会被清理，学生"晚上传、隔几天再下单"就会引用到已删对象。
+    与其等到打印时才发现，不如在下单那一刻说清楚。
+    """
+    grace_hours = int(settings.order_file_grace_hours)
+    modified = get_storage().stat_modified(file_key)
+    if modified is None:
+        raise BusinessError("文件已不存在，请重新上传", code=40053)
+
+    reference = modified.astimezone().replace(tzinfo=None) if modified.tzinfo else modified
+    uploaded_ago = datetime.now() - reference
+    if uploaded_ago > timedelta(hours=grace_hours):
+        raise BusinessError(
+            f"文件已过期（上传超过 {grace_hours} 小时），请重新上传后再下单",
+            code=40052,
+        )
+
+
 def create_order(db: Session, user: User, payload) -> Order:
     """下单：状态置 pending_pay，返回带订单号与取件码的订单。"""
     rules = get_order_rules()
     _validate_create(payload, rules["limits"])
+    _validate_file_freshness(payload.file_key)
 
     # 截单不拒绝下单：仅把订单排到下一个打印时段（首页会给出提示）
     session_info = current_session_info(db)

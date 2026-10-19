@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 OBJECT_PREFIX = "files/"
 # 已完结状态：只有这些状态引用的过期文件可以删
 FINISHED_STATUSES = frozenset({STATUS_COMPLETED, STATUS_CANCELLED})
+# 异常单不算完结，但也没有自动超时，所以给它一个额外的宽限上限而不是无限期保留
+ABNORMAL_STATUS = "abnormal"
 # 按 file_key 批量查订单时每批的数量，避免 IN 列表过长
 ORDER_QUERY_CHUNK = 500
 # 启动后先等一小会儿再跑第一轮，给数据库与对象存储留出就绪时间
@@ -97,6 +99,7 @@ def _cleanup_files(
 ) -> None:
     """删除超过保留期且没有未完结订单引用的上传文件。"""
     cutoff = now - timedelta(hours=settings.file_expire_hours)
+    abnormal_cutoff = cutoff - timedelta(days=settings.abnormal_file_grace_days)
     try:
         objects = storage.list_objects(OBJECT_PREFIX)
     except Exception:
@@ -115,11 +118,20 @@ def _cleanup_files(
 
     for obj in expired:
         statuses = references.get(obj.key, set())
-        blocking = sorted(statuses - FINISHED_STATUSES)
-        if blocking:
+        # 异常单享受额外宽限：没超过宽限上限就继续留着
+        in_flight = statuses - FINISHED_STATUSES - {ABNORMAL_STATUS}
+        if in_flight:
             stats.skipped += 1
             logger.info(
-                "跳过文件 %s：仍被未完结订单引用（状态 %s）", obj.key, "、".join(blocking)
+                "跳过文件 %s：仍被未完结订单引用（状态 %s）", obj.key, "、".join(sorted(in_flight))
+            )
+            continue
+        if ABNORMAL_STATUS in statuses and _as_local_naive(obj.last_modified) > abnormal_cutoff:
+            stats.skipped += 1
+            logger.info(
+                "跳过文件 %s：仍被异常单引用，且未超过额外宽限的 %d 天",
+                obj.key,
+                settings.abnormal_file_grace_days,
             )
             continue
 

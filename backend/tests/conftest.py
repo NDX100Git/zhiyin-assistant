@@ -87,6 +87,19 @@ def client(db_session):
     app.dependency_overrides.clear()
 
 
+@pytest.fixture(autouse=True)
+def _fresh_upload_time(monkeypatch):
+    """下单会校验文件新旧；单测里的 file_key 是假的，统一按「刚上传」处理。
+
+    要验证过期与文件缺失的用例在用例内部再 monkeypatch 覆盖即可。
+    """
+    from datetime import datetime
+
+    from app.services.storage.minio_store import MinioStorage
+
+    monkeypatch.setattr(MinioStorage, "stat_modified", lambda self, key: datetime.now())
+
+
 @pytest.fixture
 def test_storage(monkeypatch):
     """把存储切到独立的测试桶，避免和开发数据混在一起。"""

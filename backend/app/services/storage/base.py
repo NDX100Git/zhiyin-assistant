@@ -52,5 +52,9 @@ class FileStorage(ABC):
         """读取对象字节（阶段 5 图片 OCR 内联 base64 使用）。"""
 
     @abstractmethod
+    def stat_modified(self, key: str) -> datetime | None:
+        """单个对象的最后修改时间；对象不存在时返回 None（下单校验文件是否过期）。"""
+
+    @abstractmethod
     def list_objects(self, prefix: str = "") -> list[StoredObject]:
         """递归列出指定前缀下的全部对象（定时清理过期文件使用）。"""

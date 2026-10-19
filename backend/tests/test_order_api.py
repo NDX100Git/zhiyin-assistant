@@ -8,6 +8,7 @@ from datetime import date
 import pytest
 from sqlalchemy import select
 
+from app.config import settings
 from app.models.notification import Notification
 from app.models.order import Order
 from app.models.payment_log import PaymentLog
@@ -264,3 +265,31 @@ def test_首页在截单时仍可下单并给出取件提示(client, closed_sess
     assert data["order_session"]["can_order"] is True
     assert data["order_session"]["deferred"] is True
     assert "下一个打印时段" in data["order_session"]["hint"]
+
+
+def test_上传超过宽限期下单被拒(client, open_session, monkeypatch) -> None:
+    """订单引用的文件过期后不该还能下单，否则打印时才发现文件没了。"""
+    from datetime import datetime, timedelta
+
+    from app.services.storage.minio_store import MinioStorage
+
+    stale = datetime.now() - timedelta(hours=settings.order_file_grace_hours + 1)
+    monkeypatch.setattr(MinioStorage, "stat_modified", lambda self, key: stale)
+
+    token = login(client)
+    body = client.post("/api/order/create", json=ORDER_PAYLOAD, headers=auth(token)).json()
+
+    assert body["code"] == 40052
+    assert "重新上传" in body["message"]
+
+
+def test_文件已不存在时下单给出人话提示(client, open_session, monkeypatch) -> None:
+    from app.services.storage.minio_store import MinioStorage
+
+    monkeypatch.setattr(MinioStorage, "stat_modified", lambda self, key: None)
+
+    token = login(client)
+    body = client.post("/api/order/create", json=ORDER_PAYLOAD, headers=auth(token)).json()
+
+    assert body["code"] == 40053
+    assert "重新上传" in body["message"]
