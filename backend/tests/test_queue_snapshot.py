@@ -12,14 +12,19 @@ import time
 from datetime import date, datetime
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from app.config import settings
 from app.models.order import Order
+from app.models.uploaded_file import UploadedFile
 from app.services import queue_service, queue_snapshot
 from app.services.queue_snapshot import QueueSnapshot
+from app.utils.security import decode_token
 
 _key_seq = itertools.count(1)
+
+# 下单要求每份文件都有本人的上传记录；用例里造出来的 file_key 在这里登记
+_SESSION = None
 
 
 def _file_key(name: str = "file") -> str:
@@ -101,10 +106,39 @@ def admin_headers(client) -> dict[str, str]:
     return {"Authorization": f"Bearer {body['data']['token']}"}
 
 
+@pytest.fixture(autouse=True)
+def capture_session(db_session):
+    """把测试会话存到模块里，供 register_upload 使用。"""
+    global _SESSION
+    _SESSION = db_session
+    yield
+    _SESSION = None
+
+
+def register_upload(file_key: str, file_name: str | None, headers: dict[str, str]) -> None:
+    """把用例造出来的文件标识登记成该用户的上传记录。"""
+    user_id = int(decode_token(headers["Authorization"].split(" ", 1)[1])["sub"])
+    existing = _SESSION.execute(
+        select(UploadedFile).where(UploadedFile.file_key == file_key)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return
+    _SESSION.add(
+        UploadedFile(
+            user_id=user_id,
+            file_key=file_key,
+            file_name=file_name,
+            size=0,
+            content_type="application/pdf",
+        )
+    )
+    _SESSION.commit()
+
+
 def create_order(client, headers: dict[str, str], page_count: int = 10) -> dict:
-    body = client.post(
-        "/api/order/create", json=_order_payload(page_count), headers=headers
-    ).json()
+    payload = _order_payload(page_count)
+    register_upload(payload["file_key"], payload["file_name"], headers)
+    body = client.post("/api/order/create", json=payload, headers=headers).json()
     assert body["code"] == 0, body
     return body["data"]
 

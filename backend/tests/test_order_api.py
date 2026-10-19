@@ -13,8 +13,13 @@ from app.models.notification import Notification
 from app.models.order import Order
 from app.models.payment_log import PaymentLog
 from app.models.print_log import PrintLog
+from app.models.uploaded_file import UploadedFile
+from app.utils.security import decode_token
 
 PDF_BYTES = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< >>\n%%EOF\n"
+
+# 下单要求每份文件都有本人的上传记录；本模块的 file_key 是造的，登录后统一登记
+_SESSION = None
 
 ORDER_PAYLOAD = {
     "file_key": "files/2026/10/abcdef0123456789abcdef0123456789.pdf",
@@ -95,10 +100,41 @@ def outside_window(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def capture_session(db_session):
+    """把测试会话存到模块里，供 register_order_file 使用。"""
+    global _SESSION
+    _SESSION = db_session
+    yield
+    _SESSION = None
+
+
+def register_order_file(user_id: int) -> None:
+    """把 ORDER_PAYLOAD 里的文件登记成该用户的上传记录。"""
+    key = ORDER_PAYLOAD["file_key"]
+    existing = _SESSION.execute(
+        select(UploadedFile).where(UploadedFile.file_key == key)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return
+    _SESSION.add(
+        UploadedFile(
+            user_id=user_id,
+            file_key=key,
+            file_name=ORDER_PAYLOAD["file_name"],
+            size=0,
+            content_type="application/pdf",
+        )
+    )
+    _SESSION.commit()
+
+
 def login(client, device_id: str = "order-device-0001") -> str:
     body = client.post("/api/auth/login", json={"device_id": device_id}).json()
     assert body["code"] == 0, body
-    return body["data"]["token"]
+    token = body["data"]["token"]
+    register_order_file(int(decode_token(token)["sub"]))
+    return token
 
 
 def auth(token: str) -> dict[str, str]:

@@ -26,6 +26,30 @@ import pymupdf
 ROOT = Path(__file__).resolve().parents[1]
 PASSED: list[str] = []
 
+# 学生端订单列表/详情、老师端队列/详情/下载/开始打印/换文件确认，文件项都必须是这套键
+FILE_VIEW_KEYS = {
+    "file_index",
+    "file_key",
+    "file_name",
+    "page_count",
+    "print_pages",
+    "print_side",
+    "color_mode",
+    "paper_size",
+    "copies",
+    "amount_cents",
+}
+
+
+def expect_file_view(items: list[dict], where: str) -> None:
+    """检查每个文件项都带齐统一键名。"""
+    if not items:
+        raise StepFailed(f"{where}：没有返回文件项")
+    for item in items:
+        missing = FILE_VIEW_KEYS - set(item)
+        if missing:
+            raise StepFailed(f"{where}：文件项缺少键 {sorted(missing)}")
+
 
 def load_env(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
@@ -77,6 +101,15 @@ def call(
 def expect(condition: bool, message: str) -> None:
     if not condition:
         raise StepFailed(message)
+
+
+def load_pricing(path: Path) -> dict[str, int]:
+    """读后端价目表，脚本里的期望金额一律按它算，不写死数字。"""
+    import json
+
+    if not path.is_file():
+        return {"bw_single": 15, "bw_duplex": 15, "color_single": 80, "color_duplex": 80}
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def build_pdf(pages: int, label: str) -> bytes:
@@ -138,6 +171,7 @@ def main() -> int:
         print("!! 没读到老师账号，检查 backend/.env 的 ADMIN_USERNAME 与 ADMIN_PASSWORD")
         return 1
 
+    pricing = load_pricing(ROOT / "config" / "pricing.json")
     stamp = int(time.time())
     device = f"smoke-multi-file-{stamp}"
     print(f"多文件端到端目标 {args.base_url}，学生设备标识 {device}")
@@ -153,6 +187,17 @@ def main() -> int:
             third = upload(client, sh, "smoke-图册-5p.pdf", 5)
             step("上传三份文件")
 
+            bw_single = int(pricing["bw_single"])
+            bw_duplex = int(pricing["bw_duplex"])
+            color_duplex = int(pricing["color_duplex"])
+            # 三份文件参数各不相同，第三份不传逐份参数，继承订单级
+            first_amount = bw_single * 2 * 3
+            second_amount = color_duplex * 3 * 2
+            third_amount = bw_duplex * 5 * 1
+            total_amount = first_amount + second_amount + third_amount
+            doc_pages = 2 + 3 + 5
+            print_pages = 2 * 3 + 3 * 2 + 5 * 1
+
             order = call(
                 client,
                 "POST",
@@ -161,9 +206,11 @@ def main() -> int:
                 json={
                     "files": [
                         {"file_key": first["file_key"], "file_name": first["file_name"],
-                         "page_count": 2},
+                         "page_count": 2, "print_side": 1, "color_mode": 0,
+                         "paper_size": "A4", "copies": 3},
                         {"file_key": second["file_key"], "file_name": second["file_name"],
-                         "page_count": 3},
+                         "page_count": 3, "print_side": 2, "color_mode": 1,
+                         "paper_size": "A3", "copies": 2},
                         {"file_key": third["file_key"], "file_name": third["file_name"],
                          "page_count": 5},
                     ],
@@ -176,20 +223,41 @@ def main() -> int:
             order_id = int(order["id"])
             order_no = order["order_no"]
             pickup_code = order["pickup_code"]
-            total_pages = int(order["page_count"])
-            total_amount = int(order["amount_cents"])
-            unit_amount = total_amount // total_pages
-            expect(total_pages == 10, f"三份文件合计应为 10 页，实际 {total_pages}")
             expect(
-                total_amount == unit_amount * 10,
-                f"金额应按总页数算，实际 {total_amount} 分",
+                len(order["files"]) == 3, f"订单应返回 3 份文件，实际 {len(order['files'])}"
             )
-            expect(len(order["files"]) == 3, f"订单应返回 3 份文件，实际 {len(order['files'])}")
             expect(
                 [item["file_index"] for item in order["files"]] == [1, 2, 3],
                 "文件序号不是 1、2、3",
             )
-            step("多文件下单：总页数计费、一单一码")
+            expect(
+                [int(item["amount_cents"]) for item in order["files"]]
+                == [first_amount, second_amount, third_amount],
+                f"逐份行金额不对：{[(item['file_index'], item['amount_cents']) for item in order['files']]}",
+            )
+            expect(
+                [int(item["print_pages"]) for item in order["files"]] == [6, 6, 5],
+                f"逐份打印页数不对：{[item['print_pages'] for item in order['files']]}",
+            )
+            expect(
+                [(item["print_side"], item["color_mode"], item["paper_size"], item["copies"])
+                 for item in order["files"]]
+                == [(1, 0, "A4", 3), (2, 1, "A3", 2), (2, 0, "A4", 1)],
+                "逐份参数回显不对（第三份应继承订单级）",
+            )
+            expect(
+                int(order["page_count"]) == doc_pages,
+                f"文档页数应为 {doc_pages}，实际 {order['page_count']}",
+            )
+            expect(
+                int(order["print_page_count"]) == print_pages,
+                f"打印页数应为 {print_pages}，实际 {order.get('print_page_count')}",
+            )
+            expect(
+                int(order["amount_cents"]) == total_amount,
+                f"整单金额应为 {total_amount} 分，实际 {order['amount_cents']} 分",
+            )
+            step("多文件下单：逐份参数计价、文档页数与打印页数分开、一单一码")
 
             paid = call(client, "POST", f"/api/order/{order_id}/pay", headers=sh)
             expect(paid["status"] == "queuing", f"支付后应为排队中，实际 {paid['status']}")
@@ -209,18 +277,34 @@ def main() -> int:
                     "reason": "附录传错版本",
                 },
             )
+            new_second_amount = color_duplex * 4 * 2  # 第二份的参数与份数沿用原行
+            new_total_amount = first_amount + new_second_amount + third_amount
             expect(pending["applied"] is False, "已付款换文件不应立即生效")
-            expect(pending["page_count"] == 10, "待确认期间订单总页数不应变化")
+            expect(pending["page_count"] == doc_pages, "待确认期间订单文档页数不应变化")
+            expect(
+                int(pending["amount_cents"]) == total_amount,
+                "待确认期间订单金额不应变化",
+            )
             change = pending.get("file_change") or {}
             expect(int(change.get("file_index", 0)) == 2, "待确认请求没有记录第 2 份文件")
             expect(int(change.get("old_file_page_count", 0)) == 3, "旧文件页数不对")
             expect(int(change.get("new_file_page_count", 0)) == 4, "新文件页数不对")
-            expect(int(change.get("new_page_count", 0)) == 11, "换完后的总页数应为 11")
+            expect(int(change.get("old_file_print_pages", 0)) == 6, "旧文件打印页数不对")
+            expect(int(change.get("new_file_print_pages", 0)) == 8, "新文件打印页数不对")
             expect(
-                int(change.get("new_amount_cents", 0)) == unit_amount * 11,
-                "系统重算价没有按整单 11 页算",
+                int(change.get("old_file_amount_cents", 0)) == second_amount,
+                "旧文件行金额不对",
             )
-            step("逐文件换文件：待老师确认，整单总页数正确")
+            expect(
+                int(change.get("new_file_amount_cents", 0)) == new_second_amount,
+                "新文件行金额没有按该行参数算",
+            )
+            expect(int(change.get("new_page_count", 0)) == 11, "换完后的文档页数应为 11")
+            expect(
+                int(change.get("new_amount_cents", 0)) == new_total_amount,
+                f"系统重算价应为 {new_total_amount} 分，实际 {change.get('new_amount_cents')}",
+            )
+            step("逐文件换文件：只重算目标那一份，待老师确认")
 
             duplicate = client.post(
                 f"/api/order/{order_id}/replace-file",
@@ -246,11 +330,30 @@ def main() -> int:
             row = next((item for item in items if int(item["id"]) == order_id), None)
             expect(row is not None, "老师端队列里找不到这张单")
             expect(len(row.get("files") or []) == 3, "老师端队列没有显示三份文件")
+            expect_file_view(row["files"], "老师端队列")
+            expect(
+                [int(item["print_pages"]) for item in row["files"]] == [6, 6, 5],
+                f"老师端队列逐份打印页数不对：{[item['print_pages'] for item in row['files']]}",
+            )
+            expect(
+                [(item["print_side"], item["color_mode"], item["paper_size"], item["copies"])
+                 for item in row["files"]]
+                == [(1, 0, "A4", 3), (2, 1, "A3", 2), (2, 0, "A4", 1)],
+                "老师端队列没有回显逐份参数",
+            )
+            expect(
+                int(row.get("print_page_count") or 0) == print_pages,
+                f"老师端队列整单打印页数应为 {print_pages}，实际 {row.get('print_page_count')}",
+            )
             expect(
                 int((row.get("file_change") or {}).get("file_index", 0)) == 2,
                 "队列没有显示是哪一份文件被换",
             )
-            step("老师端队列显示文件清单与待确认文件")
+            expect(
+                int((row.get("file_change") or {}).get("new_file_print_pages", 0)) == 8,
+                "队列里的换文件快照没有新文件的打印页数",
+            )
+            step("老师端队列显示文件清单、逐份参数与待确认文件")
 
             confirmed = call(
                 client,
@@ -261,14 +364,35 @@ def main() -> int:
             )
             confirmed_order = confirmed["order"]
             expect(confirmed["approved"] is True, "老师确认没有通过")
-            expect(confirmed_order["page_count"] == 11, "确认后整单页数应为 11")
+            expect_file_view(confirmed_order["files"], "换文件确认")
+            expect(confirmed_order["page_count"] == 11, "确认后整单文档页数应为 11")
             expect(
-                int(confirmed_order["amount_cents"]) == unit_amount * 11,
-                "确认后整单金额没有按 11 页重算",
+                int(confirmed_order["print_page_count"]) == print_pages + 2,
+                f"确认后整单打印页数应为 {print_pages + 2}，实际 {confirmed_order['print_page_count']}",
+            )
+            expect(
+                int(confirmed_order["amount_cents"]) == new_total_amount,
+                f"确认后整单金额应为 {new_total_amount} 分，实际 {confirmed_order['amount_cents']}",
             )
             expect(
                 confirmed_order["files"][1]["file_name"] == replacement["file_name"],
                 "确认后第 2 份文件没有替换",
+            )
+            # 第 1、3 份的参数、份数与行金额一动不动
+            expect(
+                [(item["print_side"], item["color_mode"], item["paper_size"], item["copies"],
+                  int(item["amount_cents"]), int(item["print_pages"]))
+                 for item in (confirmed_order["files"][0], confirmed_order["files"][2])]
+                == [(1, 0, "A4", 3, first_amount, 6), (2, 0, "A4", 1, third_amount, 5)],
+                "换第 2 份时第 1、3 份的参数或行金额被改了",
+            )
+            expect(
+                int(confirmed_order["files"][1]["amount_cents"]) == new_second_amount,
+                "确认后第 2 份行金额没有按该行参数重算",
+            )
+            expect(
+                int(confirmed_order["files"][1]["print_pages"]) == 8,
+                "确认后第 2 份打印页数不对",
             )
             expect(confirmed_order["files"][0]["file_name"] == first["file_name"], "第 1 份文件被误改")
             expect(confirmed_order["files"][2]["file_name"] == third["file_name"], "第 3 份文件被误改")
@@ -292,9 +416,16 @@ def main() -> int:
                 client, "GET", f"/api/admin/order/{order_id}/download", headers=ah
             )
             expect(len(links.get("files") or []) == 3, "下载接口没有返回三份文件链接")
+            expect_file_view(links["files"], "老师端下载")
             expect(
                 all(item["signed_url"].startswith("http") for item in links["files"]),
                 "逐文件链接不是签名 URL",
+            )
+            expect(
+                [(item["print_side"], item["color_mode"], item["paper_size"], item["copies"])
+                 for item in links["files"]]
+                == [(1, 0, "A4", 3), (2, 1, "A3", 2), (2, 0, "A4", 1)],
+                "下载接口没有回显逐份参数",
             )
             second_link = call(
                 client,
@@ -349,6 +480,13 @@ def main() -> int:
             started = call(client, "POST", f"/api/admin/order/{order_id}/start", headers=ah)
             expect(started["order"]["status"] == "printing", "开始打印失败")
             expect(len(started["print_job"].get("files") or []) == 3, "打印任务没有带三份文件")
+            expect_file_view(started["print_job"]["files"], "开始打印")
+            expect_file_view(started["order"]["files"], "开始打印返回的订单")
+            expect(
+                [int(item["print_pages"]) for item in started["print_job"]["files"]]
+                == [6, 8, 5],
+                "开始打印的打印任务没有带逐份打印页数",
+            )
             completed = call(client, "POST", f"/api/admin/order/{order_id}/complete", headers=ah)
             expect(completed["order"]["status"] == "ready", "完成打印失败")
             step("开始打印并完成打印（打印任务带三份文件链接）")
@@ -363,21 +501,45 @@ def main() -> int:
             expect(verified["order"]["status"] == "completed", "核销后应为已完成")
             expect(verified["collected_onsite"] is True, "换文件差额没有现场补收")
             expect(
-                int(verified["collected_cents"]) == unit_amount * 1,
-                f"应补收 {unit_amount} 分，实际 {verified['collected_cents']}",
+                int(verified["collected_cents"]) == new_total_amount - total_amount,
+                f"应补收 {new_total_amount - total_amount} 分，"
+                f"实际 {verified['collected_cents']}",
             )
             step("核销取件并现场补收差额")
 
             mine = call(client, "GET", f"/api/order/{order_id}", headers=sh)
+            expect_file_view(mine["files"], "学生端订单详情")
+            listing = call(client, "GET", "/api/order/list", headers=sh)
+            listed = next(
+                (item for item in listing.get("items") or [] if int(item["id"]) == order_id),
+                None,
+            )
+            expect(listed is not None, "学生端订单列表里找不到这张单")
+            expect_file_view(listed["files"], "学生端订单列表")
+            expect(
+                int(listed["print_page_count"]) == print_pages + 2,
+                "学生端列表的打印页数不对",
+            )
             expect(mine["status"] == "completed", f"学生侧应为已完成，实际 {mine['status']}")
-            expect(mine["page_count"] == 11, "学生侧总页数不是 11")
+            expect(mine["page_count"] == 11, "学生侧文档页数不是 11")
+            expect(
+                int(mine["print_page_count"]) == print_pages + 2,
+                f"学生侧打印页数应为 {print_pages + 2}，实际 {mine['print_page_count']}",
+            )
             expect(
                 mine["files"][1]["file_name"] == replacement["file_name"],
                 "学生侧第 2 份文件没有更新",
             )
             expect(mine["files"][1]["page_count"] == 4, "学生侧第 2 份文件页数不对")
+            expect(int(mine["files"][1]["print_pages"]) == 8, "学生侧第 2 份打印页数不对")
             expect(
-                int(mine["amount_cents"]) == unit_amount * 11,
+                (mine["files"][1]["print_side"], mine["files"][1]["color_mode"],
+                 mine["files"][1]["paper_size"], mine["files"][1]["copies"])
+                == (2, 1, "A3", 2),
+                "学生侧第 2 份的逐份参数被改了",
+            )
+            expect(
+                int(mine["amount_cents"]) == new_total_amount,
                 "学生侧金额不是确认后的价格",
             )
             expect(mine["pickup_code"] == pickup_code, "学生侧取件码变了")

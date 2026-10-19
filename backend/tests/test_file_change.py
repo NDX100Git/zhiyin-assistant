@@ -27,9 +27,14 @@ from app.models.order_file_change import (
 from app.models.order_file_version import OrderFileVersion
 from app.models.payment_log import PaymentLog
 from app.models.print_log import PrintLog
+from app.models.uploaded_file import UploadedFile
+from app.utils.security import decode_token
 
 PDF_BYTES = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< >>\n%%EOF\n"
 _key_seq = itertools.count(1)
+
+# 下单要求每份文件都有本人的上传记录；用例里造出来的 file_key 统一在这里登记
+_SESSION = None
 
 
 def _file_key(name: str = "file") -> str:
@@ -99,13 +104,41 @@ def admin_headers(client) -> dict[str, str]:
     return {"Authorization": f"Bearer {body['data']['token']}"}
 
 
+@pytest.fixture(autouse=True)
+def capture_session(db_session):
+    """把测试会话存到模块里，供下面的小工具登记上传记录。"""
+    global _SESSION
+    _SESSION = db_session
+    yield
+    _SESSION = None
+
+
+def register_upload(file_key: str, file_name: str | None, user_id: int) -> None:
+    """把用例造出来的文件标识登记成该用户的真实上传记录。"""
+    session = _SESSION
+    existing = session.execute(
+        select(UploadedFile).where(UploadedFile.file_key == file_key)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return
+    session.add(
+        UploadedFile(
+            user_id=user_id,
+            file_key=file_key,
+            file_name=file_name,
+            size=0,
+            content_type="application/pdf",
+        )
+    )
+    session.commit()
+
+
 def create_order(client, headers: dict[str, str], page_count: int = 10,
                  file_key: str | None = None, file_name: str = "原稿.pdf") -> dict:
-    body = client.post(
-        "/api/order/create",
-        json=_order_payload(page_count, file_key, file_name),
-        headers=headers,
-    ).json()
+    payload = _order_payload(page_count, file_key, file_name)
+    owner_id = int(decode_token(headers["Authorization"].split(" ", 1)[1])["sub"])
+    register_upload(payload["file_key"], payload["file_name"], owner_id)
+    body = client.post("/api/order/create", json=payload, headers=headers).json()
     assert body["code"] == 0, body
     return body["data"]
 

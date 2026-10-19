@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_order_rules
 from app.models.order import Order
+from app.models.order_file import OrderFile
 from app.models.order_file_change import (
     CHANGE_APPROVED,
     CHANGE_CANCELLED,
@@ -34,8 +35,10 @@ from app.services import queue_snapshot
 from app.services.notifier import get_notifier
 from app.services.order_file_service import (
     ensure_files,
+    line_amount_cents,
     recalc_order_totals,
     resolve_file_row,
+    row_print_params,
 )
 from app.services.order_state import (
     STATUS_ABNORMAL,
@@ -45,7 +48,6 @@ from app.services.order_state import (
     record_log,
     status_label,
 )
-from app.services.pricing import calc_amount_cents
 from app.utils.exceptions import BusinessError
 
 logger = logging.getLogger(__name__)
@@ -71,14 +73,16 @@ def _note(text: str) -> str:
     return text if len(text) <= 255 else text[:252] + "..."
 
 
-def system_amount_cents(order: Order, page_count: int) -> int:
-    """按订单现有的打印参数重算新页数对应的金额（分）。"""
-    return calc_amount_cents(
-        int(page_count),
-        int(order.print_side or 2),
-        int(order.color_mode or 0),
-        int(order.copies or 1),
-    )
+def file_system_amount_cents(order: Order, row, page_count: int | None = None) -> int:
+    """按该份文件自己的打印参数算金额（分）。换文件重算一律用它，不再用订单级参数。"""
+    return line_amount_cents(order, row, page_count)
+
+
+def file_print_pages(order: Order, row, page_count: int | None = None) -> int:
+    """该份文件的打印页数 = 页数 × 份数；份数沿用该行原值。"""
+    _print_side, _color_mode, _paper, copies = row_print_params(order, row)
+    pages = int(row.page_count or 0) if page_count is None else int(page_count)
+    return pages * copies
 
 
 def _validate_new_file(file_key: str, page_count: int, reason: str | None) -> None:
@@ -188,13 +192,17 @@ def get_pending_change(db: Session, order_id: int) -> OrderFileChange | None:
     ).scalar_one_or_none()
 
 
-def change_to_view(change: OrderFileChange) -> dict:
+def change_to_view(change: OrderFileChange, copies: int = 1) -> dict:
     """待确认请求的对外字段，学生端与老师端共用同一套键名。
 
     `old_page_count` / `new_page_count` / `old_amount_cents` / `new_amount_cents`
     是订单总额与总页数（与单文件时代语义一致）；`*_file_*` 字段才是被替换的
-    那一份文件自己的页数与行金额，老师确认弹窗用后者显示「换的是哪一份」。
+    那一份文件自己的页数、打印页数与行金额，老师确认弹窗用后者显示「换的是哪一份」。
+    换文件不改份数，所以新旧打印页数都用该行原份数 × 页数算出来。
     """
+    count = int(copies or 1)
+    old_file_pages = int(change.old_file_page_count or 0)
+    new_file_pages = int(change.new_file_page_count or 0)
     return {
         "id": change.id,
         "change_id": change.id,
@@ -204,6 +212,7 @@ def change_to_view(change: OrderFileChange) -> dict:
         "new_page_count": change.new_page_count,
         "new_amount_cents": change.new_amount_cents,
         "new_file_page_count": change.new_file_page_count,
+        "new_file_print_pages": new_file_pages * count,
         "new_file_amount_cents": change.new_file_amount_cents,
         "submitted_at": change.created_at.isoformat() if change.created_at else None,
         "reason": change.reason,
@@ -212,26 +221,73 @@ def change_to_view(change: OrderFileChange) -> dict:
         "old_page_count": change.old_page_count,
         "old_amount_cents": change.old_amount_cents,
         "old_file_page_count": change.old_file_page_count,
+        "old_file_print_pages": old_file_pages * count,
         "old_file_amount_cents": change.old_file_amount_cents,
+        "file_copies": count,
     }
+
+
+def _file_copies(db: Session, order_id: int, file_index: int | None) -> int:
+    """取该行原来的份数；老数据没行时回落到订单级份数。"""
+    row = db.execute(
+        select(OrderFile).where(
+            OrderFile.order_id == order_id,
+            OrderFile.file_index == int(file_index or 1),
+        )
+    ).scalar_one_or_none()
+    if row is not None and row.copies is not None:
+        return int(row.copies)
+    order = db.get(Order, order_id)
+    return int(order.copies or 1) if order is not None else 1
 
 
 def pending_change_view(db: Session, order_id: int) -> dict | None:
     change = get_pending_change(db, order_id)
-    return change_to_view(change) if change else None
+    if change is None:
+        return None
+    return change_to_view(change, _file_copies(db, order_id, change.file_index))
 
 
 def batch_pending_changes(db: Session, order_ids: list[int]) -> dict[int, dict]:
     """一次取出一批订单的待确认请求，避免列表接口逐行查询。"""
     if not order_ids:
         return {}
-    rows = db.execute(
-        select(OrderFileChange).where(
-            OrderFileChange.order_id.in_(order_ids),
-            OrderFileChange.status == CHANGE_PENDING,
+    rows = list(
+        db.execute(
+            select(OrderFileChange).where(
+                OrderFileChange.order_id.in_(order_ids),
+                OrderFileChange.status == CHANGE_PENDING,
+            )
+        ).scalars()
+    )
+    if not rows:
+        return {}
+    # 份数按行取：一次查完这批订单的文件行，不逐条请求
+    copies_by_slot: dict[tuple[int, int], int] = {}
+    order_copies: dict[int, int] = {}
+    file_rows = list(
+        db.execute(
+            select(OrderFile).where(
+                OrderFile.order_id.in_([change.order_id for change in rows])
+            )
+        ).scalars()
+    )
+    for row in file_rows:
+        if row.copies is not None:
+            copies_by_slot[(int(row.order_id), int(row.file_index))] = int(row.copies)
+    for order in db.execute(
+        select(Order).where(Order.id.in_([change.order_id for change in rows]))
+    ).scalars():
+        order_copies[int(order.id)] = int(order.copies or 1)
+
+    result: dict[int, dict] = {}
+    for change in rows:
+        copies = copies_by_slot.get(
+            (int(change.order_id), int(change.file_index or 1)),
+            order_copies.get(int(change.order_id), 1),
         )
-    ).scalars()
-    return {change.order_id: change_to_view(change) for change in rows if change}
+        result[change.order_id] = change_to_view(change, copies)
+    return result
 
 
 def expire_pending_changes(
@@ -303,8 +359,10 @@ def _apply_immediately(db: Session, order: Order, payload) -> dict:
     old = {
         "file_name": target.file_name,
         "page_count": target.page_count,
+        "print_pages": int(target.print_pages or 0),
         "file_amount_cents": target.amount_cents,
         "total_page_count": order.page_count,
+        "total_print_page_count": int(order.print_page_count or 0),
         "total_amount_cents": order.amount_cents,
         "file_index": int(target.file_index),
     }
@@ -352,13 +410,17 @@ def _apply_immediately(db: Session, order: Order, payload) -> dict:
             "file_index": old["file_index"],
             "old_file_name": old["file_name"],
             "old_page_count": old["page_count"],
+            "old_print_pages": old["print_pages"],
             "old_amount_cents": old["file_amount_cents"],
             "old_total_page_count": old["total_page_count"],
+            "old_total_print_page_count": old["total_print_page_count"],
             "old_total_amount_cents": old["total_amount_cents"],
             "new_file_name": payload.file_name,
             "new_page_count": int(payload.page_count),
+            "new_print_pages": int(target.print_pages or 0),
             "new_amount_cents": int(target.amount_cents),
             "new_total_page_count": total_pages,
+            "new_total_print_page_count": int(order.print_page_count or 0),
             "new_total_amount_cents": new_amount,
         },
     )
@@ -375,8 +437,17 @@ def _create_pending_change(db: Session, order: Order, payload) -> OrderFileChang
 
     rows, target = resolve_file_row(db, order, getattr(payload, "file_index", None))
     new_total_pages = _ensure_total_pages(order, target, payload.page_count)
-    new_amount = system_amount_cents(order, new_total_pages)
-    new_file_amount = system_amount_cents(order, payload.page_count)
+    # 只重算被换的那一份：其余行的行金额按各自参数原样累加
+    new_file_amount = file_system_amount_cents(order, target, payload.page_count)
+    new_amount = sum(
+        file_system_amount_cents(order, row) for row in rows if row is not target
+    ) + new_file_amount
+    new_file_print_pages = file_print_pages(order, target, payload.page_count)
+    new_total_print_pages = (
+        int(order.print_page_count or 0)
+        - int(target.print_pages or 0)
+        + new_file_print_pages
+    )
 
     change = OrderFileChange(
         order_id=order.id,
@@ -411,8 +482,9 @@ def _create_pending_change(db: Session, order: Order, payload) -> OrderFileChang
     file_label = f"第 {target.file_index} 份文件" if len(rows) > 1 else "文件"
     note = (
         f"学生申请换{file_label}：{target.file_name or '原文件'}"
-        f"（{target.page_count or 0} 页）→ "
-        f"{payload.file_name or payload.file_key}（{payload.page_count} 页），"
+        f"（{target.page_count or 0} 页 → {payload.page_count} 页，"
+        f"打印 {target.print_pages or 0} 页 → {new_file_print_pages} 页）→ "
+        f"{payload.file_name or payload.file_key}，"
         f"整单 {order.page_count or 0} 页 / {order.amount_cents or 0} 分 → "
         f"{new_total_pages} 页 / {new_amount} 分，等待老师确认"
     )
@@ -428,13 +500,16 @@ def _create_pending_change(db: Session, order: Order, payload) -> OrderFileChang
             "file_index": int(target.file_index),
             "old_file_name": target.file_name,
             "old_page_count": target.page_count,
+            "old_print_pages": int(target.print_pages or 0),
             "old_amount_cents": target.amount_cents,
             "old_total_page_count": order.page_count,
             "old_total_amount_cents": order.amount_cents,
             "new_file_name": payload.file_name,
             "new_page_count": int(payload.page_count),
+            "new_print_pages": new_file_print_pages,
             "new_amount_cents": new_file_amount,
             "new_total_page_count": new_total_pages,
+            "new_total_print_page_count": new_total_print_pages,
             "new_total_amount_cents": new_amount,
         },
     )
@@ -533,8 +608,10 @@ def _approve_change(
         "file_index": int(target.file_index),
         "file_name": target.file_name,
         "page_count": target.page_count,
+        "print_pages": int(target.print_pages or 0),
         "file_amount_cents": target.amount_cents,
         "total_page_count": order.page_count,
+        "total_print_page_count": int(order.print_page_count or 0),
         "total_amount_cents": order.amount_cents,
     }
     paid_total = _paid_total(db, order.id)
@@ -594,8 +671,9 @@ def _approve_change(
     file_label = f"第 {old['file_index']} 份文件" if len(rows) > 1 else "文件"
     note = (
         f"老师确认换{file_label}：{old['file_name'] or '原文件'}"
-        f"（{old['page_count'] or 0} 页）→ "
-        f"{change.new_file_name or change.new_file_key}（{new_file_pages} 页）；"
+        f"（{old['page_count'] or 0} 页 / 打印 {old['print_pages']} 页）→ "
+        f"{change.new_file_name or change.new_file_key}"
+        f"（{new_file_pages} 页 / 打印 {int(target.print_pages or 0)} 页）；"
         f"整单 {old['total_page_count'] or 0} 页 / {old['total_amount_cents'] or 0} 分 → "
         f"{total_pages} 页 / {final_amount} 分（系统重算 {system_total} 分）；"
         f"{price_note}；已重新排到队尾{status_note}"
@@ -612,13 +690,17 @@ def _approve_change(
             "file_index": old["file_index"],
             "old_file_name": old["file_name"],
             "old_page_count": old["page_count"],
+            "old_print_pages": old["print_pages"],
             "old_amount_cents": old["file_amount_cents"],
             "old_total_page_count": old["total_page_count"],
+            "old_total_print_page_count": old["total_print_page_count"],
             "old_total_amount_cents": old["total_amount_cents"],
             "new_file_name": change.new_file_name,
             "new_page_count": new_file_pages,
+            "new_print_pages": int(target.print_pages or 0),
             "new_amount_cents": int(target.amount_cents),
             "new_total_page_count": total_pages,
+            "new_total_print_page_count": int(order.print_page_count or 0),
             "new_total_amount_cents": final_amount,
             "system_total_amount_cents": system_total,
             "paid_total_cents": paid_total,
@@ -660,8 +742,9 @@ __all__ = [
     "confirm_file_change",
     "create_initial_version",
     "expire_pending_changes",
+    "file_print_pages",
+    "file_system_amount_cents",
     "get_pending_change",
     "pending_change_view",
     "replace_order_file",
-    "system_amount_cents",
 ]

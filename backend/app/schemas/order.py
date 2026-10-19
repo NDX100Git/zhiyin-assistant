@@ -6,7 +6,10 @@ from pydantic import BaseModel, Field
 
 
 class OrderFileItem(BaseModel):
-    """下单文件清单中的一项。file_index 不传时按数组顺序自动编号。"""
+    """下单文件清单中的一项。file_index 不传时按数组顺序自动编号。
+
+    四个打印参数都是可选的：不传时继承订单级同名字段，单文件旧写法行为不变。
+    """
 
     file_key: str = Field(description="上传接口返回的对象 key")
     file_name: str | None = Field(default=None, description="展示用文件名")
@@ -14,6 +17,11 @@ class OrderFileItem(BaseModel):
     file_index: int | None = Field(
         default=None, ge=1, description="文件顺序，从 1 开始；不传时按数组顺序"
     )
+    # 逐份打印参数：取值约束与订单级同名字段完全一致，不传时继承订单级
+    print_side: int | None = Field(default=None, description="1=单面 2=双面；不传继承订单级")
+    color_mode: int | None = Field(default=None, description="0=黑白 1=彩色；不传继承订单级")
+    paper_size: str | None = Field(default=None, description="纸张规格；不传继承订单级")
+    copies: int | None = Field(default=None, description="该份份数；不传继承订单级")
 
 
 class OrderCreateRequest(BaseModel):
