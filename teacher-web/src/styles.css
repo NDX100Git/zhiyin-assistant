@@ -541,3 +541,77 @@ body.zi-theme-classic {
     min-height: 44px;
   }
 }
+
+/* ---------------------------------------------------------------------------
+ * 订单文件清单弹窗
+ * 同样被 teleport 到 body，只写版式：每份一行、名字能断行，
+ * 窄屏下下载按钮独占一行且不小于 44 像素，避免横向溢出。
+ * ------------------------------------------------------------------------- */
+
+.files-dialog .files-dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.files-dialog .files-dialog-meta {
+  color: var(--zi-muted);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.files-dialog .files-dialog-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-top: 1px dashed var(--zi-line);
+  min-width: 0;
+}
+
+.files-dialog .files-dialog-seq {
+  flex: none;
+  color: var(--zi-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.files-dialog .files-dialog-main {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.5;
+}
+
+.files-dialog .files-dialog-name {
+  min-width: 0;
+  color: var(--zi-ink);
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.files-dialog .files-dialog-dl {
+  flex: none;
+  margin-left: 0;
+}
+
+@media (max-width: 767px) {
+  .files-dialog .el-dialog__body {
+    padding: 12px;
+  }
+  .files-dialog .files-dialog-row {
+    flex-wrap: wrap;
+  }
+  .files-dialog .files-dialog-main {
+    flex: 1 1 140px;
+  }
+  .files-dialog .files-dialog-dl {
+    flex: 1 1 100%;
+    min-height: 44px;
+  }
+  .files-dialog .el-dialog__footer .el-button {
+    min-height: 44px;
+  }
+}

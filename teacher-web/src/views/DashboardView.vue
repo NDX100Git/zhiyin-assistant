@@ -87,8 +87,12 @@
                   下载
                 </el-button>
               </div>
-              <div v-if="fileRows(row).rest > 0" class="file-more muted">
-                等 {{ fileRows(row).total }} 个文件
+              <!-- 超过三份时给明确入口：点开逐份列出，每份都能单独下载 -->
+              <div v-if="fileRows(row).rest > 0" class="file-more">
+                <span class="muted">还有 {{ fileRows(row).rest }} 份未展开</span>
+                <el-button link type="primary" class="file-more-btn" @click="openFiles(row)">
+                  查看全部 {{ fileRows(row).total }} 个文件
+                </el-button>
               </div>
               <div v-if="fileRows(row).total === 0" class="muted">{{ fileFormatter(row) }}</div>
             </div>
@@ -350,6 +354,40 @@
       </template>
     </el-dialog>
 
+    <!-- 桌面文件列只展开前三份，其余在这里逐份列出并下载 -->
+    <el-dialog
+      v-model="filesDialog.visible"
+      title="订单文件"
+      class="files-dialog"
+      :width="isMobile ? '92%' : '560px'"
+    >
+      <div v-if="filesDialog.order" class="files-dialog-body">
+        <div class="files-dialog-meta">
+          {{ filesDialog.order.order_no }} · {{ filesDialog.order.pickup_code }} ·
+          {{ filesDialog.files.length }} 份文件 · 共 {{ totalPages(filesDialog.order) }} 页
+        </div>
+        <div v-for="file in filesDialog.files" :key="file.seq" class="files-dialog-row">
+          <span class="files-dialog-seq">#{{ file.seq }}</span>
+          <div class="files-dialog-main">
+            <span class="files-dialog-name">{{ file.file_name }}</span>
+            <span class="muted">{{ file.page_count ? file.page_count + ' 页' : '页数未知' }}</span>
+          </div>
+          <el-button
+            size="large"
+            type="primary"
+            plain
+            class="files-dialog-dl"
+            @click="downloadOne(filesDialog.order, file)"
+          >
+            下载第 {{ file.seq }} 份
+          </el-button>
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="filesDialog.visible = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="completeDialog.visible" title="打印完成" :width="isMobile ? '92%' : '420px'">
       <div v-if="completeDialog.order">
         <el-descriptions :column="1" size="small" border>
@@ -539,6 +577,8 @@ const fileChangeDialog = reactive({
   yuan: 0,
   loading: false,
 })
+/** 订单全部文件弹窗：桌面文件列放不下时逐份列出，每份都有自己的下载按钮。 */
+const filesDialog = reactive({ visible: false, order: null, files: [] })
 
 /**
  * 弹窗里「这一份文件」的新旧页数与行金额。
@@ -650,10 +690,15 @@ onUnmounted(() => {
   document.removeEventListener('visibilitychange', handleVisibilityChange)
 })
 
-/** 下载单份文件；不传 file 就是第 1 份（老订单行为不变）。 */
+/**
+ * 下载单份文件。
+ *
+ * fileIndex 取文件自己的序号（后端 file_index，清单缺字段时按顺序补），
+ * 不能拿行标识顶替：现在两者刚好相等，字段一改就会下错文件。
+ * 不传 file 时按第 1 份处理，老订单行为不变。
+ */
 async function downloadOne(row, file) {
-  // 后端的「第几份」就是清单里的 file_index，从 1 开始
-  const fileIndex = file && file.id !== undefined && file.id !== null ? file.id : undefined
+  const fileIndex = file && Number(file.seq) > 0 ? Number(file.seq) : undefined
   try {
     const data = await downloadFileUrl(row.id, fileIndex)
     if (data && data.signed_url) {
@@ -665,8 +710,11 @@ async function downloadOne(row, file) {
     // 拦截器已提示，下载失败不往下走确认流程
     return
   }
+  // 确认口径保持订单级：队列只给出「文件已替换、老师还没确认」这一个整单标记，
+  // 不告诉你具体换的是哪一份；没换过文件的订单只下载，不调确认接口，
+  // 避免下载把无关订单的标记状态搞乱。
   if (!hasUnseenChange(row)) return
-  // 下载成功顺手确认看到新文件；接口失败只提示，不阻断已完成的下载
+  // 接口失败只提示，不阻断已完成的下载
   try {
     await confirmFileSeen(row.id)
     markRowSeen(row)
@@ -675,6 +723,13 @@ async function downloadOne(row, file) {
   } catch (error) {
     /* 拦截器已提示 */
   }
+}
+
+/** 打开「全部文件」弹窗：清单从当前行重新归一化，刷新后也不会拿旧数据。 */
+function openFiles(row) {
+  filesDialog.order = row
+  filesDialog.files = orderFiles(row)
+  filesDialog.visible = true
 }
 
 /**
@@ -1053,7 +1108,18 @@ async function submitBatchComplete() {
   line-height: 1.5;
 }
 .file-more {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
   font-size: 12px;
+  line-height: 1.5;
+}
+.file-more-btn {
+  height: auto;
+  padding: 0;
+  font-size: 12px;
+  line-height: 1.5;
 }
 /* 手机上逐份文件：名字可折行，下载按钮保持 44px 不掉手 */
 .oc-files {
