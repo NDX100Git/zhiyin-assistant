@@ -11,23 +11,820 @@ body,
 
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif;
-  background: #f5f7fb;
-  color: #1f2d3d;
+  background-color: #e9e3d4;
+  color: #17161a;
+  -webkit-font-smoothing: antialiased;
 }
 
+/* ---------------------------------------------------------------------------
+ * 主题变量
+ * 默认 press：纸面工单。signal：信号牌。classic：旧蓝白皮肤（纯色，无渐变）。
+ * 老师端主题入口见 src/theme.js。
+ * ------------------------------------------------------------------------- */
+
+.zi-theme-press {
+  --zi-bg: #e9e3d4;
+  --zi-bg-image: repeating-linear-gradient(
+      0deg,
+      rgba(23, 22, 26, 0.07) 0,
+      rgba(23, 22, 26, 0.07) 1px,
+      transparent 1px,
+      transparent 32px
+    ),
+    repeating-linear-gradient(
+      90deg,
+      rgba(23, 22, 26, 0.07) 0,
+      rgba(23, 22, 26, 0.07) 1px,
+      transparent 1px,
+      transparent 32px
+    );
+  --zi-paper: #f8f4e9;
+  --zi-ink: #17161a;
+  --zi-muted: #67614f;
+  --zi-line: #c3b9a4;
+  --zi-line-strong: #8e8370;
+  --zi-soft: #f1ecdf;
+  --zi-soft-2: #f7f1e4;
+  --zi-accent: #d02d10;
+  --zi-accent-ink: #ffffff;
+  --zi-ok: #2f6b3f;
+  --zi-ok-bg: #e4ecdf;
+  --zi-warn: #8a4b00;
+  --zi-warn-bg: #f4e5c8;
+  --zi-danger: #b3261e;
+  --zi-danger-bg: #f6ded9;
+  --zi-radius: 0px;
+  --zi-card-border: 2px solid #17161a;
+  --zi-card-shadow: none;
+  --zi-primary-bg: #17161a;
+  --zi-primary-ink: #f8f4e9;
+  --zi-control-radius: 0px;
+  --zi-pill-radius: 0px;
+  --zi-aside-bg: #17161a;
+  --zi-aside-text: #d8d1c2;
+  --zi-aside-active: #ffffff;
+  --zi-aside-hover: rgba(255, 255, 255, 0.08);
+  --zi-header-bg: #f8f4e9;
+  --zi-header-border: 2px solid #17161a;
+  /* 实心地块（按钮/角标）上的字色，与语义色分开，深色下才不会白字压亮底 */
+  --zi-on-solid: #ffffff;
+  --zi-ok-solid: #2f6b3f;
+  --zi-warn-solid: #8a4b00;
+  --zi-danger-solid: #b3261e;
+  /* 弹层遮罩与立体阴影 */
+  --zi-overlay: rgba(23, 22, 26, 0.42);
+  --zi-card-shadow-hard: 12px 12px 0 rgba(23, 22, 26, 0.12);
+  --zi-card-shadow-soft: 0 4px 16px rgba(31, 45, 61, 0.06);
+  --zi-card-shadow-pop: 4px 4px 0 rgba(23, 22, 26, 0.12);
+  --zi-message-shadow: 4px 4px 0 rgba(23, 22, 26, 0.12);
+  /* 纸面：打印出来的东西不受深浅影响，深浅都用这一组 */
+  --zi-print-paper: #f8f4e9;
+  --zi-print-ink: #17161a;
+}
+
+.zi-theme-signal {
+  --zi-bg: #ece7dc;
+  --zi-bg-image: repeating-linear-gradient(
+    135deg,
+    transparent 0,
+    transparent 26px,
+    rgba(210, 43, 30, 0.05) 26px,
+    rgba(210, 43, 30, 0.05) 28px
+  );
+  --zi-paper: #fbf8f1;
+  --zi-ink: #121110;
+  --zi-muted: #5c574e;
+  --zi-line: #d9d2c3;
+  --zi-line-strong: #8a8377;
+  --zi-soft: #efe9dd;
+  --zi-soft-2: #f6f0e6;
+  --zi-accent: #d22b1e;
+  --zi-accent-ink: #ffffff;
+  --zi-ok: #1f6b3a;
+  --zi-ok-bg: #e3efe4;
+  --zi-warn: #8a4a00;
+  --zi-warn-bg: #f5e6c8;
+  --zi-danger: #b3261e;
+  --zi-danger-bg: #f6ded9;
+  --zi-radius: 0px;
+  --zi-card-border: 2px solid #121110;
+  --zi-card-shadow: none;
+  --zi-primary-bg: #d22b1e;
+  --zi-primary-ink: #ffffff;
+  --zi-control-radius: 0px;
+  --zi-pill-radius: 0px;
+  --zi-aside-bg: #121110;
+  --zi-aside-text: #d6d0c2;
+  --zi-aside-active: #ffffff;
+  --zi-aside-hover: rgba(255, 255, 255, 0.08);
+  --zi-header-bg: #fbf8f1;
+  --zi-header-border: 2px solid #121110;
+  --zi-on-solid: #ffffff;
+  --zi-ok-solid: #1f6b3a;
+  --zi-warn-solid: #8a4a00;
+  --zi-danger-solid: #b3261e;
+  --zi-overlay: rgba(18, 17, 16, 0.44);
+  --zi-card-shadow-hard: 12px 12px 0 rgba(23, 22, 26, 0.12);
+  --zi-card-shadow-soft: 0 4px 16px rgba(31, 45, 61, 0.06);
+  --zi-card-shadow-pop: 4px 4px 0 rgba(23, 22, 26, 0.12);
+  --zi-message-shadow: 4px 4px 0 rgba(23, 22, 26, 0.12);
+  --zi-print-paper: #fbf8f1;
+  --zi-print-ink: #121110;
+}
+
+.zi-theme-classic {
+  --zi-bg: #f5f7fb;
+  --zi-bg-image: none;
+  --zi-paper: #ffffff;
+  --zi-ink: #1f2d3d;
+  --zi-muted: #7a869a;
+  --zi-line: #e3e8f0;
+  --zi-line-strong: #c9d3e0;
+  --zi-soft: #f2f4f8;
+  --zi-soft-2: #f7f9fc;
+  --zi-accent: #2f6bff;
+  --zi-accent-ink: #ffffff;
+  --zi-ok: #3f8f5c;
+  --zi-ok-bg: #eaf7ef;
+  --zi-warn: #b25e09;
+  --zi-warn-bg: #fff4e6;
+  --zi-danger: #c0392b;
+  --zi-danger-bg: #fdecea;
+  --zi-radius: 12px;
+  --zi-card-border: 0 solid transparent;
+  --zi-card-shadow: 0 4px 16px rgba(31, 45, 61, 0.06);
+  --zi-primary-bg: #2f6bff;
+  --zi-primary-ink: #ffffff;
+  --zi-control-radius: 4px;
+  --zi-pill-radius: 4px;
+  --zi-aside-bg: #1f2d3d;
+  --zi-aside-text: #c7d2df;
+  --zi-aside-active: #ffffff;
+  --zi-aside-hover: rgba(255, 255, 255, 0.06);
+  --zi-header-bg: #ffffff;
+  --zi-header-border: 1px solid #eef1f6;
+  --zi-on-solid: #ffffff;
+  --zi-ok-solid: #3f8f5c;
+  --zi-warn-solid: #b25e09;
+  --zi-danger-solid: #c0392b;
+  --zi-overlay: rgba(31, 45, 61, 0.45);
+  --zi-card-shadow-hard: 12px 12px 0 rgba(23, 22, 26, 0.12);
+  --zi-card-shadow-soft: 0 4px 16px rgba(31, 45, 61, 0.06);
+  --zi-card-shadow-pop: 4px 4px 0 rgba(23, 22, 26, 0.12);
+  --zi-message-shadow: 4px 4px 0 rgba(23, 22, 26, 0.12);
+  --zi-print-paper: #ffffff;
+  --zi-print-ink: #1f2d3d;
+}
+
+/* ---------------------------------------------------------------------------
+ * 深色配色（跟随系统 prefers-color-scheme，由 body 上的 zi-scheme-dark 触发）
+ * 每套皮肤一份，只覆盖颜色类变量：圆角、边框粗细与版式沿用浅色那份。
+ * 正文与背景对比度全部不低于 4.5:1，边框线也保留在 1.6:1 以上。
+ * ------------------------------------------------------------------------- */
+
+body.zi-theme-press.zi-scheme-dark {
+  --zi-bg: #17150f;
+  --zi-bg-image: repeating-linear-gradient(
+      0deg,
+      rgba(236, 231, 220, 0.06) 0,
+      rgba(236, 231, 220, 0.06) 1px,
+      transparent 1px,
+      transparent 32px
+    ),
+    repeating-linear-gradient(
+      90deg,
+      rgba(236, 231, 220, 0.06) 0,
+      rgba(236, 231, 220, 0.06) 1px,
+      transparent 1px,
+      transparent 32px
+    );
+  --zi-paper: #221f18;
+  --zi-ink: #ece7dc;
+  --zi-muted: #a9a291;
+  --zi-line: #4a4436;
+  --zi-line-strong: #91897a;
+  --zi-soft: #262218;
+  --zi-soft-2: #2b271d;
+  --zi-accent: #ff7a5c;
+  --zi-accent-ink: #1a1811;
+  --zi-ok: #86d5a0;
+  --zi-ok-bg: #1e2a22;
+  --zi-warn: #f3bd74;
+  --zi-warn-bg: #32281a;
+  --zi-danger: #ff9d92;
+  --zi-danger-bg: #3a211d;
+  --zi-card-border: 2px solid #91897a;
+  --zi-primary-bg: #e4ddcd;
+  --zi-primary-ink: #1a1811;
+  --zi-aside-bg: #100f0b;
+  --zi-aside-text: #bdb5a5;
+  --zi-aside-active: #f2ece0;
+  --zi-aside-hover: rgba(242, 236, 224, 0.1);
+  --zi-header-bg: #221f18;
+  --zi-header-border: 2px solid #91897a;
+  --zi-on-solid: #f7f3ea;
+  --zi-ok-solid: #2b7346;
+  --zi-warn-solid: #8a5a12;
+  --zi-danger-solid: #a8352a;
+  --zi-overlay: rgba(8, 7, 5, 0.66);
+  --zi-card-shadow-hard: 8px 8px 0 rgba(0, 0, 0, 0.5);
+  --zi-card-shadow-soft: 0 4px 16px rgba(0, 0, 0, 0.45);
+  --zi-card-shadow-pop: 4px 4px 0 rgba(0, 0, 0, 0.5);
+  --zi-message-shadow: 4px 4px 0 rgba(0, 0, 0, 0.5);
+  --el-mask-color: rgba(8, 7, 5, 0.7);
+  --el-mask-color-extra-light: rgba(8, 7, 5, 0.4);
+}
+
+body.zi-theme-signal.zi-scheme-dark {
+  --zi-bg: #14120f;
+  --zi-bg-image: repeating-linear-gradient(
+    135deg,
+    transparent 0,
+    transparent 26px,
+    rgba(255, 96, 68, 0.07) 26px,
+    rgba(255, 96, 68, 0.07) 28px
+  );
+  --zi-paper: #1f1c19;
+  --zi-ink: #f3efe6;
+  --zi-muted: #a9a196;
+  --zi-line: #474138;
+  --zi-line-strong: #91897a;
+  --zi-soft: #262220;
+  --zi-soft-2: #2b2623;
+  --zi-accent: #ff6044;
+  --zi-accent-ink: #1a1613;
+  --zi-ok: #8ad6a4;
+  --zi-ok-bg: #1d2b22;
+  --zi-warn: #f4c078;
+  --zi-warn-bg: #33291a;
+  --zi-danger: #ffa095;
+  --zi-danger-bg: #3b211d;
+  --zi-card-border: 2px solid #91897a;
+  --zi-primary-bg: #ff6044;
+  --zi-primary-ink: #1a1613;
+  --zi-aside-bg: #121110;
+  --zi-aside-text: #c3bcb0;
+  --zi-aside-active: #f6f2e9;
+  --zi-aside-hover: rgba(246, 242, 233, 0.1);
+  --zi-header-bg: #1f1c19;
+  --zi-header-border: 2px solid #91897a;
+  --zi-on-solid: #f8f4ec;
+  --zi-ok-solid: #2b7346;
+  --zi-warn-solid: #8a5a12;
+  --zi-danger-solid: #b03a2c;
+  --zi-overlay: rgba(7, 6, 5, 0.68);
+  --zi-card-shadow-hard: 8px 8px 0 rgba(0, 0, 0, 0.5);
+  --zi-card-shadow-soft: 0 4px 16px rgba(0, 0, 0, 0.45);
+  --zi-card-shadow-pop: 4px 4px 0 rgba(0, 0, 0, 0.5);
+  --zi-message-shadow: 4px 4px 0 rgba(0, 0, 0, 0.5);
+  --el-mask-color: rgba(7, 6, 5, 0.72);
+  --el-mask-color-extra-light: rgba(7, 6, 5, 0.42);
+}
+
+body.zi-theme-classic.zi-scheme-dark {
+  --zi-bg: #12161d;
+  --zi-bg-image: none;
+  --zi-paper: #1b2029;
+  --zi-ink: #e6ebf2;
+  --zi-muted: #9fabbc;
+  --zi-line: #3a4658;
+  --zi-line-strong: #8b99b0;
+  --zi-soft: #222a35;
+  --zi-soft-2: #262f3b;
+  --zi-accent: #7aa7ff;
+  --zi-accent-ink: #111828;
+  --zi-ok: #6fd39a;
+  --zi-ok-bg: #1b2b23;
+  --zi-warn: #f0b968;
+  --zi-warn-bg: #2e2717;
+  --zi-danger: #ff9a8f;
+  --zi-danger-bg: #34201e;
+  --zi-card-border: 0 solid transparent;
+  --zi-card-shadow: 0 8px 24px rgba(0, 0, 0, 0.42);
+  --zi-primary-bg: #7aa7ff;
+  --zi-primary-ink: #111828;
+  --zi-aside-bg: #101620;
+  --zi-aside-text: #b7c4d6;
+  --zi-aside-active: #eef3fb;
+  --zi-aside-hover: rgba(238, 243, 251, 0.1);
+  --zi-header-bg: #1b2029;
+  --zi-header-border: 1px solid #3a4658;
+  --zi-on-solid: #f6f9ff;
+  --zi-ok-solid: #2b7346;
+  --zi-warn-solid: #8a5a12;
+  --zi-danger-solid: #a8352a;
+  --zi-overlay: rgba(6, 9, 14, 0.68);
+  --zi-card-shadow-hard: 8px 8px 0 rgba(0, 0, 0, 0.45);
+  --zi-card-shadow-soft: 0 4px 16px rgba(0, 0, 0, 0.4);
+  --zi-card-shadow-pop: 4px 4px 0 rgba(0, 0, 0, 0.45);
+  --zi-message-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  --el-mask-color: rgba(6, 9, 14, 0.7);
+  --el-mask-color-extra-light: rgba(6, 9, 14, 0.4);
+}
+
+body.zi-theme-press,
+body.zi-theme-signal,
+body.zi-theme-classic {
+  background-color: var(--zi-bg);
+  background-image: var(--zi-bg-image);
+  color: var(--zi-ink);
+  --el-color-primary: var(--zi-accent);
+  --el-color-primary-light-3: var(--zi-accent);
+  --el-color-primary-light-5: var(--zi-accent);
+  --el-color-primary-light-7: var(--zi-line-strong);
+  --el-color-primary-light-8: var(--zi-soft);
+  --el-color-primary-light-9: var(--zi-soft);
+  --el-color-primary-dark-2: var(--zi-ink);
+  --el-color-success: var(--zi-ok);
+  --el-color-success-light-3: var(--zi-ok);
+  --el-color-success-light-5: var(--zi-ok);
+  --el-color-success-light-7: var(--zi-line-strong);
+  --el-color-success-light-8: var(--zi-ok-bg);
+  --el-color-success-light-9: var(--zi-ok-bg);
+  --el-color-warning: var(--zi-warn);
+  --el-color-warning-light-3: var(--zi-warn);
+  --el-color-warning-light-5: var(--zi-warn);
+  --el-color-warning-light-7: var(--zi-line-strong);
+  --el-color-warning-light-8: var(--zi-warn-bg);
+  --el-color-warning-light-9: var(--zi-warn-bg);
+  --el-color-danger: var(--zi-danger);
+  --el-color-danger-light-3: var(--zi-danger);
+  --el-color-danger-light-5: var(--zi-danger);
+  --el-color-danger-light-7: var(--zi-line-strong);
+  --el-color-danger-light-8: var(--zi-danger-bg);
+  --el-color-danger-light-9: var(--zi-danger-bg);
+  --el-color-info: var(--zi-muted);
+  --el-color-info-light-9: var(--zi-soft);
+  --el-text-color-primary: var(--zi-ink);
+  --el-text-color-regular: var(--zi-ink);
+  --el-text-color-secondary: var(--zi-muted);
+  --el-text-color-placeholder: var(--zi-line-strong);
+  --el-text-color-disabled: var(--zi-muted);
+  --el-border-color: var(--zi-line);
+  --el-border-color-light: var(--zi-line);
+  --el-border-color-lighter: var(--zi-line);
+  --el-border-color-extra-light: var(--zi-line);
+  --el-border-color-dark: var(--zi-line-strong);
+  --el-fill-color-blank: var(--zi-paper);
+  --el-fill-color: var(--zi-soft);
+  --el-fill-color-light: var(--zi-soft);
+  --el-fill-color-lighter: var(--zi-soft-2);
+  --el-fill-color-extra-light: var(--zi-soft-2);
+  --el-fill-color-dark: var(--zi-line);
+  --el-bg-color: var(--zi-paper);
+  --el-bg-color-page: var(--zi-bg);
+  --el-bg-color-overlay: var(--zi-paper);
+  --el-border-radius-base: var(--zi-control-radius);
+  --el-border-radius-small: var(--zi-control-radius);
+  --el-border-radius-round: var(--zi-pill-radius);
+  --el-mask-color: rgba(248, 244, 233, 0.78);
+  --el-mask-color-extra-light: rgba(248, 244, 233, 0.4);
+}
+
+/* 禁用态按钮：浅底 + 次要文字色，深色下也不会白字压在亮底上 */
+.el-button.is-disabled:not(.is-link),
+.el-button.is-disabled:not(.is-link):hover {
+  background-color: var(--zi-soft);
+  border-color: var(--zi-line-strong);
+  color: var(--zi-muted);
+}
+.el-button.is-link.is-disabled,
+.el-button.is-link.is-disabled:hover {
+  background: transparent;
+  border-color: transparent;
+  color: var(--zi-muted);
+}
+
+/* ---------------------------------------------------------------------------
+ * 通用块
+ * ------------------------------------------------------------------------- */
+
 .page-card {
-  background: #fff;
-  border-radius: 12px;
+  background: var(--zi-paper);
+  border: var(--zi-card-border);
+  border-top: 6px solid var(--zi-accent);
+  border-radius: var(--zi-radius);
   padding: 18px;
-  box-shadow: 0 4px 16px rgba(31, 45, 61, 0.06);
+  box-shadow: var(--zi-card-shadow);
 }
 
 .money {
-  font-weight: 600;
-  color: #2f6bff;
+  font-weight: 800;
+  color: var(--zi-accent);
 }
 
 .muted {
-  color: #8b98a8;
+  color: var(--zi-muted);
   font-size: 12px;
+}
+
+/* ---------------------------------------------------------------------------
+ * Element Plus 覆盖：按钮、输入、表格、标签、弹窗
+ * ------------------------------------------------------------------------- */
+
+.el-button {
+  border-radius: var(--zi-control-radius);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.el-button--primary {
+  --el-button-bg-color: var(--zi-primary-bg);
+  --el-button-border-color: var(--zi-primary-bg);
+  --el-button-text-color: var(--zi-primary-ink);
+  --el-button-hover-bg-color: var(--zi-accent);
+  --el-button-hover-border-color: var(--zi-accent);
+  --el-button-hover-text-color: var(--zi-accent-ink);
+  --el-button-active-bg-color: var(--zi-primary-bg);
+  --el-button-active-border-color: var(--zi-ink);
+  --el-button-active-text-color: var(--zi-primary-ink);
+}
+
+.el-button--success {
+  --el-button-bg-color: var(--zi-ok-solid);
+  --el-button-border-color: var(--zi-ok-solid);
+  --el-button-text-color: var(--zi-on-solid);
+  --el-button-hover-bg-color: var(--zi-ok-solid);
+  --el-button-hover-border-color: var(--zi-ok-solid);
+  --el-button-hover-text-color: var(--zi-on-solid);
+  --el-button-active-bg-color: var(--zi-ink);
+  --el-button-active-border-color: var(--zi-ink);
+  --el-button-active-text-color: var(--zi-paper);
+}
+
+.el-button--warning {
+  --el-button-bg-color: var(--zi-warn-solid);
+  --el-button-border-color: var(--zi-warn-solid);
+  --el-button-text-color: var(--zi-on-solid);
+  --el-button-hover-bg-color: var(--zi-warn-solid);
+  --el-button-hover-border-color: var(--zi-warn-solid);
+  --el-button-hover-text-color: var(--zi-on-solid);
+  --el-button-active-bg-color: var(--zi-ink);
+  --el-button-active-border-color: var(--zi-ink);
+  --el-button-active-text-color: var(--zi-paper);
+}
+
+.el-button--danger {
+  --el-button-bg-color: var(--zi-danger-solid);
+  --el-button-border-color: var(--zi-danger-solid);
+  --el-button-text-color: var(--zi-on-solid);
+  --el-button-hover-bg-color: var(--zi-danger-solid);
+  --el-button-hover-border-color: var(--zi-danger-solid);
+  --el-button-hover-text-color: var(--zi-on-solid);
+  --el-button-active-bg-color: var(--zi-ink);
+  --el-button-active-border-color: var(--zi-ink);
+  --el-button-active-text-color: var(--zi-paper);
+}
+
+.el-button.is-link {
+  background: transparent;
+  border-color: transparent;
+}
+.el-button.is-link.el-button--primary {
+  color: var(--zi-accent);
+}
+.el-button.is-link.el-button--success {
+  color: var(--zi-ok);
+}
+.el-button.is-link.el-button--warning {
+  color: var(--zi-warn);
+}
+.el-button.is-link.el-button--danger {
+  color: var(--zi-danger);
+}
+
+.el-input__wrapper,
+.el-select__wrapper,
+.el-textarea__inner {
+  background-color: var(--zi-paper);
+  border-radius: var(--zi-control-radius);
+  box-shadow: 0 0 0 1px var(--zi-line-strong) inset;
+}
+.el-input__wrapper.is-focus,
+.el-select__wrapper.is-focused,
+.el-textarea__inner:focus {
+  box-shadow: 0 0 0 2px var(--zi-accent) inset;
+}
+.el-input__inner {
+  color: var(--zi-ink);
+}
+.el-input__inner::placeholder,
+.el-textarea__inner::placeholder {
+  color: var(--zi-line-strong);
+}
+.el-form-item__label {
+  color: var(--zi-ink);
+  font-weight: 700;
+}
+
+.el-table {
+  --el-table-border-color: var(--zi-line);
+  --el-table-header-bg-color: var(--zi-soft);
+  --el-table-header-text-color: var(--zi-ink);
+  --el-table-row-hover-bg-color: var(--zi-soft);
+  --el-table-current-row-bg-color: var(--zi-soft);
+  --el-table-tr-bg-color: var(--zi-paper);
+  --el-table-bg-color: var(--zi-paper);
+  --el-table-expanded-cell-bg-color: var(--zi-paper);
+  --el-fill-color-lighter: var(--zi-soft-2);
+}
+.el-table th.el-table__cell {
+  background: var(--zi-soft);
+  color: var(--zi-ink);
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+.el-table td.el-table__cell {
+  color: var(--zi-ink);
+}
+.el-table--striped .el-table__body tr.el-table__row--striped td.el-table__cell {
+  background: var(--zi-soft-2);
+}
+.el-table__empty-text {
+  color: var(--zi-muted);
+}
+
+.el-tag {
+  border: 1px solid var(--zi-line-strong);
+  border-radius: var(--zi-pill-radius);
+  background: transparent;
+  color: var(--zi-ink);
+  font-weight: 800;
+  white-space: nowrap;
+}
+.el-tag--primary {
+  border-color: var(--zi-accent);
+  color: var(--zi-accent);
+}
+.el-tag--success {
+  border-color: var(--zi-ok);
+  color: var(--zi-ok);
+}
+.el-tag--warning {
+  border-color: var(--zi-warn);
+  color: var(--zi-warn);
+}
+.el-tag--danger {
+  border-color: var(--zi-danger-solid);
+  background: var(--zi-danger-solid);
+  color: var(--zi-on-solid);
+}
+.el-tag--info {
+  border-color: var(--zi-line-strong);
+  color: var(--zi-muted);
+}
+.el-tag.is-plain {
+  background: transparent;
+}
+
+.el-dialog,
+.el-message-box {
+  border: var(--zi-card-border);
+  border-top: 8px solid var(--zi-accent);
+  border-radius: var(--zi-radius);
+  background: var(--zi-paper);
+}
+.el-dialog__header {
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--zi-line);
+}
+.el-dialog__title,
+.el-message-box__title {
+  color: var(--zi-ink);
+  font-weight: 900;
+  letter-spacing: 0.02em;
+}
+.el-dialog__body,
+.el-message-box__content {
+  color: var(--zi-ink);
+}
+.el-message {
+  border: 1px solid var(--zi-line-strong);
+  border-left: 5px solid var(--zi-line-strong);
+  border-radius: var(--zi-control-radius);
+  background: var(--zi-paper);
+  color: var(--zi-ink);
+  box-shadow: var(--zi-message-shadow);
+}
+.el-message--success {
+  border-left-color: var(--zi-ok);
+}
+.el-message--warning {
+  border-left-color: var(--zi-warn);
+}
+.el-message--error {
+  border-left-color: var(--zi-danger);
+}
+
+.el-descriptions__label.el-descriptions__cell.is-bordered-label {
+  background: var(--zi-soft);
+  color: var(--zi-muted);
+  font-weight: 800;
+}
+.el-descriptions__content.el-descriptions__cell {
+  color: var(--zi-ink);
+}
+
+.el-popper.is-light {
+  border: 1px solid var(--zi-ink);
+  border-radius: var(--zi-control-radius);
+  background: var(--zi-paper);
+  color: var(--zi-ink);
+}
+.el-select-dropdown__item.is-selected {
+  color: var(--zi-accent);
+  font-weight: 800;
+}
+
+/* ---------------------------------------------------------------------------
+ * 旧蓝白皮肤：恢复轻量圆角与浅色填充
+ * ------------------------------------------------------------------------- */
+
+.zi-theme-classic .page-card {
+  border: none;
+  border-top: none;
+  border-radius: 12px;
+  box-shadow: var(--zi-card-shadow-soft);
+}
+.zi-theme-classic .el-button {
+  font-weight: 500;
+  letter-spacing: 0;
+}
+.zi-theme-classic .el-tag {
+  border: none;
+  background: var(--zi-soft);
+  font-weight: 400;
+}
+.zi-theme-classic .el-tag--primary {
+  background: var(--zi-soft);
+  color: var(--zi-accent);
+}
+.zi-theme-classic .el-tag--success {
+  background: var(--zi-ok-bg);
+  color: var(--zi-ok);
+}
+.zi-theme-classic .el-tag--warning {
+  background: var(--zi-warn-bg);
+  color: var(--zi-warn);
+}
+.zi-theme-classic .el-tag--danger {
+  background: var(--zi-danger-bg);
+  color: var(--zi-danger);
+}
+.zi-theme-classic .el-tag--info {
+  background: var(--zi-soft);
+  color: var(--zi-muted);
+}
+.zi-theme-classic .el-dialog,
+.zi-theme-classic .el-message-box {
+  border: none;
+  border-top: none;
+  border-radius: 8px;
+}
+.zi-theme-classic .el-dialog__header {
+  border-bottom: 1px solid var(--zi-line);
+}
+.zi-theme-classic .el-input__wrapper,
+.zi-theme-classic .el-select__wrapper,
+.zi-theme-classic .el-textarea__inner {
+  box-shadow: 0 0 0 1px var(--zi-line) inset;
+}
+.zi-theme-classic .el-input__wrapper.is-focus,
+.zi-theme-classic .el-select__wrapper.is-focused,
+.zi-theme-classic .el-textarea__inner:focus {
+  box-shadow: 0 0 0 1px var(--zi-accent) inset;
+}
+.zi-theme-classic .el-table th.el-table__cell {
+  font-weight: 600;
+  letter-spacing: 0;
+}
+.zi-theme-classic .el-message {
+  border: none;
+  border-left: 4px solid var(--zi-line-strong);
+  box-shadow: var(--zi-card-shadow-soft);
+}
+.zi-theme-classic .el-message--success {
+  border-left-color: var(--zi-ok);
+}
+.zi-theme-classic .el-message--warning {
+  border-left-color: var(--zi-warn);
+}
+.zi-theme-classic .el-message--error {
+  border-left-color: var(--zi-danger);
+}
+
+/* ---------------------------------------------------------------------------
+ * 换文件确认弹窗
+ * 弹窗被 teleport 到 body，拿不到页面级的主题变量，因此这里只管版式：
+ * 长文件名必须能断行，窄屏下三个按钮竖排且不小于 44 像素，避免横向溢出。
+ * ------------------------------------------------------------------------- */
+
+.file-change-dialog .el-descriptions__content {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 767px) {
+  .file-change-dialog .el-dialog__body {
+    padding: 12px;
+  }
+  .file-change-dialog .el-dialog__footer {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .file-change-dialog .el-dialog__footer .el-button {
+    flex: 1 1 100%;
+    margin: 0;
+    min-height: 44px;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * 订单文件清单弹窗
+ * 同样被 teleport 到 body，只写版式：每份一行、名字能断行，
+ * 窄屏下下载按钮独占一行且不小于 44 像素，避免横向溢出。
+ * ------------------------------------------------------------------------- */
+
+.files-dialog .files-dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.files-dialog .files-dialog-meta {
+  color: var(--zi-muted);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.files-dialog .files-dialog-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-top: 1px dashed var(--zi-line);
+  min-width: 0;
+}
+
+.files-dialog .files-dialog-seq {
+  flex: none;
+  color: var(--zi-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.files-dialog .files-dialog-main {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.5;
+}
+
+.files-dialog .files-dialog-name {
+  min-width: 0;
+  color: var(--zi-ink);
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.files-dialog .files-dialog-dl {
+  flex: none;
+  margin-left: 0;
+}
+
+@media (max-width: 767px) {
+  .files-dialog .el-dialog__body {
+    padding: 12px;
+  }
+  .files-dialog .files-dialog-row {
+    flex-wrap: wrap;
+  }
+  .files-dialog .files-dialog-main {
+    flex: 1 1 140px;
+  }
+  .files-dialog .files-dialog-dl {
+    flex: 1 1 100%;
+    min-height: 44px;
+  }
+  .files-dialog .el-dialog__footer .el-button {
+    min-height: 44px;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * 弹层：抽屉与遮罩不能漏出默认白底（深色下尤其明显）
+ * ------------------------------------------------------------------------- */
+
+.el-overlay {
+  background-color: var(--zi-overlay);
+}
+
+.el-drawer {
+  background-color: var(--zi-aside-bg);
+}
+
+.el-popper.is-light .el-select-dropdown__item {
+  color: var(--zi-ink);
 }

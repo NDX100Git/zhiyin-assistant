@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: ci_mysql_password
+          MYSQL_DATABASE: zhiyin
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pci_mysql_password --silent"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: "3306"
+      DB_NAME: zhiyin
+      DB_USER: root
+      DB_PASSWORD: ci_mysql_password
+      DB_POOL_SIZE: "10"
+      DB_MAX_OVERFLOW: "10"
+      MINIO_ENDPOINT: 127.0.0.1:9000
+      MINIO_ACCESS_KEY: ci_minio_access
+      MINIO_SECRET_KEY: ci_minio_secret
+      MINIO_BUCKET: zhiyin-files
+      MINIO_SECURE: "false"
+      AUTO_CREATE_TABLES: "true"
+      CLEANUP_ENABLED: "false"
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD: ci_admin_password
+      JWT_SECRET: ci_jwt_secret_at_least_32_characters_long
+      AWS_DEFAULT_REGION: us-east-1
+      SOFFICE_PATH: /usr/bin/soffice
+      SOFFICE_CONTAINER: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install LibreOffice
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libreoffice-writer \
+            libreoffice-calc \
+            libreoffice-impress \
+            fonts-noto-cjk
+
+      - name: Install Python dependencies
+        working-directory: backend
+        run: python -m pip install -r requirements-dev.txt "moto[server]==5.2.4"
+
+      - name: Lint
+        working-directory: backend
+        run: ruff check . --output-format=github
+
+      - name: Test
+        working-directory: backend
+        run: |
+          moto_server -H 127.0.0.1 -p 9000 > "${RUNNER_TEMP}/moto-s3.log" 2>&1 &
+          moto_pid=$!
+          trap 'kill "$moto_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/moto-api/ > /dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              cat "${RUNNER_TEMP}/moto-s3.log"
+              exit 1
+            fi
+            sleep 1
+          done
+          pytest -q -p no:logging
+
+  teacher-web:
+    name: Teacher web build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: teacher-web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: teacher-web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+  student-app:
+    name: Student app build (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - h5
+          - mp-weixin
+    defaults:
+      run:
+        working-directory: student-app
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: student-app/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build:${{ matrix.target }}

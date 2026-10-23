@@ -111,3 +111,71 @@ def test_查询不存在的任务报业务错误():
 
     with pytest.raises(BusinessError):
         proofreader.get_progress("not-a-real-task")
+
+
+def test_校对分块并发与全局闸门口径对齐():
+    """配置必须钉住「两个校对任务 × 每任务 2 路 = 全局 4 个名额」。"""
+    from app.config import get_ai_rules, settings
+
+    rules = get_ai_rules()
+    assert "max_concurrency" not in rules  # 顶层重复配置已删，只留 proofread 下这一份
+    assert rules["proofread"]["max_concurrency"] == 2
+    assert settings.llm_max_concurrency == 4
+    assert rules["proofread"]["max_concurrency"] * 2 == settings.llm_max_concurrency
+    # 校对任务本身最多 2 个同时跑，乘每任务 2 路正好是全局 4 个名额
+    assert proofreader._executor._max_workers == 2
+
+
+def test_两个校对任务并发时不超过全局闸门(monkeypatch):
+    """两个任务同时跑，分块请求叠加也不超过全局名额；单任务不超过配置路数。"""
+    import asyncio
+    import threading
+    from collections import defaultdict
+
+    from app.config import get_ai_rules, settings
+
+    rules = get_ai_rules()
+    per_task_limit = int(rules["proofread"]["max_concurrency"])
+    chunks = [f"第{i}段正文" + "字" * 60 for i in range(4)]
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+    per_active: dict[str, int] = defaultdict(int)
+    per_peak: dict[str, int] = defaultdict(int)
+
+    async def fake_achat_json(messages, thinking=False, temperature=None):
+        nonlocal active, peak
+        name = threading.current_thread().name
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            per_active[name] += 1
+            per_peak[name] = max(per_peak[name], per_active[name])
+        try:
+            await asyncio.sleep(0.05)
+            return {"issues": []}
+        finally:
+            with lock:
+                active -= 1
+                per_active[name] -= 1
+
+    monkeypatch.setattr("app.services.proofreader.achat_json", fake_achat_json)
+
+    tasks = [task_registry.create_task("proofread") for _ in range(2)]
+    threads = [
+        threading.Thread(
+            target=lambda task_id=task.task_id: asyncio.run(
+                proofreader._run_chunks(task_id, chunks)
+            ),
+            name=f"proof-{index}",
+        )
+        for index, task in enumerate(tasks)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert all(value <= per_task_limit for value in per_peak.values())
+    assert peak <= settings.llm_max_concurrency
+    assert peak >= 2  # 两个任务确实同时跑起来了，不是串行

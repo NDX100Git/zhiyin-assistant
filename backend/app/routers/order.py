@@ -10,10 +10,15 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.user import User
-from app.schemas.order import OrderCancelRequest, OrderCreateRequest
-from app.services import order_service
+from app.schemas.order import (
+    OrderCancelRequest,
+    OrderCreateRequest,
+    OrderFileReplaceRequest,
+    OrderQuoteRequest,
+)
+from app.services import file_change_service, order_service
 from app.services.session_service import order_notice
-from app.utils.response import ok
+from app.utils.response import ok, ok_json
 from app.utils.security import get_current_user
 
 router = APIRouter()
@@ -33,6 +38,20 @@ def create_order(
     return ok(data)
 
 
+@router.post("/quote", summary="试算价格（只算不落库，需登录）", response_model=None)
+def quote_order(
+    payload: OrderQuoteRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """页面改参数时调它取金额：与下单同一套校验与计费，不建订单、不写库。
+
+    返回逐份行金额（含打印页数）与整单文档页数、打印页数、总额，
+    字段名与订单里的文件项完全一致，前端两句接口共用一份参数与一套展示。
+    """
+    return ok(order_service.quote_order(db, user, payload))
+
+
 @router.get("/list", summary="我的订单列表", response_model=None)
 def list_orders(
     status: str | None = Query(default=None, description="按状态筛选"),
@@ -41,7 +60,8 @@ def list_orders(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    return ok(order_service.list_orders(db, user, status, page, page_size))
+    # 30 秒轮询的最高频读接口：返回值已是纯 JSON 类型，直出省掉一层通用编码
+    return ok_json(order_service.list_orders(db, user, status, page, page_size))
 
 
 @router.get("/{order_id}", summary="订单详情（含排队位置）", response_model=None)
@@ -75,3 +95,22 @@ def pay_order(
 ) -> dict:
     """调用当前配置的 PaymentProvider，成功后状态转排队中。"""
     return ok(order_service.pay_order(db, user, order_id))
+
+
+@router.post("/{order_id}/replace-file", summary="换文件（需登录）", response_model=None)
+def replace_file(
+    order_id: int,
+    payload: OrderFileReplaceRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """待支付直接生效；排队中与异常单转「待老师确认」；其余状态拒绝。
+
+    返回订单对象本身，另加 `applied` 标识是立即生效还是等待确认；
+    待确认时订单里的 `file_change` 字段给出新文件与系统重算价。
+    """
+    order = order_service.get_owned_order(db, user, order_id)
+    result = file_change_service.replace_order_file(db, order, payload, user)
+    data = order_service.order_to_dict(db, order)
+    data["applied"] = bool(result["applied"])
+    return ok(data)

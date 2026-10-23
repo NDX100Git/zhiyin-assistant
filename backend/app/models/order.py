@@ -15,18 +15,23 @@ class Order(Base):
     __tablename__ = "orders"
     __table_args__ = (
         Index("idx_status_created", "status", "created_at"),
-        Index("idx_pickup_code", "pickup_code"),
+        Index("uq_pickup_code", "pickup_code", unique=True),
         {"comment": "订单主表，状态机见交接文档 3.1"},
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    order_no: Mapped[str] = mapped_column(String(16), nullable=False, unique=True)  # 1016-007
-    pickup_code: Mapped[str] = mapped_column(String(8), nullable=False)  # B-12，按当日顺序
+    # 序号日（年+日）自带，跨年不会重号，所以两张号都能上唯一索引
+    order_no: Mapped[str] = mapped_column(String(16), nullable=False, unique=True)  # 261016-007
+    pickup_code: Mapped[str] = mapped_column(String(20), nullable=False)  # 261017-A-01
     user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     file_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 整单打印页数 = Σ 各份打印页数（page_count × copies）；page_count 仍是文档页数之和
+    print_page_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     print_side: Mapped[int | None] = mapped_column(TINYINT, nullable=True)  # 1=单面 2=双面
     color_mode: Mapped[int | None] = mapped_column(TINYINT, nullable=True)  # 0=黑白 1=彩色
     copies: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
@@ -38,6 +43,13 @@ class Order(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.current_timestamp()
     )
+    # 换文件后重新排队的时间。队列排序优先用它，为空时回落到 created_at；
+    # 不改 order_no 与 created_at，保证订单号、取件码与下单时间都可追溯。
+    requeue_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 当前文件最近一次被替换的时间；下单时为 NULL。老师确认看到后写 files_seen_at，
+    # 两者一起表达「文件已替换，但老师还没重新下载确认」。
+    file_changed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    files_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     printed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     picked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     remark: Mapped[str | None] = mapped_column(String(255), nullable=True)

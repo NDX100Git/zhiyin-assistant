@@ -17,15 +17,22 @@ from app.models.user import User
 _seq = itertools.count(1)
 
 
-def _make_order(db_session, status: str = "queuing", pickup_code: str = "A-01",
+def _full_code(tail: str, day: date | None = None) -> str:
+    """取件码是日期前缀加当日短码，如 261017-A-01。"""
+    return f"{(day or date.today()):%y%m%d}-{tail}"
+
+
+def _make_order(db_session, status: str = "queuing", pickup_code: str | None = None,
                 paid: int = 0, **kwargs) -> Order:
     index = next(_seq)
+    # 取件码现在有唯一索引，不传就按序号造一个不重复的短码
+    tail = pickup_code or f"{chr(65 + index % 26)}-{index % 99 + 1:02d}"
     user = User(openid=f"admin-test-{index}", auth_provider="device")
     db_session.add(user)
     db_session.flush()
     order = Order(
         order_no=f"0101-{index:03d}",
-        pickup_code=pickup_code,
+        pickup_code=_full_code(tail),
         user_id=user.id,
         status=status,
         page_count=42,
@@ -105,10 +112,10 @@ def test_队列按订单号排序且支持筛选与搜索(client, db_session):
         "/api/admin/queue", params={"keyword": "B-12"}, headers=auth(token)
     ).json()["data"]
     assert searched["total"] == 1
-    assert searched["items"][0]["pickup_code"] == "B-12"
+    assert searched["items"][0]["pickup_code"] == _full_code("B-12")
 
 
-def test_开始打印然后完成打印(client, db_session):
+def test_开始打印然后完成打印(client, db_session, test_storage):
     token = admin_token(client)
     order = _make_order(db_session, status="queuing")
 
@@ -277,7 +284,7 @@ def test_收单开关影响学生端提示(client, db_session, monkeypatch):
 
     closed = client.post(
         "/api/admin/session/close",
-        json={"date": "2026-10-17", "session": "pm"},
+        json={"date": date.today().isoformat(), "session": "pm"},
         headers=auth(admin),
     ).json()
     assert closed["code"] == 0, closed
@@ -290,7 +297,7 @@ def test_收单开关影响学生端提示(client, db_session, monkeypatch):
 
     opened = client.post(
         "/api/admin/session/open",
-        json={"date": "2026-10-17", "session": "pm"},
+        json={"date": date.today().isoformat(), "session": "pm"},
         headers=auth(admin),
     ).json()
     assert opened["data"]["is_open"] is True
@@ -344,7 +351,7 @@ def test_系统报价供完成弹窗预填(client, db_session):
 def test_收单时段总览返回上午下午(client):
     token = admin_token(client)
     body = client.get(
-        "/api/admin/sessions", params={"date": "2026-10-17"}, headers=auth(token)
+        "/api/admin/sessions", params={"date": date.today().isoformat()}, headers=auth(token)
     ).json()
 
     assert body["code"] == 0

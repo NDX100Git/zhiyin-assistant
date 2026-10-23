@@ -12,8 +12,9 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.user import User
 from app.schemas.ai import PageCountRequest
+from app.schemas.file import FileDeleteRequest
 from app.services.doc_parser import parse_document
-from app.services.file_service import load_demo_document, store_upload
+from app.services.file_service import delete_uploaded_file, load_demo_document, store_upload
 from app.utils.response import ok
 from app.utils.security import get_current_user
 
@@ -24,15 +25,29 @@ router = APIRouter()
 def upload(
     file: UploadFile = File(..., description="待体检的文档或图片"),
     user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> dict:
     """校验类型与大小后存入私有桶，返回对象 key 与限时签名 URL。"""
-    return ok(store_upload(user, file))
+    return ok(store_upload(user, file, db))
+
+
+@router.post("/delete", summary="撤回未下单的上传文件（需登录）", response_model=None)
+def delete_file(
+    payload: FileDeleteRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """只允许上传者本人撤回；已被订单、版本或待确认请求引用的文件拒绝删除。"""
+    return ok(delete_uploaded_file(db, user, payload.file_key))
 
 
 @router.post("/demo", summary="载入服务端示例论文（演示兜底）", response_model=None)
-def upload_demo(user: User = Depends(get_current_user)) -> dict:
+def upload_demo(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
     """App 端选文件不可用时，用它保证「上传 → AI 体检」链路可演示。"""
-    return ok(load_demo_document(user))
+    return ok(load_demo_document(user, db))
 
 
 @router.post("/page-count", summary="读取页数（不调用 AI）", response_model=None)

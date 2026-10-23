@@ -7,9 +7,11 @@ API Key、base_url、模型名全部从环境变量读取（见 app.config.setti
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+import threading
 from typing import Any
 
 from openai import AsyncOpenAI, OpenAI
@@ -19,11 +21,23 @@ from app.utils.exceptions import BusinessError
 
 logger = logging.getLogger(__name__)
 
-REQUEST_TIMEOUT = 60
-MAX_ATTEMPTS = 3
-
 _client: OpenAI | None = None
 _async_client: AsyncOpenAI | None = None
+
+# 并发闸门：模型调用慢，必须限流，否则几十个人同时点体检会占满线程池，
+# 登录、下单这些快接口跟着排队。闸门大小随配置变化自动重建，改配置不用重启也行。
+_gate_guard = threading.Lock()
+_gate: tuple[int, threading.BoundedSemaphore] | None = None
+_in_flight = 0
+
+
+def _semaphore() -> threading.BoundedSemaphore:
+    global _gate
+    size = max(1, int(settings.llm_max_concurrency))
+    with _gate_guard:
+        if _gate is None or _gate[0] != size:
+            _gate = (size, threading.BoundedSemaphore(size))
+        return _gate[1]
 
 
 def is_configured() -> bool:
@@ -40,7 +54,7 @@ def get_client() -> OpenAI:
         _client = OpenAI(
             api_key=settings.llm_api_key,
             base_url=settings.llm_base_url,
-            timeout=REQUEST_TIMEOUT,
+            timeout=settings.llm_timeout_seconds,
         )
     return _client
 
@@ -54,7 +68,7 @@ def get_async_client() -> AsyncOpenAI:
         _async_client = AsyncOpenAI(
             api_key=settings.llm_api_key,
             base_url=settings.llm_base_url,
-            timeout=REQUEST_TIMEOUT,
+            timeout=settings.llm_timeout_seconds,
         )
     return _async_client
 
@@ -87,15 +101,91 @@ def chat(
     thinking=True 用于版式诊断、格式校验等需要推理的复杂任务。
     """
     kwargs = _build_kwargs(messages, json_mode, thinking, temperature)
+    client = get_client()
 
+    slot = _acquire_slot(float(settings.llm_queue_wait_seconds))
+    try:
+        return _chat_with_retry(client, kwargs)
+    finally:
+        _release_slot(slot)
+
+
+def _acquire_slot(wait_seconds: float) -> threading.BoundedSemaphore:
+    """拿全局模型调用名额，同步与异步共用。
+
+    返回拿到的信号量本身，归还时释放同一个对象，避免配置变更后释放到新信号量。
+    """
+    semaphore = _semaphore()
+    if not semaphore.acquire(timeout=wait_seconds):
+        # 队列里等太久说明此刻排满了，早失败比让请求占着线程干等更好
+        logger.warning("AI 并发已满，等待 %.1f 秒未拿到名额，直接拒绝", wait_seconds)
+        raise BusinessError("当前使用 AI 的人较多，请稍后重试", code=50034)
+
+    global _in_flight
+    with _gate_guard:
+        _in_flight += 1
+        current = _in_flight
+    logger.info("AI 调用开始，当前并发 %d", current)
+    return semaphore
+
+
+def _release_slot(semaphore: threading.BoundedSemaphore) -> None:
+    global _in_flight
+    with _gate_guard:
+        _in_flight -= 1
+    semaphore.release()
+
+
+def _release_orphan_slot(task: asyncio.Future) -> None:
+    """排队期间被取消的调用：线程事后拿到的名额要就地归还。"""
+    if task.cancelled():
+        return
+    if task.exception() is not None:
+        # 排队超时之类的失败，本来就没拿到名额，不用归还
+        return
+    semaphore = task.result()
+    if semaphore is not None:
+        _release_slot(semaphore)
+
+
+async def _acquire_slot_async(wait_seconds: float) -> threading.BoundedSemaphore:
+    """异步排队拿名额，且任务被取消时不留孤儿名额。
+
+    `asyncio.to_thread` 只把排队丢进线程：调用方取消之后线程照旧继续等，最终
+    仍会拿到名额。若直接放弃等待，这个名额就永远悬在那儿没人归还，几次取消之后
+    异步模型调用的并发上限被吃光，后续调用全部排队超时。
+
+    所以这里记一个「调用方已经走了」的标志：线程拿到名额时看到标志就当场归还；
+    标志与拿到名额正好擦肩而过时，由回调归还。两条路互斥，名额只还一次。
+    """
+    abandoned = threading.Event()
+
+    def worker() -> threading.BoundedSemaphore | None:
+        semaphore = _acquire_slot(wait_seconds)
+        if abandoned.is_set():
+            _release_slot(semaphore)
+            return None
+        return semaphore
+
+    task = asyncio.ensure_future(asyncio.to_thread(worker))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        abandoned.set()
+        task.add_done_callback(_release_orphan_slot)
+        raise
+
+
+def _chat_with_retry(client: OpenAI, kwargs: dict[str, Any]) -> str:
+    attempts = max(1, int(settings.llm_max_attempts))
     last_error: Exception | None = None
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    for attempt in range(1, attempts + 1):
         try:
-            response = get_client().chat.completions.create(**kwargs)
+            response = client.chat.completions.create(**kwargs)
             return response.choices[0].message.content or ""
         except Exception as exc:  # 需要把各类 SDK 异常统一成重试
             last_error = exc
-            logger.warning("模型调用失败（第 %d/%d 次）：%s", attempt, MAX_ATTEMPTS, exc)
+            logger.warning("模型调用失败（第 %d/%d 次）：%s", attempt, attempts, exc)
 
     raise BusinessError("AI 服务暂时不可用，请稍后重试", code=50031) from last_error
 
@@ -162,19 +252,29 @@ async def achat(
     thinking: bool = False,
     temperature: float | None = None,
 ) -> str:
-    """异步版 chat，供 asyncio.gather 并发调用。"""
+    """异步版 chat，供 asyncio.gather 并发调用。
+
+    异步调用也必须经过同步 chat 用的那道全局闸门，否则校对任务与体检端点
+    各算各的并发，实际模型调用量会突破配置上限。
+    """
     kwargs = _build_kwargs(messages, json_mode, thinking, temperature)
 
-    last_error: Exception | None = None
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        try:
-            response = await get_async_client().chat.completions.create(**kwargs)
-            return response.choices[0].message.content or ""
-        except Exception as exc:  # 统一重试
-            last_error = exc
-            logger.warning("异步模型调用失败（第 %d/%d 次）：%s", attempt, MAX_ATTEMPTS, exc)
+    # 排队在别的线程里等，不卡事件循环；取消时名额也会被还掉；拿到的名额在 finally 归还
+    slot = await _acquire_slot_async(float(settings.llm_queue_wait_seconds))
+    try:
+        attempts = max(1, int(settings.llm_max_attempts))
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                response = await get_async_client().chat.completions.create(**kwargs)
+                return response.choices[0].message.content or ""
+            except Exception as exc:  # 统一重试
+                last_error = exc
+                logger.warning("异步模型调用失败（第 %d/%d 次）：%s", attempt, attempts, exc)
 
-    raise BusinessError("AI 服务暂时不可用，请稍后重试", code=50031) from last_error
+        raise BusinessError("AI 服务暂时不可用，请稍后重试", code=50031) from last_error
+    finally:
+        _release_slot(slot)
 
 
 async def achat_json(

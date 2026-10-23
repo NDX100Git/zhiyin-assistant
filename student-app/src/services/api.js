@@ -106,3 +106,26 @@ export function uploadFile(filePath, fileName) {
     })
   })
 }
+
+/**
+ * 撤回一个还没下单的上传文件。
+ *
+ * 服务端会校验归属（只能删自己传的）与引用（已被订单、文件版本或待确认请求
+ * 引用的文件拒绝删除），因此这里不做任何本地猜测，失败就把原因原样交给页面。
+ */
+export function deleteUploadedFile(fileKey) {
+  return request('/api/file/delete', { method: 'POST', data: { file_key: fileKey } })
+}
+
+/**
+ * 服务端报价：只算不落库。
+ *
+ * 请求体与下单完全一致（文件清单 + 订单级四个参数），返回
+ * `{files: [{file_index, file_key, file_name, page_count, print_pages,
+ * print_side, color_mode, paper_size, copies, amount_cents}],
+ * page_count, print_page_count, amount_cents}`。
+ * 页面上的每份行金额与整单金额只能来自这里，不许前端自己乘单价。
+ */
+export function quoteOrder(payload) {
+  return request('/api/order/quote', { method: 'POST', data: payload })
+}

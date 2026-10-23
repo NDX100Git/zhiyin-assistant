@@ -9,27 +9,43 @@
     {
       "path": "pages/order/order",
       "style": {
-        "navigationBarTitleText": "AI 体检下单"
+        "navigationBarTitleText": "上传与下单"
       }
     },
     {
       "path": "pages/mine/mine",
       "style": {
-        "navigationBarTitleText": "我的订单"
+        "navigationBarTitleText": "我的订单",
+        "enablePullDownRefresh": true,
+        "backgroundTextStyle": "dark",
+        "h5": {
+          "enablePullDownRefresh": false
+        }
       }
     },
     {
       "path": "pages/mine/detail",
       "style": {
-        "navigationBarTitleText": "订单详情"
+        "navigationBarTitleText": "订单详情",
+        "enablePullDownRefresh": true,
+        "backgroundTextStyle": "dark",
+        "h5": {
+          "enablePullDownRefresh": false
+        }
+      }
+    },
+    {
+      "path": "pages/mine/replace",
+      "style": {
+        "navigationBarTitleText": "换文件"
       }
     }
   ],
   "tabBar": {
-    "color": "#7a869a",
-    "selectedColor": "#2f6bff",
-    "backgroundColor": "#ffffff",
-    "borderStyle": "white",
+    "color": "#67614f",
+    "selectedColor": "#d02d10",
+    "backgroundColor": "#f8f4e9",
+    "borderStyle": "black",
     "list": [
       {
         "pagePath": "pages/index/index",
@@ -48,7 +64,7 @@
   "globalStyle": {
     "navigationBarTextStyle": "black",
     "navigationBarTitleText": "智印助手",
-    "navigationBarBackgroundColor": "#ffffff",
-    "backgroundColor": "#f5f7fb"
+    "navigationBarBackgroundColor": "#f8f4e9",
+    "backgroundColor": "#e9e3d4"
   }
 }

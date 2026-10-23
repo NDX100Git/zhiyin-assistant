@@ -19,11 +19,15 @@ import app.models  # noqa: E402  确保所有表注册到 metadata
 from app.config import settings  # noqa: E402
 from app.database import get_db  # noqa: E402
 from app.main import app  # noqa: E402
+from app.migrations import run_migrations  # noqa: E402
 from app.models.base import Base  # noqa: E402
 from app.services import storage as storage_module  # noqa: E402
 
 TEST_DB_NAME = f"{settings.db_name}_test"
 TEST_BUCKET = f"{settings.minio_bucket}-test"
+
+# 单测不启动定时清理：TestClient 会触发 lifespan，后台任务会去扫真实数据库与对象存储
+settings.cleanup_enabled = False
 
 
 @pytest.fixture(scope="session")
@@ -44,6 +48,8 @@ def engine():
 
     test_engine = create_engine(url.set(database=TEST_DB_NAME), pool_pre_ping=True)
     Base.metadata.create_all(test_engine)
+    # 测试库可能由旧版本建过，create_all 不会给已有表加列；跑一遍幂等迁移
+    run_migrations(test_engine)
     yield test_engine
     test_engine.dispose()
 
@@ -60,6 +66,10 @@ def clean_tables(engine):
     with engine.begin() as conn:
         for table in reversed(Base.metadata.sorted_tables):
             conn.execute(text(f"TRUNCATE TABLE `{table.name}`"))
+    # 队列快照是进程内缓存，TRUNCATE 不会触发失效，用例之间必须显式清掉
+    from app.services import queue_snapshot
+
+    queue_snapshot.reset()
 
 
 @pytest.fixture
@@ -82,6 +92,22 @@ def client(db_session):
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_upload_time(monkeypatch):
+    """下单会校验文件新旧；单测里的 file_key 是假的，统一按「刚上传」处理。
+
+    要验证过期与文件缺失的用例在用例内部再 monkeypatch 覆盖即可。
+    """
+    from datetime import datetime
+
+    from app.services import order_service
+    from app.services.storage.minio_store import MinioStorage
+
+    monkeypatch.setattr(MinioStorage, "stat_modified", lambda self, key: datetime.now())
+    # 大多数接口用例使用假的 file_key，不进入真实文档解析；页数校验用例会覆盖这里。
+    monkeypatch.setattr(order_service, "_actual_page_count", lambda db, key: None)
 
 
 @pytest.fixture

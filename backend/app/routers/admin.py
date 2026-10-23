@@ -16,11 +16,12 @@ from app.schemas.admin import (
     AdminLoginRequest,
     BatchCompleteRequest,
     CompleteRequest,
+    FileChangeConfirmRequest,
     NoticeCreateRequest,
     SessionSwitchRequest,
     VerifyCodeRequest,
 )
-from app.services import admin_service
+from app.services import admin_service, file_change_service
 from app.services.auth import get_admin_auth_provider
 from app.utils.exceptions import BusinessError
 from app.utils.response import ok
@@ -58,10 +59,29 @@ def queue(
 @router.get("/order/{order_id}/download", summary="获取限时下载链接", response_model=None)
 def download(
     order_id: int,
+    file_index: int | None = Query(
+        default=None, ge=1, description="只取第几份文件；不传则返回全部文件链接"
+    ),
     _: str = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict:
-    return ok(admin_service.download_url(admin_service.get_order(db, order_id)))
+    order = admin_service.get_order(db, order_id)
+    return ok(admin_service.download_url(db, order, file_index))
+
+
+@router.post(
+    "/order/{order_id}/confirm-files-seen",
+    summary="老师确认已看到替换后的文件",
+    response_model=None,
+)
+def confirm_files_seen(
+    order_id: int,
+    operator: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict:
+    """老师重新下载后调用，清掉队列里的「文件已替换」标记。"""
+    order = admin_service.get_order(db, order_id)
+    return ok(admin_service.confirm_files_seen(db, order, operator))
 
 
 @router.post("/order/{order_id}/start", summary="开始打印", response_model=None)
@@ -73,6 +93,35 @@ def start(
     """queuing -> printing，并调用当前 PrinterProvider（V1 为手动打印）。"""
     order = admin_service.get_order(db, order_id)
     return ok(admin_service.start_print(db, order, operator))
+
+
+@router.post(
+    "/order/{order_id}/confirm-file-change",
+    summary="确认或驳回换文件",
+    response_model=None,
+)
+def confirm_file_change(
+    order_id: int,
+    payload: FileChangeConfirmRequest,
+    operator: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict:
+    """approve=true 时替换文件、按确认价落库并重新排到队尾；false 时保留原文件。"""
+    order = admin_service.get_order(db, order_id)
+    result = file_change_service.confirm_file_change(
+        db, order, payload.approve, payload.amount_cents, operator
+    )
+    view = admin_service.order_admin_view(db, order)
+    return ok(
+        {
+            "order": view,
+            "approved": bool(result["approved"]),
+            "file_change": view["file_change"],
+            "amount_cents": order.amount_cents,
+            "supplement_cents": result.get("supplement_cents", 0),
+            "paid_total_cents": result.get("paid_total_cents", 0),
+        }
+    )
 
 
 @router.post("/order/{order_id}/complete", summary="打印完成（可改价）", response_model=None)
@@ -95,7 +144,7 @@ def quote(
     db: Session = Depends(get_db),
 ) -> dict:
     order = admin_service.get_order(db, order_id)
-    return ok(admin_service.quote_amount(order))
+    return ok(admin_service.quote_amount(db, order))
 
 
 @router.post("/order/batch-complete", summary="批量标记完成", response_model=None)

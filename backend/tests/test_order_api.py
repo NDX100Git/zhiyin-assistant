@@ -3,16 +3,23 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 
 import pytest
 from sqlalchemy import select
 
+from app.config import settings
 from app.models.notification import Notification
 from app.models.order import Order
 from app.models.payment_log import PaymentLog
 from app.models.print_log import PrintLog
+from app.models.uploaded_file import UploadedFile
+from app.utils.security import decode_token
 
 PDF_BYTES = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< >>\n%%EOF\n"
+
+# 下单要求每份文件都有本人的上传记录；本模块的 file_key 是造的，登录后统一登记
+_SESSION = None
 
 ORDER_PAYLOAD = {
     "file_key": "files/2026/10/abcdef0123456789abcdef0123456789.pdf",
@@ -39,7 +46,7 @@ def open_session(monkeypatch):
     _patch_session(
         monkeypatch,
         {
-            "date": "2026-10-17",
+            "date": date.today().isoformat(),
             "session": "pm",
             "label": "下午",
             "is_open": True,
@@ -59,7 +66,7 @@ def closed_session(monkeypatch):
     _patch_session(
         monkeypatch,
         {
-            "date": "2026-10-17",
+            "date": date.today().isoformat(),
             "session": "pm",
             "label": "下午",
             "is_open": False,
@@ -79,7 +86,7 @@ def outside_window(monkeypatch):
     _patch_session(
         monkeypatch,
         {
-            "date": "2026-10-17",
+            "date": date.today().isoformat(),
             "session": None,
             "label": "",
             "is_open": False,
@@ -93,10 +100,41 @@ def outside_window(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def capture_session(db_session):
+    """把测试会话存到模块里，供 register_order_file 使用。"""
+    global _SESSION
+    _SESSION = db_session
+    yield
+    _SESSION = None
+
+
+def register_order_file(user_id: int) -> None:
+    """把 ORDER_PAYLOAD 里的文件登记成该用户的上传记录。"""
+    key = ORDER_PAYLOAD["file_key"]
+    existing = _SESSION.execute(
+        select(UploadedFile).where(UploadedFile.file_key == key)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return
+    _SESSION.add(
+        UploadedFile(
+            user_id=user_id,
+            file_key=key,
+            file_name=ORDER_PAYLOAD["file_name"],
+            size=0,
+            content_type="application/pdf",
+        )
+    )
+    _SESSION.commit()
+
+
 def login(client, device_id: str = "order-device-0001") -> str:
     body = client.post("/api/auth/login", json={"device_id": device_id}).json()
     assert body["code"] == 0, body
-    return body["data"]["token"]
+    token = body["data"]["token"]
+    register_order_file(int(decode_token(token)["sub"]))
+    return token
 
 
 def auth(token: str) -> dict[str, str]:
@@ -112,12 +150,28 @@ def test_下单返回服务端生成的订单号与取件码(client, open_sessio
     body = client.post("/api/order/create", json=ORDER_PAYLOAD, headers=auth(token)).json()
     assert body["code"] == 0, body
     data = body["data"]
-    assert re.fullmatch(r"\d{4}-\d{3}", data["order_no"])
-    assert re.fullmatch(r"[A-Z]-\d{2}", data["pickup_code"])
+    assert re.fullmatch(r"\d{6}-\d{3}", data["order_no"])
+    assert re.fullmatch(r"\d{6}-[0-9A-Z]-[0-9A-Z]{2}", data["pickup_code"])
     assert data["status"] == "pending_pay"
     assert data["status_label"] == "待支付"
     # 42 页 × 15 分 × 1 份 = 630 分
     assert data["amount_cents"] == 630
+
+
+def test_下单页数与实际文件不一致被拒(client, open_session, monkeypatch):
+    token = login(client)
+    monkeypatch.setattr(
+        "app.services.order_service._actual_page_count",
+        lambda db, file_key: 7,
+    )
+
+    body = client.post(
+        "/api/order/create",
+        json=ORDER_PAYLOAD,
+        headers=auth(token),
+    ).json()
+    assert body["code"] == 40054
+    assert "实际为 7 页" in body["message"]
 
 
 def test_截单后仍可下单并提示排到下一个时段(client, closed_session):
@@ -263,3 +317,31 @@ def test_首页在截单时仍可下单并给出取件提示(client, closed_sess
     assert data["order_session"]["can_order"] is True
     assert data["order_session"]["deferred"] is True
     assert "下一个打印时段" in data["order_session"]["hint"]
+
+
+def test_上传超过宽限期下单被拒(client, open_session, monkeypatch) -> None:
+    """订单引用的文件过期后不该还能下单，否则打印时才发现文件没了。"""
+    from datetime import datetime, timedelta
+
+    from app.services.storage.minio_store import MinioStorage
+
+    stale = datetime.now() - timedelta(hours=settings.order_file_grace_hours + 1)
+    monkeypatch.setattr(MinioStorage, "stat_modified", lambda self, key: stale)
+
+    token = login(client)
+    body = client.post("/api/order/create", json=ORDER_PAYLOAD, headers=auth(token)).json()
+
+    assert body["code"] == 40052
+    assert "重新上传" in body["message"]
+
+
+def test_文件已不存在时下单给出人话提示(client, open_session, monkeypatch) -> None:
+    from app.services.storage.minio_store import MinioStorage
+
+    monkeypatch.setattr(MinioStorage, "stat_modified", lambda self, key: None)
+
+    token = login(client)
+    body = client.post("/api/order/create", json=ORDER_PAYLOAD, headers=auth(token)).json()
+
+    assert body["code"] == 40053
+    assert "重新上传" in body["message"]

@@ -6,15 +6,30 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import date as date_type
 from datetime import datetime, timedelta
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from app.config import get_order_rules
 from app.models.notice import Notice
 from app.models.order import Order
 from app.models.payment_log import PaymentLog
+from app.services.file_change_service import (
+    batch_pending_changes,
+    expire_pending_changes,
+    pending_change_view,
+)
+from app.services.order_file_service import (
+    batch_files_view,
+    ensure_files,
+    file_to_dict,
+    files_view,
+    is_file_unconfirmed,
+    system_total_cents,
+)
 from app.services.order_state import (
     ADMIN_CANCELLABLE,
     STATUS_ABNORMAL,
@@ -25,14 +40,31 @@ from app.services.order_state import (
     record_log,
     status_label,
 )
-from app.services.pricing import calc_amount_cents
 from app.services.printer import get_printer_provider
-from app.services.queue_service import order_wait_info
+from app.services.queue_service import batch_wait_info, order_wait_info, queue_order_by
 from app.services.session_service import get_or_create_session
 from app.services.storage import get_storage
 from app.utils.exceptions import BusinessError
 
 logger = logging.getLogger(__name__)
+
+# 区分「调用方没传」与「明确没有待确认请求」：队列接口批量查到 None 时要传 None
+_UNSET = object()
+
+def _short_code_pattern() -> re.Pattern[str]:
+    """老师手输的当天短码，如 0-01。按取件码配置生成，改进制与长度不用改这里。"""
+    rules = get_order_rules()["pickup_code"]
+    alphabet = re.escape(str(rules["alphabet"]))
+    length = int(rules["length"])
+    separator_after = int(rules.get("separator_after", 1))
+    if 0 < separator_after < length:
+        return re.compile(
+            rf"^[{alphabet}]{{{separator_after}}}-[{alphabet}]{{{length - separator_after}}}$"
+        )
+    return re.compile(rf"^[{alphabet}]{{{length}}}$")
+
+
+PICKUP_SHORT_CODE_RE = _short_code_pattern()
 
 
 def get_order(db: Session, order_id: int) -> Order:
@@ -42,9 +74,18 @@ def get_order(db: Session, order_id: int) -> Order:
     return order
 
 
-def order_admin_view(db: Session, order: Order) -> dict:
-    """老师端订单视图：含打印参数与排队信息。"""
-    wait = order_wait_info(db, order)
+def order_admin_view(db: Session, order: Order, wait: dict | None = None,
+                     file_change: dict | object | None = _UNSET,
+                     files: list[dict] | object | None = _UNSET) -> dict:
+    """老师端订单视图：含打印参数、文件清单与排队信息。
+
+    wait / file_change / files 可由调用方批量算好后传入；不传时单独查一次。
+    """
+    wait = wait or order_wait_info(db, order)
+    if file_change is _UNSET:
+        file_change = pending_change_view(db, order.id)
+    if files is _UNSET:
+        files = files_view(db, order)
     return {
         "id": order.id,
         "order_no": order.order_no,
@@ -54,6 +95,7 @@ def order_admin_view(db: Session, order: Order) -> dict:
         "file_key": order.file_key,
         "file_name": order.file_name,
         "page_count": order.page_count,
+        "print_page_count": int(order.print_page_count or 0),
         "print_side": order.print_side,
         "color_mode": order.color_mode,
         "copies": order.copies,
@@ -62,12 +104,18 @@ def order_admin_view(db: Session, order: Order) -> dict:
         "paid": order.paid,
         "pay_method": order.pay_method,
         "created_at": order.created_at.isoformat() if order.created_at else None,
+        "requeue_at": order.requeue_at.isoformat() if order.requeue_at else None,
+        "file_changed_at": order.file_changed_at.isoformat() if order.file_changed_at else None,
+        "files_seen_at": order.files_seen_at.isoformat() if order.files_seen_at else None,
+        "files_unconfirmed": is_file_unconfirmed(order),
         "printed_at": order.printed_at.isoformat() if order.printed_at else None,
         "picked_at": order.picked_at.isoformat() if order.picked_at else None,
         "remark": order.remark,
         "cancel_reason": order.cancel_reason,
         "queue_position": wait["queue_position"],
         "estimated_minutes": wait["estimated_minutes"],
+        "files": files,
+        "file_change": file_change,
     }
 
 
@@ -88,47 +136,107 @@ def queue_list(db: Session, status: str | None = None, keyword: str | None = Non
         db.execute(
             select(Order)
             .where(*condition)
-            .order_by(Order.order_no.asc(), Order.id.asc())
+            .order_by(*queue_order_by())
             .offset((page - 1) * page_size)
             .limit(page_size)
         ).scalars()
     )
+    waits = batch_wait_info(db, rows)
+    changes = batch_pending_changes(db, [order.id for order in rows])
+    files = batch_files_view(db, rows)
     return {
         "total": int(total),
         "page": page,
         "page_size": page_size,
-        "items": [order_admin_view(db, order) for order in rows],
+        "items": [
+            order_admin_view(
+                db, order, waits.get(order.id), changes.get(order.id), files.get(order.id)
+            )
+            for order in rows
+        ],
     }
 
 
-def download_url(order: Order) -> dict:
-    """给老师发限时签名下载链接（私有桶，禁止公开读）。"""
-    if not order.file_key:
+def download_url(db: Session, order: Order, file_index: int | None = None) -> dict:
+    """给老师发限时签名下载链接（私有桶，禁止公开读）。
+
+    不传 file_index 时返回全部文件链接，同时保留顶层的首份文件链接作为旧接口兼容。
+    """
+    rows = ensure_files(db, order)
+    if not rows:
         raise BusinessError("该订单没有关联文件", code=40402)
+    target = rows[0]
+    if file_index is not None:
+        target = next(
+            (row for row in rows if int(row.file_index) == int(file_index)), None
+        )
+        if target is None:
+            raise BusinessError(
+                f"订单里没有第 {file_index} 份文件，请刷新后重试", code=40405
+            )
+    storage = get_storage()
+    items = [
+        {**file_to_dict(row, order), "signed_url": storage.signed_url(row.file_key)}
+        for row in rows
+    ]
+    if not items and order.file_key:
+        # 老订单迁移未回填时，兜底给第 1 份文件的链接
+        for view in files_view(db, order):
+            items.append(
+                {**view, "signed_url": storage.signed_url(view["file_key"])}
+            )
+    primary = next(
+        (item for item in items if item["file_index"] == int(target.file_index)),
+        items[0] if items else None,
+    )
     return {
         "order_id": order.id,
-        "file_key": order.file_key,
-        "file_name": order.file_name,
-        "signed_url": get_storage().signed_url(order.file_key),
+        "file_index": primary["file_index"] if primary else None,
+        "file_key": primary["file_key"] if primary else None,
+        "file_name": primary["file_name"] if primary else None,
+        "signed_url": primary["signed_url"] if primary else "",
+        "files": items,
     }
 
 
 def start_print(db: Session, order: Order, operator: str) -> dict:
-    """开始打印：queuing -> printing，并交给当前 PrinterProvider。"""
+    """开始打印：queuing -> printing，并交给当前 PrinterProvider。
+
+    订单一旦进入打印中就不能再换文件，所以先把待确认请求置为失效，
+    避免老师在打印后才看到一个无法执行的确认请求。
+    """
+    expire_pending_changes(db, order.id, "订单已开始打印，换文件请求失效", operator)
     change_status(db, order, STATUS_PRINTING, operator=operator, note="老师开始打印")
-    file_url = get_storage().signed_url(order.file_key) if order.file_key else ""
+    storage = get_storage()
+    rows = files_view(db, order)
+    file_links = [
+        {**row, "signed_url": storage.signed_url(row["file_key"])} for row in rows
+    ]
+    file_url = file_links[0]["signed_url"] if file_links else ""
     job = get_printer_provider().print(order, file_url)
+    job["files"] = file_links
     db.commit()
     db.refresh(order)
     return {"order": order_admin_view(db, order), "print_job": job}
 
 
+def confirm_files_seen(db: Session, order: Order, operator: str) -> dict:
+    """老师重新下载后确认已看到当前文件，清掉「文件已替换」标记。"""
+    order.files_seen_at = datetime.now()  # 服务端时间
+    record_log(
+        db, order, "note",
+        note="老师已重新下载并确认当前文件",
+        operator=operator,
+    )
+    db.commit()
+    db.refresh(order)
+    return order_admin_view(db, order)
+
+
 def complete_print(db: Session, order: Order, operator: str,
                    amount_cents: int | None = None) -> dict:
     """打印完成：printing -> ready，系统计价预填，老师可改（改价写日志留痕）。"""
-    system_amount = calc_amount_cents(
-        order.page_count or 1, order.print_side or 2, order.color_mode or 0, order.copies or 1
-    )
+    system_amount = system_total_cents(db, order)
     final_amount = system_amount if amount_cents is None else int(amount_cents)
     if final_amount < 0:
         raise BusinessError("金额不能为负数", code=40061)
@@ -220,21 +328,43 @@ def verify_pickup(db: Session, order: Order, operator: str) -> dict:
     }
 
 
+def _normalize_pickup_code(raw: str, now: datetime | None = None) -> str:
+    """规整取件码。
+
+    老师可只输当天的短码（A-01），这里按服务器当天补成完整码（261017-A-01）；
+    扫码与学生端展示的都是完整码，原样匹配。跨天的遗留单只能用完整码。
+    """
+    code = "".join((raw or "").split()).upper()
+    if not code:
+        return ""
+    if PICKUP_SHORT_CODE_RE.fullmatch(code):
+        today = (now or datetime.now()).date()
+        return f"{today:%y%m%d}-{code}"
+    return code
+
+
 def verify_by_code(db: Session, pickup_code: str, operator: str) -> dict:
     """按取件码核销（老师扫码或手动输入）。"""
-    code = (pickup_code or "").strip().upper()
+    code = _normalize_pickup_code(pickup_code)
     if not code:
         raise BusinessError("请输入取件码", code=40001)
 
-    order = db.execute(
-        select(Order)
-        .where(Order.pickup_code == code, Order.status == STATUS_READY)
-        .order_by(Order.created_at.desc(), Order.id.desc())
-        .limit(1)
-    ).scalar_one_or_none()
-    if order is None:
+    orders = list(
+        db.execute(
+            select(Order)
+            .where(Order.pickup_code == code, Order.status == STATUS_READY)
+            .order_by(Order.created_at.desc(), Order.id.desc())
+            .limit(2)
+        ).scalars()
+    )
+    if not orders:
         raise BusinessError(f"没有找到取件码 {code} 对应的待取件订单", code=40401)
-    return verify_pickup(db, order, operator)
+    if len(orders) > 1:
+        # 唯一索引下不会发生；只有历史重码数据才会走到，宁可拒绝也不能核销错单
+        raise BusinessError(
+            f"取件码 {code} 命中多张待取件单，请用完整取件码或订单号核销", code=40902
+        )
+    return verify_pickup(db, orders[0], operator)
 
 
 def mark_abnormal(db: Session, order: Order, reason: str | None, operator: str) -> dict:
@@ -264,6 +394,7 @@ def cancel_abnormal(db: Session, order: Order, reason: str | None, operator: str
         )
     note = (reason or "").strip() or "老师关闭异常单"
     order.cancel_reason = note
+    expire_pending_changes(db, order.id, "异常单已关闭，换文件请求失效", operator)
     change_status(db, order, "cancelled", operator=operator, note=note)
     db.commit()
     db.refresh(order)
@@ -299,11 +430,9 @@ def today_summary(db: Session) -> dict:
     }
 
 
-def quote_amount(order: Order) -> dict:
-    """打印完成前的系统报价（老师端弹窗预填用）。"""
-    system_amount = calc_amount_cents(
-        order.page_count or 1, order.print_side or 2, order.color_mode or 0, order.copies or 1
-    )
+def quote_amount(db: Session, order: Order) -> dict:
+    """打印完成前的系统报价（老师端弹窗预填用）：按逐份参数整单累加。"""
+    system_amount = system_total_cents(db, order)
     return {
         "order_id": order.id,
         "system_amount_cents": system_amount,

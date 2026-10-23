@@ -1,8 +1,11 @@
 """格式校验与版式诊断服务（阶段 5-B）。
 
 架构：规则引擎（format_rules_engine，确定性事实）+ 大模型（语义判断）混合。
-- 规则引擎：空白页、图片超出页边距、页边距偏差、结构要素缺失/乱序
+- 规则引擎：空白页、图片超出页边距、图片分辨率过低、页边距偏差、结构要素缺失/乱序、
+  正文字体字号行距、表格末尾大片空行空列、表格打印字号过小
 - 大模型：参考文献著录规范（GB/T 7714）、结构问题表述、版式问题与目录页码一致性
+
+报告同时给出「总页数 / 单面张数 / 双面张数」与表格归一后的中位字号，避免把页数当张数。
 
 铁律：AI 结果只作建议，绝不自动修改用户文档；修复必须由用户勾选后再执行。
 """
@@ -20,7 +23,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_format_rules
 from app.services.doc_parser import get_cached_report, parse_document, save_report
-from app.services.format_rules_engine import collect_facts
+from app.services.format_rules_engine import collect_facts, sheet_count_info
 from app.services.llm import chat_json
 from app.utils.exceptions import BusinessError
 from app.utils.filetype import normalize_ext
@@ -158,7 +161,8 @@ def build_layout_messages(rules: dict, parsed: dict, facts: list[dict]) -> list[
         f"页面结构数据：\n{_dump(payload)}\n\n"
         "检查项：图片是否超出页边距、是否存在异常空白页、页边距是否与规则不符、"
         "目录页码与实际页码是否可能不一致。\n"
-        "注意：页边距是否合规已由规则引擎按容差判断（见客观事实），你不需要重复报告页边距问题。\n"
+        "注意：页边距、图片越界与图片有效分辨率已由规则引擎判断（见客观事实），"
+        "你不需要重复报告这些确定性问题。\n"
         f"输出格式（必须是合法 JSON，issues 可以为空数组）：\n{_dump(output_schema)}"
     )
     return [
@@ -197,9 +201,14 @@ def _normalize_location(location: str) -> str:
 
 
 def merge_issues(rule_issues: list[dict], ai_issues: list[dict]) -> list[dict]:
-    """合并规则与模型结果：同一位置同一类型以规则引擎为准，避免重复报同一问题。"""
+    """合并规则与模型结果：同一位置同一类型以规则引擎为准，避免重复报同一问题。
+
+    规则内部可能在同一页产出多条不同问题（如图片越界与分辨率过低），这些都要保留；
+    模型结果只要与规则结果同类型同位置就跳过，避免换个说法重复报。
+    """
     merged: list[dict] = []
     seen: set[tuple[str, str]] = set()
+    seen_rule: set[tuple[str, str, str]] = set()
 
     # 规则引擎已确认缺失的结构要素，避免模型换个说法重复报一次
     covered_sections: set[str] = set()
@@ -207,11 +216,13 @@ def merge_issues(rule_issues: list[dict], ai_issues: list[dict]) -> list[dict]:
         if issue["type"] == "structure":
             covered_sections.update(SECTION_PATTERN.findall(f"{issue['original']}{issue['suggestion']}"))
 
-    # 规则结果全部保留；只有模型结果需要做"同一结构要素已报过"的跳过判断
     for issue in rule_issues:
-        key = (issue["type"], _normalize_location(issue["location"]))
-        if key in seen:
+        location = _normalize_location(issue["location"])
+        key = (issue["type"], location)
+        rule_key = (issue["type"], location, str(issue["original"]))
+        if rule_key in seen_rule:
             continue
+        seen_rule.add(rule_key)
         seen.add(key)
         merged.append(dict(issue))
 
@@ -270,7 +281,7 @@ def effective_rules(rules: dict, profile: str) -> dict:
 PROFILE_NOTES = {
     "paper": "",
     "slide": "演示文稿按版式检查：不套用论文的结构与参考文献规范，重点看图片越界与空白页。",
-    "sheet": "表格文档按基础版式检查：不套用论文结构与参考文献规范。",
+    "sheet": "表格文档按基础版式检查：不套用论文结构与参考文献规范，另检查末尾空行空列、打印字号与图片分辨率。",
 }
 
 
@@ -319,6 +330,8 @@ def check_format(db: Session, file_key: str, force: bool = False) -> dict:
         "page_count": parsed.get("page_count"),
         "sections": parsed.get("sections", []),
         "reference_count": len(parsed.get("references", [])),
+        "sheet_info": sheet_count_info(parsed),
+        "spreadsheet": parsed.get("spreadsheet"),
         "issues": issues,
         "rule_issue_count": sum(1 for issue in issues if issue["source"] == "rule"),
         "ai_issue_count": sum(1 for issue in issues if issue["source"] == "ai"),

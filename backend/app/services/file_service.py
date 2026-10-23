@@ -9,11 +9,19 @@ from __future__ import annotations
 import logging
 import shutil
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import UploadFile
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.config import BACKEND_DIR, get_upload_rules, settings
+from app.models.order import Order
+from app.models.order_file import OrderFile
+from app.models.order_file_change import CHANGE_PENDING, OrderFileChange
+from app.models.order_file_version import OrderFileVersion
+from app.models.uploaded_file import UploadedFile
 from app.models.user import User
 from app.services.storage import build_object_key, get_storage
 from app.utils.exceptions import BusinessError
@@ -23,6 +31,27 @@ logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 1024 * 1024
 RUNTIME_TMP_DIR = BACKEND_DIR / "runtime" / "tmp"
+
+
+def ensure_files_owned_by(db: Session, user: User, file_keys: list[str]) -> None:
+    """确认每个文件都有当前用户的上传记录。
+
+    「不存在」和「属于别人」使用同一个错误，避免泄露别人的文件状态。
+    """
+    keys = list(dict.fromkeys(str(key) for key in file_keys if key))
+    if not keys:
+        return
+    owners = {
+        str(file_key): int(owner_id)
+        for file_key, owner_id in db.execute(
+            select(UploadedFile.file_key, UploadedFile.user_id).where(
+                UploadedFile.file_key.in_(keys)
+            )
+        ).all()
+    }
+    for file_key in keys:
+        if owners.get(file_key) != int(user.id):
+            raise BusinessError("文件不存在或不属于当前用户，请重新上传", code=40404)
 
 
 def _save_to_temp(upload: UploadFile, ext: str, max_bytes: int) -> tuple[Path, Path, int]:
@@ -58,7 +87,59 @@ def _save_to_temp(upload: UploadFile, ext: str, max_bytes: int) -> tuple[Path, P
         raise
 
 
-def store_upload(user: User, upload: UploadFile) -> dict:
+def _record_upload(
+    db: Session | None,
+    user: User,
+    *,
+    file_key: str,
+    file_name: str,
+    size: int,
+    content_type: str,
+) -> datetime:
+    """写入上传记录，供学生撤回时做归属校验。"""
+    now = datetime.now()
+    if db is not None:
+        db.add(
+            UploadedFile(
+                user_id=user.id,
+                file_key=file_key,
+                file_name=file_name,
+                size=int(size),
+                content_type=content_type,
+                created_at=now,
+            )
+        )
+        db.commit()
+    return now
+
+
+def record_generated_upload(
+    db: Session | None,
+    user: User,
+    *,
+    file_key: str,
+    file_name: str,
+    size: int,
+    content_type: str,
+) -> None:
+    """把服务端生成的文件（AI 修复、PDF 转 Word）也写进上传记录。
+
+    对象存储不记归属，只有上传记录能回答「这个文件是谁的」。少了这一行，
+    学生点「移除」会被归属校验挡住：界面上文件消失了，对象却一直留在桶里。
+    """
+    if db is None:
+        return
+    _record_upload(
+        db,
+        user,
+        file_key=file_key,
+        file_name=file_name,
+        size=size,
+        content_type=content_type,
+    )
+
+
+def store_upload(user: User, upload: UploadFile, db: Session | None = None) -> dict:
     """校验并保存上传文件，返回上传结果（含 30 分钟签名 URL）。"""
     rules = get_upload_rules()
     max_bytes = int(rules["max_size_mb"]) * 1024 * 1024
@@ -97,6 +178,14 @@ def store_upload(user: User, upload: UploadFile) -> dict:
         signed_url = storage.signed_url(key)
 
         logger.info("用户 %s 上传文件 %s -> %s (%d 字节)", user.id, filename, key, size)
+        uploaded_at = _record_upload(
+            db,
+            user,
+            file_key=key,
+            file_name=filename,
+            size=size,
+            content_type=content_type,
+        )
         return {
             "file_key": key,
             "file_name": filename,
@@ -104,6 +193,7 @@ def store_upload(user: User, upload: UploadFile) -> dict:
             "content_type": content_type,
             "signed_url": signed_url,
             "expires_minutes": settings.signed_url_expire_minutes,
+            "uploaded_at": uploaded_at.isoformat(),
         }
     finally:
         if tmp_dir is not None:
@@ -113,7 +203,7 @@ def store_upload(user: User, upload: UploadFile) -> dict:
 DEMO_FILE_NAME = "智印助手示例论文.docx"
 
 
-def load_demo_document(user: User) -> dict:
+def load_demo_document(user: User, db: Session | None = None) -> dict:
     """生成并上传一份服务端示例论文，作为 App 端选文件失败时的演示兜底。
 
     示例文档含格式错误（缺目录、图片超边距、参考文献著录错误等），
@@ -132,6 +222,14 @@ def load_demo_document(user: User) -> dict:
     signed_url = storage.signed_url(key)
 
     logger.info("用户 %s 载入示例论文 -> %s", user.id, key)
+    uploaded_at = _record_upload(
+        db,
+        user,
+        file_key=key,
+        file_name=DEMO_FILE_NAME,
+        size=size,
+        content_type=MIME_BY_EXT["docx"],
+    )
     return {
         "file_key": key,
         "file_name": DEMO_FILE_NAME,
@@ -139,5 +237,55 @@ def load_demo_document(user: User) -> dict:
         "content_type": MIME_BY_EXT["docx"],
         "signed_url": signed_url,
         "expires_minutes": settings.signed_url_expire_minutes,
+        "uploaded_at": uploaded_at.isoformat(),
         "is_demo": True,
     }
+
+
+def _file_is_referenced(db: Session, file_key: str) -> bool:
+    """文件被订单、文件版本或待确认换文件请求引用时，不能撤回。"""
+    checks = (
+        select(Order.id).where(Order.file_key == file_key).limit(1),
+        select(OrderFile.id).where(OrderFile.file_key == file_key).limit(1),
+        select(OrderFileVersion.id).where(OrderFileVersion.file_key == file_key).limit(1),
+        select(OrderFileChange.id)
+        .where(
+            OrderFileChange.new_file_key == file_key,
+            OrderFileChange.status == CHANGE_PENDING,
+        )
+        .limit(1),
+    )
+    return any(db.execute(statement).first() is not None for statement in checks)
+
+
+def delete_uploaded_file(db: Session, user: User, file_key: str) -> dict:
+    """学生撤回还没下单的上传文件：校验归属与引用，删对象和上传记录。"""
+    key = (file_key or "").strip()
+    if not key.startswith("files/"):
+        raise BusinessError("文件标识无效", code=40041)
+
+    record = db.execute(
+        select(UploadedFile).where(
+            UploadedFile.file_key == key,
+            UploadedFile.user_id == user.id,
+        )
+    ).scalar_one_or_none()
+    if record is None:
+        # 不区分「不存在」与「不是你的」，避免泄露别人的文件标识
+        raise BusinessError("文件不存在或不属于当前用户", code=40404)
+
+    if _file_is_referenced(db, key):
+        raise BusinessError(
+            "文件已被订单引用，不能撤回；如需更换请在订单里换文件", code=40920
+        )
+
+    try:
+        get_storage().delete(key)
+    except Exception as exc:
+        logger.exception("撤回文件时对象存储删除失败：%s", key)
+        raise BusinessError("文件删除失败，请稍后重试", code=50030) from exc
+
+    db.delete(record)
+    db.commit()
+    logger.info("用户 %s 撤回上传文件 %s", user.id, key)
+    return {"file_key": key, "deleted": True}

@@ -6,17 +6,36 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.config import get_order_rules
+from app.config import get_order_rules, settings
 from app.models.order import Order
 from app.models.payment_log import PaymentLog
+from app.models.queue_session import QueueSession
 from app.models.user import User
+from app.services import queue_snapshot
+from app.services.file_change_service import (
+    batch_pending_changes,
+    create_initial_version,
+    expire_pending_changes,
+    pending_change_view,
+)
+from app.services.file_service import ensure_files_owned_by
 from app.services.notifier import get_notifier
+from app.services.order_file_service import (
+    batch_files_view,
+    create_order_files,
+    files_view,
+    is_file_unconfirmed,
+    items_totals,
+    normalize_file_items,
+    quote_items,
+    validate_print_params,
+)
 from app.services.order_state import (
     STATUS_CANCELLED,
     STATUS_PENDING_PAY,
@@ -26,109 +45,209 @@ from app.services.order_state import (
     status_label,
 )
 from app.services.payment import get_payment_provider
-from app.services.pricing import calc_amount_cents
-from app.services.queue_service import new_order_wait_info, order_wait_info
+from app.services.queue_service import batch_wait_info, new_order_wait_info, order_wait_info
 from app.services.session_service import current_session_info, get_or_create_session
+from app.services.storage import get_storage
 from app.utils.exceptions import BusinessError
 
 logger = logging.getLogger(__name__)
 
-MAX_ORDER_NO_ATTEMPTS = 5
+# 区分「调用方没传」与「明确没有待确认请求」：列表接口批量查到 None 时要传 None
+_UNSET = object()
+
+def _next_daily_seq(db: Session, day: date) -> int:
+    """取当日的下一个序号，订单号与取件码共用它。
+
+    `INSERT ... ON DUPLICATE KEY UPDATE` 在 MySQL 上是一条语句完成的原子自增，
+    行锁持有到事务结束，同一刻的并发请求会排队，不会读到同一个数，也不需要失败重试。
+    """
+    db.execute(
+        text(
+            "INSERT INTO order_daily_seq (day, last_seq) VALUES (:day, 1) "
+            "ON DUPLICATE KEY UPDATE last_seq = last_seq + 1"
+        ),
+        {"day": day},
+    )
+    return int(
+        db.execute(
+            text("SELECT last_seq FROM order_daily_seq WHERE day = :day"), {"day": day}
+        ).scalar_one()
+    )
 
 
-def _day_start(now: datetime) -> datetime:
-    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+def build_pickup_code(seq: int, day: date) -> str:
+    """取件码：日期前缀加当日序号，如 261017-0-01。
 
+    日期必须进码。不带日期的话每天从头开始，跳天就撞；只带月日则每年同日还会撞，
+    唯一索引会在明年那天直接挡住下单。
 
-def _next_daily_seq(db: Session, now: datetime) -> int:
-    """当日序号：已有订单数 + 1。配合 order_no 唯一索引与失败重试保证唯一。"""
-    total = db.execute(
-        select(func.count()).select_from(Order).where(Order.created_at >= _day_start(now))
-    ).scalar_one()
-    return int(total) + 1
-
-
-def build_pickup_code(seq: int) -> str:
-    """按当日顺序生成取件码，如 A-01、B-12。"""
+    短码是三十六进制（数字加大小写不敏感的字母），三位给到 46656 个每天每站点，
+    中间插一个短横只是为了让老师念得清，不参与进制。
+    """
     rules = get_order_rules()["pickup_code"]
-    letters = str(rules["letters"])
-    per_letter = int(rules["numbers_per_letter"])
-    letter_index, number = divmod(seq - 1, per_letter)
-    if letter_index >= len(letters):
-        raise BusinessError("今日取件码已用完，请明天再来", code=40051)
-    return f"{letters[letter_index]}-{number + 1:02d}"
+    alphabet = str(rules["alphabet"])
+    length = int(rules["length"])
+    separator_after = int(rules.get("separator_after", 1))
+    base = len(alphabet)
+
+    capacity = base**length
+    if seq < 1 or seq > capacity:
+        raise BusinessError(
+            f"今日取件码 {capacity} 个已用完，请明天再来", code=40051
+        )
+
+    digits = []
+    value = seq - 1
+    for _ in range(length):
+        value, remainder = divmod(value, base)
+        digits.append(alphabet[remainder])
+    short = "".join(reversed(digits))
+
+    if 0 < separator_after < length:
+        short = f"{short[:separator_after]}-{short[separator_after:]}"
+    return f"{day:%y%m%d}-{short}"
 
 
 def _validate_create(payload, limits: dict) -> None:
-    if not payload.file_key or not str(payload.file_key).startswith("files/"):
-        raise BusinessError("文件标识无效，请重新上传", code=40041)
-    if payload.print_side not in (1, 2):
-        raise BusinessError("打印方式只能是单面或双面", code=40042)
-    if payload.color_mode not in (0, 1):
-        raise BusinessError("颜色模式只能是黑白或彩色", code=40043)
-    if not 1 <= int(payload.copies) <= int(limits["max_copies"]):
-        raise BusinessError(f"份数必须在 1 到 {limits['max_copies']} 之间", code=40044)
-    if not 1 <= int(payload.page_count) <= int(limits["max_page_count"]):
-        raise BusinessError(f"页数必须在 1 到 {limits['max_page_count']} 之间", code=40045)
-    if payload.paper_size not in limits["allowed_paper_sizes"]:
-        raise BusinessError(
-            f"纸张规格不支持：{payload.paper_size}，可选 {'、'.join(limits['allowed_paper_sizes'])}",
-            code=40046,
-        )
+    # 订单级参数与逐份参数走同一套校验，错误码也一致
+    validate_print_params(
+        payload.print_side, payload.color_mode, payload.paper_size, payload.copies, limits
+    )
     if payload.remark and len(payload.remark) > int(limits["max_remark_length"]):
         raise BusinessError(f"备注最多 {limits['max_remark_length']} 个字符", code=40047)
 
 
-def create_order(db: Session, user: User, payload) -> Order:
-    """下单：状态置 pending_pay，返回带订单号与取件码的订单。"""
+def _validate_file_freshness(file_key: str) -> None:
+    """下单时校验文件还在、且没超过下单宽限期。
+
+    文件在上传后一段时间会被清理，学生"晚上传、隔几天再下单"就会引用到已删对象。
+    与其等到打印时才发现，不如在下单那一刻说清楚。
+    """
+    grace_hours = int(settings.order_file_grace_hours)
+    modified = get_storage().stat_modified(file_key)
+    if modified is None:
+        raise BusinessError("文件已不存在，请重新上传", code=40053)
+
+    reference = modified.astimezone().replace(tzinfo=None) if modified.tzinfo else modified
+    uploaded_ago = datetime.now() - reference
+    if uploaded_ago > timedelta(hours=grace_hours):
+        raise BusinessError(
+            f"文件已过期（上传超过 {grace_hours} 小时），请重新上传后再下单",
+            code=40052,
+        )
+
+
+def _validate_file_owner(db: Session, user: User, items: list[dict]) -> None:
+    """逐个校验文件归属：没有上传记录、或记录不是本人，一律拒绝。
+
+    文件标识本身就长成 `files/...`，单靠格式校验挡不住「拿别人的文件标识下单」。
+    历史文件缺少上传记录时同样不能确认归属，因此直接拒绝并要求重新上传；
+    「不存在」与「是别人的」返回同一条提示与同一个错误码，不泄露别人的文件标识。
+    """
+    ensure_files_owned_by(db, user, [item["file_key"] for item in items])
+
+
+def _actual_page_count(db: Session, file_key: str) -> int | None:
+    """读取服务端解析出的真实页数；测试替身可返回 None 表示跳过。"""
+    from app.services.doc_parser import parse_document
+
+    report = parse_document(db, file_key)
+    try:
+        page_count = int(report.get("page_count") or 0)
+    except (TypeError, ValueError) as exc:
+        raise BusinessError("无法读取文件真实页数，请重新上传", code=40054) from exc
+    if page_count <= 0:
+        raise BusinessError("无法读取文件真实页数，请重新上传", code=40054)
+    return page_count
+
+
+def validate_declared_page_counts(db: Session, items: list[dict]) -> None:
+    """落单前用服务端解析结果校验页数，避免客户端改小页数少付钱。"""
+    for position, item in enumerate(items, start=1):
+        actual = _actual_page_count(db, str(item["file_key"]))
+        if actual is None:
+            continue
+        declared = int(item["page_count"])
+        if actual != declared:
+            index = int(item.get("file_index") or position)
+            raise BusinessError(
+                f"第 {index} 个文件实际为 {actual} 页，与提交的 {declared} 页不一致，"
+                "请刷新页数后重试",
+                code=40054,
+            )
+
+
+def _prepare_items(db: Session, user: User, payload) -> list[dict]:
+    """下单与报价共用的入场校验：参数、清单归一化、归属、文件新鲜度。
+
+    两个接口必须走这同一条路径：报价只是“只算不落库”，一旦两边各写一套，
+    页面上的估价与真实扣款就会分叉。
+    """
     rules = get_order_rules()
     _validate_create(payload, rules["limits"])
+    items = normalize_file_items(payload, rules["limits"])
+    _validate_file_owner(db, user, items)
+    for item in items:
+        _validate_file_freshness(item["file_key"])
+    return items
+
+
+def create_order(db: Session, user: User, payload) -> Order:
+    """下单：支持单文件旧写法与文件清单新写法，状态置 pending_pay。"""
+    items = _prepare_items(db, user, payload)
+    validate_declared_page_counts(db, items)
 
     # 截单不拒绝下单：仅把订单排到下一个打印时段（首页会给出提示）
     session_info = current_session_info(db)
 
-    amount_cents = calc_amount_cents(
-        payload.page_count, payload.print_side, payload.color_mode, payload.copies
-    )
+    total_pages, total_print_pages, amount_cents = items_totals(items)
+    first = items[0]
 
     now = datetime.now()  # 服务端时间
-    order: Order | None = None
-    for attempt in range(1, MAX_ORDER_NO_ATTEMPTS + 1):
-        seq = _next_daily_seq(db, now)
-        candidate = Order(
-            order_no=f"{now:%m%d}-{seq:03d}",
-            pickup_code=build_pickup_code(seq),
-            user_id=user.id,
-            status=STATUS_PENDING_PAY,
-            file_key=payload.file_key,
-            file_name=payload.file_name,
-            page_count=payload.page_count,
-            print_side=payload.print_side,
-            color_mode=payload.color_mode,
-            copies=payload.copies,
-            paper_size=payload.paper_size,
-            amount_cents=amount_cents,
-            remark=payload.remark,
-            site_id=1,
-        )
-        db.add(candidate)
-        try:
-            db.flush()
-        except IntegrityError:
-            db.rollback()
-            logger.warning("订单号冲突，第 %d 次重试", attempt)
-            continue
-        order = candidate
-        break
-
-    if order is None:
-        raise BusinessError("订单号生成失败，请稍后重试", code=50020)
+    day = now.date()
+    seq = _next_daily_seq(db, day)
+    order = Order(
+        order_no=f"{day:%y%m%d}-{seq:03d}",
+        pickup_code=build_pickup_code(seq, day),
+        user_id=user.id,
+        status=STATUS_PENDING_PAY,
+        # 兼容字段指向第一份文件，完整清单在 order_files
+        file_key=first["file_key"],
+        file_name=first["file_name"],
+        page_count=total_pages,
+        print_page_count=total_print_pages,
+        print_side=payload.print_side,
+        color_mode=payload.color_mode,
+        copies=payload.copies,
+        paper_size=payload.paper_size,
+        amount_cents=amount_cents,
+        remark=payload.remark,
+        site_id=1,
+    )
+    db.add(order)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        # 序号表与订单表不同步（手工改过数据）才会走到这里，不再盲重试
+        db.rollback()
+        raise BusinessError("订单号生成失败，请稍后重试", code=50020) from exc
 
     record_log(db, order, "state_change", None, STATUS_PENDING_PAY, "学生创建订单", "student")
+    # 先写当前文件清单，再按清单逐份留版本痕迹；后续换文件只追加元数据
+    rows = create_order_files(db, order, items)
+    create_initial_version(db, order, rows)
     # 仅在本时段仍收单时占用容量；截单后的订单算下一个时段
     if session_info["session"] and session_info["is_open"]:
-        session_row = get_or_create_session(db, now.date(), session_info["session"])
-        session_row.used = session_row.used + 1
+        session_row = get_or_create_session(db, day, session_info["session"])
+        # 带条件的原子自增：判定与加一在同一条语句里，满员不再加，不会超卖
+        db.execute(
+            update(QueueSession)
+            .where(
+                QueueSession.id == session_row.id,
+                QueueSession.used < QueueSession.capacity,
+            )
+            .values(used=QueueSession.used + 1)
+        )
 
     get_notifier(db).send(
         user_id=user.id,
@@ -142,11 +261,24 @@ def create_order(db: Session, user: User, payload) -> Order:
         order_id=order.id,
     )
 
+    queue_snapshot.invalidate()  # 下单同样让旧的队列快照作废
     db.commit()
     db.refresh(order)
     logger.info("创建订单成功：%s 取件码 %s 金额 %s 分", order.order_no, order.pickup_code,
                 order.amount_cents)
     return order
+
+
+def quote_order(db: Session, user: User, payload) -> dict:
+    """服务端报价：与下单同一套校验与同一套计费，只算不落库。
+
+    不建订单、不写订单文件行、不碰队列快照，也不生成订单号；
+    校验（含越界参数与文件归属）与下单走同一条 `_prepare_items`，
+    行金额与三种合计走 `order_file_service.quote_items`，前端拿到的数字
+    与随后下单时落库的数字是同一次计算的结果。
+    """
+    items = _prepare_items(db, user, payload)
+    return quote_items(items)
 
 
 def get_owned_order(db: Session, user: User, order_id: int) -> Order:
@@ -174,17 +306,35 @@ def list_orders(db: Session, user: User, status: str | None = None,
             .limit(page_size)
         ).scalars()
     )
+    waits = batch_wait_info(db, rows)
+    changes = batch_pending_changes(db, [order.id for order in rows])
+    files = batch_files_view(db, rows)
     return {
         "total": int(total),
         "page": page,
         "page_size": page_size,
-        "items": [order_to_dict(db, order) for order in rows],
+        "items": [
+            order_to_dict(
+                db, order, waits.get(order.id), changes.get(order.id), files.get(order.id)
+            )
+            for order in rows
+        ],
     }
 
 
-def order_to_dict(db: Session, order: Order) -> dict:
-    """订单对外字段（不含任何敏感信息）。"""
-    wait = order_wait_info(db, order)
+def order_to_dict(db: Session, order: Order, wait: dict | None = None,
+                  file_change: dict | object | None = _UNSET,
+                  files: list[dict] | object | None = _UNSET) -> dict:
+    """订单对外字段（不含任何敏感信息）。
+
+    wait / file_change / files 可由调用方批量算好后传入，避免列表接口逐行查询；
+    不传时按订单 id 单独查（详情接口走这条）。
+    """
+    wait = wait or order_wait_info(db, order)
+    if file_change is _UNSET:
+        file_change = pending_change_view(db, order.id)
+    if files is _UNSET:
+        files = files_view(db, order)
     return {
         "id": order.id,
         "order_no": order.order_no,
@@ -194,6 +344,7 @@ def order_to_dict(db: Session, order: Order) -> dict:
         "file_key": order.file_key,
         "file_name": order.file_name,
         "page_count": order.page_count,
+        "print_page_count": int(order.print_page_count or 0),
         "print_side": order.print_side,
         "color_mode": order.color_mode,
         "copies": order.copies,
@@ -202,12 +353,18 @@ def order_to_dict(db: Session, order: Order) -> dict:
         "paid": order.paid,
         "pay_method": order.pay_method,
         "created_at": order.created_at.isoformat() if order.created_at else None,
+        "requeue_at": order.requeue_at.isoformat() if order.requeue_at else None,
+        "file_changed_at": order.file_changed_at.isoformat() if order.file_changed_at else None,
+        "files_seen_at": order.files_seen_at.isoformat() if order.files_seen_at else None,
+        "files_unconfirmed": is_file_unconfirmed(order),
         "printed_at": order.printed_at.isoformat() if order.printed_at else None,
         "picked_at": order.picked_at.isoformat() if order.picked_at else None,
         "remark": order.remark,
         "cancel_reason": order.cancel_reason,
         "queue_position": wait["queue_position"],
         "estimated_minutes": wait["estimated_minutes"],
+        "files": files,
+        "file_change": file_change,
     }
 
 
@@ -219,6 +376,8 @@ def cancel_order(db: Session, user: User, order_id: int, reason: str | None = No
             f"订单当前状态为「{status_label(order.status)}」，不能取消", code=40901
         )
     order.cancel_reason = reason
+    # 订单一旦取消，未处理的换文件请求跟着失效，避免悬空请求
+    expire_pending_changes(db, order.id, "订单已取消，换文件请求失效", "student")
     change_status(db, order, STATUS_CANCELLED, operator="student",
                   note=reason or "学生取消订单")
     db.commit()

@@ -87,7 +87,7 @@ def test_无彩色图片时强制黑白且模型失败可兜底(db_session, monk
 
     monkeypatch.setattr("app.services.print_planner.chat_json", boom)
 
-    plan = plan_print(db_session, "files/2026/10/plan.pdf", {})
+    plan = plan_print(db_session, "files/2026/10/plan.pdf", {"use_ai": True})
     assert plan["from_model"] is False
     assert plan["recommend"]["color_mode"] == 0
     assert plan["errors"]
@@ -104,12 +104,12 @@ def test_方案写入缓存且带用户偏好(db_session, monkeypatch):
         },
     )
 
-    first = plan_print(db_session, "files/2026/10/cache.pdf", {"copies": 2})
+    first = plan_print(db_session, "files/2026/10/cache.pdf", {"copies": 2, "use_ai": True})
     assert first["from_model"] is True
     assert first["recommend"]["layout"] == "handout_4in1"
     assert first["options"]["copies"] == 2
 
-    second = plan_print(db_session, "files/2026/10/cache.pdf", {"copies": 2})
+    second = plan_print(db_session, "files/2026/10/cache.pdf", {"copies": 2, "use_ai": True})
     assert second["generated_at"] == first["generated_at"]  # 命中缓存
 
 
@@ -129,7 +129,7 @@ def test_用户手动选择单双面颜色与版式(db_session, monkeypatch):
     plan = plan_print(
         db_session,
         "files/2026/10/manual.pptx",
-        {"copies": 1, "print_side": 1, "color_mode": 1, "layout": "handout_4in1"},
+        {"copies": 1, "print_side": 1, "color_mode": 1, "layout": "handout_4in1", "use_ai": True},
     )
 
     assert plan["recommend"]["print_side"] == 1
@@ -142,7 +142,7 @@ def test_用户手动选择单双面颜色与版式(db_session, monkeypatch):
     invalid = plan_print(
         db_session,
         "files/2026/10/manual2.pptx",
-        {"print_side": 9, "layout": "handout_9in1"},
+        {"print_side": 9, "layout": "handout_9in1", "use_ai": True},
     )
     assert invalid["recommend"]["print_side"] in (1, 2)
     assert invalid["recommend"]["layout"] in {"single", "handout_2in1", "handout_4in1"}
@@ -164,3 +164,41 @@ def test_不使用AI时走规则方案且不调用模型(db_session, monkeypatch
     assert "未使用 AI" in plan["reason"]
     assert plan["recommend"]["print_side"] == 2
     assert plan["sheets_needed"] == 21
+
+
+def test_不传AI开关时默认不调用模型(db_session, monkeypatch):
+    """接口只传文件标识时，不能静默走模型花钱。"""
+    monkeypatch.setattr(
+        "app.services.print_planner.parse_document",
+        lambda db, key: _parsed(10),
+    )
+
+    def should_not_be_called(messages):
+        raise AssertionError("不传 use_ai 时应按关闭处理")
+
+    monkeypatch.setattr("app.services.print_planner.chat_json", should_not_be_called)
+
+    plan = plan_print(db_session, "files/2026/10/default-off.pdf", {})
+    assert plan["from_model"] is False
+    assert plan["errors"] == []
+    assert "未使用 AI" in plan["reason"]
+
+
+def test_打印方案给出总页数与单双面张数(db_session, monkeypatch):
+    monkeypatch.setattr(
+        "app.services.print_planner.parse_document",
+        lambda db, key: _parsed(5),
+    )
+    plan = plan_print(db_session, "files/2026/10/sheets.pdf", {})
+
+    assert plan["sheet_info"]["page_count"] == 5
+    assert plan["sheet_info"]["single_sided_sheets"] == 5
+    assert plan["sheet_info"]["double_sided_sheets"] == 3
+    assert "页数不等于纸张数" in plan["sheet_info"]["note"]
+
+
+def test_打印方案请求模型默认关闭AI开关():
+    """接口层默认值也要是关，避免前端漏传时静默调用模型。"""
+    from app.schemas.ai import PrintPlanOptions
+
+    assert PrintPlanOptions().use_ai is False

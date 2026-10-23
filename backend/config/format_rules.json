@@ -21,6 +21,11 @@
     "margin_right_cm": 2.0,
     "_source": "common"
   },
+  "image": {
+    "min_dpi": 150,
+    "_source": "print",
+    "_note": "按图片像素宽高与实际打印尺寸估算有效分辨率，低于阈值打印会发虚"
+  },
   "typography": {
     "body":     {"font": "宋体", "size_pt": 12, "line_spacing": 1.5},
     "heading1": {"font": "黑体", "size_pt": 16},

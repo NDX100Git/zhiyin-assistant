@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # backend/ 目录与 config/ 目录的绝对路径
@@ -42,6 +43,11 @@ class Settings(BaseSettings):
     db_name: str = "zhiyin"
     db_user: str = "root"
     db_password: str = ""
+    # 连接池。默认值 5 加 10 是 SQLAlchemy 的出厂设置，一万人在线轮询时会排队超时，
+    # 实测见 REVIEW 第 11 条；这里显式给足，并让等连接快失败而不是拖 30 秒
+    db_pool_size: int = 20
+    db_max_overflow: int = 30
+    db_pool_timeout: int = 10
 
     # 对象存储（阶段 2 使用）
     minio_endpoint: str = "127.0.0.1:9000"
@@ -54,6 +60,17 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_base_url: str = "https://api.deepseek.com"
     llm_model: str = "deepseek-flash"
+    # AI 调用的隔离参数。模型接口慢，一次请求能占住线程几十秒，
+    # 不设上限时几十个人同时点体检会把登录与下单一起拖死，所以并发要卡住、
+    # 排队要短、超时要早失败。
+    llm_timeout_seconds: int = 30
+    llm_max_attempts: int = 2
+    llm_max_concurrency: int = 4
+    llm_queue_wait_seconds: float = 3.0
+    # AI 任务专用线程池大小与排队上限。公共线程池只留给交易链路，
+    # AI 再慢也只占这几个名额；排队等不到就早失败，不占线程。
+    ai_max_workers: int = 4
+    ai_queue_wait_seconds: float = 30.0
 
     # 管理员（阶段 4 使用）
     admin_username: str = "admin"
@@ -62,13 +79,33 @@ class Settings(BaseSettings):
     # 业务参数
     jwt_secret: str = "change_me"
     jwt_expire_minutes: int = 720
-    file_expire_hours: int = 24
+    # 上传文件的物理保留小时数。必须大于下单宽限期（下方 order_file_grace_hours），
+    # 否则学生拿到的是一份已被删掉的引用。启动时会自检并提示。
+    file_expire_hours: int = 72
+    # 上传后允许多久之内下单；超过就提示重新上传（宽限期口径，产品定）
+    order_file_grace_hours: int = 48
+    # 异常单引用的文件额外保留天数。异常单没有自动超时，不设上限会无限期占空间
+    abnormal_file_grace_days: int = 3
     signed_url_expire_minutes: int = 30
 
+    # 定时清理。默认开启；测试环境通过 CLEANUP_ENABLED=false 关掉，避免后台任务干扰用例
+    cleanup_enabled: bool = True
+    cleanup_interval_minutes: int = 60
+
     # LibreOffice headless 可执行文件路径（阶段 5-A 的 Word -> PDF 使用）。
-    # 允许通过环境变量 SOFFICE_PATH 覆盖，代码中不硬编码。
-    soffice_path: str = r"C:\Program Files\LibreOffice\program\soffice.exe"
+    # 空字符串表示本机未配置，此时 Office 文档一律报 50040，不尝试启动进程。
+    # 不提供盘符默认值：Windows 与 Linux 的安装位置不同，猜错了比没配更难查。
+    soffice_path: str = ""
     soffice_timeout_seconds: int = 180
+    # 同时最多几个转换进程。每次转换都新起一个 soffice，几十人同时上传时
+    # 进程数与内存会把机器打满，所以超出上限的请求排队，排不到就返回 50046。
+    soffice_max_concurrency: int = 2
+    # 排队等空位的最长秒数。等不到就早失败，不占着请求线程干等。
+    soffice_queue_wait_seconds: float = 20.0
+    # 也可以不装本机 LibreOffice，改用常驻转换容器（编排文件里的 libreoffice 服务）。
+    # 填容器名即走 docker exec，容器内把后端的 runtime 目录挂成 soffice_container_dir。
+    soffice_container: str = ""
+    soffice_container_dir: str = "/workspace/runtime"
 
     # 可扩展点：V1 用简化实现，V2 换实现只改环境变量
     auth_provider: str = "device"  # device | wechat | cas
@@ -80,6 +117,25 @@ class Settings(BaseSettings):
     wechat_mch_id: str = ""
     wechat_api_key: str = ""
     wechat_notify_url: str = ""
+
+    @model_validator(mode="after")
+    def _check_file_retention(self) -> Settings:
+        """文件物理保留期必须长于下单宽限期，否则学生会引用到已删除的文件。"""
+        if self.file_expire_hours <= self.order_file_grace_hours:
+            raise ValueError(
+                "FILE_EXPIRE_HOURS 必须大于 ORDER_FILE_GRACE_HOURS："
+                f"当前为 {self.file_expire_hours} 与 {self.order_file_grace_hours}"
+            )
+        return self
+
+    @property
+    def report_expire_hours(self) -> int:
+        """体检报告缓存（ai_reports）的保留小时数。
+
+        产品口径：报告跟它对应的上传文件同寿命、同步删除，所以这里不另设独立
+        常量，直接取 file_expire_hours。两处各写一个数字迟早会打架。
+        """
+        return self.file_expire_hours
 
     @property
     def database_url(self) -> str:
@@ -93,6 +149,19 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [item.strip() for item in self.cors_origins.split(",") if item.strip()]
+
+    @property
+    def soffice_binary(self) -> Path | None:
+        """LibreOffice 可执行文件；未配置或不是一个文件时返回 None。
+
+        不能把空值交给 Path() 再加 exists() 判断：Path("") 就是当前目录，
+        exists() 会认为它存在，后续去执行目录才报权限错。全仓只在这里做一次判断。
+        """
+        raw = (self.soffice_path or "").strip()
+        if not raw:
+            return None
+        candidate = Path(raw).expanduser()
+        return candidate if candidate.is_file() else None
 
 
 settings = Settings()
@@ -128,6 +197,11 @@ def get_feature_flags() -> dict[str, Any]:
 def get_upload_rules() -> dict[str, Any]:
     """上传校验规则（大小上限、扩展名白名单）。"""
     return read_json_config("upload_rules.json")
+
+
+def get_spreadsheet_rules() -> dict[str, Any]:
+    """表格归一版式的口径（缩放、方向、边距）。改口径只改配置文件。"""
+    return read_json_config("spreadsheet_rules.json")
 
 
 def get_order_rules() -> dict[str, Any]:
