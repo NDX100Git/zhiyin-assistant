@@ -149,6 +149,7 @@ def replace_file(client, headers, order_id: int, page_count: int, **fields) -> d
         "reason": "传错版本",
         **fields,
     }
+    register_upload(payload["file_key"], payload["file_name"], _user_id(headers))
     return client.post(
         f"/api/order/{order_id}/replace-file", json=payload, headers=headers
     ).json()

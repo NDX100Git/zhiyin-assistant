@@ -169,9 +169,11 @@ def create_multi_order(client, headers: dict[str, str], files: list[dict]) -> di
 
 
 def replace_file(client, headers: dict[str, str], order_id: int, page_count: int) -> dict:
+    payload = _replace_payload(page_count)
+    register_upload(payload["file_key"], payload["file_name"], headers)
     body = client.post(
         f"/api/order/{order_id}/replace-file",
-        json=_replace_payload(page_count),
+        json=payload,
         headers=headers,
     ).json()
     assert body["code"] == 0, body

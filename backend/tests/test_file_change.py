@@ -151,12 +151,53 @@ def pay_order(client, headers: dict[str, str], order_id: int) -> dict:
 
 def replace_file(client, headers: dict[str, str], order_id: int, page_count: int,
                  **kwargs) -> dict:
+    should_register = kwargs.pop("register_upload", True)
+    payload = _replace_payload(page_count, **kwargs)
+    if should_register:
+        owner_id = int(decode_token(headers["Authorization"].split(" ", 1)[1])["sub"])
+        register_upload(payload["file_key"], payload["file_name"], owner_id)
     body = client.post(
         f"/api/order/{order_id}/replace-file",
-        json=_replace_payload(page_count, **kwargs),
+        json=payload,
         headers=headers,
     ).json()
     return body
+
+
+def test_换文件拒绝使用他人的上传文件(client):
+    owner_headers = student_headers(client, device_id="file-owner")
+    order = create_order(client, owner_headers)
+
+    other_headers = student_headers(client, device_id="file-other")
+    other_owner_id = int(
+        decode_token(other_headers["Authorization"].split(" ", 1)[1])["sub"]
+    )
+    other_key = _file_key("other-user")
+    register_upload(other_key, "别人的文件.pdf", other_owner_id)
+
+    body = replace_file(
+        client,
+        owner_headers,
+        order["id"],
+        page_count=20,
+        file_key=other_key,
+        register_upload=False,
+    )
+    assert body["code"] == 40404
+    assert "不属于当前用户" in body["message"]
+
+
+def test_换文件页数与实际文件不一致被拒(client, monkeypatch):
+    headers = student_headers(client)
+    order = create_order(client, headers, page_count=10)
+    monkeypatch.setattr(
+        "app.services.order_service._actual_page_count",
+        lambda db, file_key: 17,
+    )
+
+    body = replace_file(client, headers, order["id"], page_count=20)
+    assert body["code"] == 40054
+    assert "实际为 17 页" in body["message"]
 
 
 def confirm(client, headers: dict[str, str], order_id: int, approve: bool,

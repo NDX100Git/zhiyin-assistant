@@ -32,6 +32,7 @@ from app.models.order_file_change import (
 from app.models.order_file_version import OrderFileVersion
 from app.models.payment_log import PaymentLog
 from app.services import queue_snapshot
+from app.services.file_service import ensure_files_owned_by
 from app.services.notifier import get_notifier
 from app.services.order_file_service import (
     ensure_files,
@@ -85,7 +86,9 @@ def file_print_pages(order: Order, row, page_count: int | None = None) -> int:
     return pages * copies
 
 
-def _validate_new_file(file_key: str, page_count: int, reason: str | None) -> None:
+def _validate_new_file(
+    db: Session, user, file_key: str, page_count: int, reason: str | None
+) -> None:
     limits = get_order_rules()["limits"]
     if not file_key or not str(file_key).startswith("files/"):
         raise BusinessError("文件标识无效，请重新上传", code=40041)
@@ -94,11 +97,20 @@ def _validate_new_file(file_key: str, page_count: int, reason: str | None) -> No
     if reason and len(reason) > int(limits["max_remark_length"]):
         raise BusinessError(f"换文件原因最多 {limits['max_remark_length']} 个字符", code=40047)
 
+    ensure_files_owned_by(db, user, [file_key])
+
     # 延迟导入：下单服务依赖本模块写初始版本，模块级互相导入会成环。
     # 延迟导入也让测试或回归脚本替换 order_service._validate_file_freshness 时能生效。
-    from app.services.order_service import _validate_file_freshness
+    from app.services.order_service import (
+        _validate_file_freshness,
+        validate_declared_page_counts,
+    )
 
     _validate_file_freshness(file_key)
+    validate_declared_page_counts(
+        db,
+        [{"file_key": file_key, "page_count": int(page_count), "file_index": 1}],
+    )
 
 
 def _next_version_no(db: Session, order_id: int) -> int:
@@ -523,9 +535,9 @@ def _create_pending_change(db: Session, order: Order, payload) -> OrderFileChang
     return change
 
 
-def replace_order_file(db: Session, order: Order, payload) -> dict:
+def replace_order_file(db: Session, order: Order, payload, user) -> dict:
     """学生换文件入口。返回 {"applied": bool, "change": OrderFileChange | None}。"""
-    _validate_new_file(payload.file_key, payload.page_count, payload.reason)
+    _validate_new_file(db, user, payload.file_key, payload.page_count, payload.reason)
 
     # 行锁把同一张单的并发换文件请求串起来，避免两个版本号同时算成同一个
     db.refresh(order, with_for_update=True)

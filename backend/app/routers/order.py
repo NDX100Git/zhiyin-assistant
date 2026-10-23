@@ -110,7 +110,7 @@ def replace_file(
     待确认时订单里的 `file_change` 字段给出新文件与系统重算价。
     """
     order = order_service.get_owned_order(db, user, order_id)
-    result = file_change_service.replace_order_file(db, order, payload)
+    result = file_change_service.replace_order_file(db, order, payload, user)
     data = order_service.order_to_dict(db, order)
     data["applied"] = bool(result["applied"])
     return ok(data)

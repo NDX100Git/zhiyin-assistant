@@ -102,9 +102,12 @@ def _fresh_upload_time(monkeypatch):
     """
     from datetime import datetime
 
+    from app.services import order_service
     from app.services.storage.minio_store import MinioStorage
 
     monkeypatch.setattr(MinioStorage, "stat_modified", lambda self, key: datetime.now())
+    # 大多数接口用例使用假的 file_key，不进入真实文档解析；页数校验用例会覆盖这里。
+    monkeypatch.setattr(order_service, "_actual_page_count", lambda db, key: None)
 
 
 @pytest.fixture

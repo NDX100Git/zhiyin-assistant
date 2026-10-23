@@ -16,7 +16,6 @@ from app.config import get_order_rules, settings
 from app.models.order import Order
 from app.models.payment_log import PaymentLog
 from app.models.queue_session import QueueSession
-from app.models.uploaded_file import UploadedFile
 from app.models.user import User
 from app.services import queue_snapshot
 from app.services.file_change_service import (
@@ -25,6 +24,7 @@ from app.services.file_change_service import (
     expire_pending_changes,
     pending_change_view,
 )
+from app.services.file_service import ensure_files_owned_by
 from app.services.notifier import get_notifier
 from app.services.order_file_service import (
     batch_files_view,
@@ -144,19 +144,37 @@ def _validate_file_owner(db: Session, user: User, items: list[dict]) -> None:
     历史文件缺少上传记录时同样不能确认归属，因此直接拒绝并要求重新上传；
     「不存在」与「是别人的」返回同一条提示与同一个错误码，不泄露别人的文件标识。
     """
-    keys = [item["file_key"] for item in items]
-    owners = {
-        str(file_key): int(owner_id)
-        for file_key, owner_id in db.execute(
-            select(UploadedFile.file_key, UploadedFile.user_id).where(
-                UploadedFile.file_key.in_(keys)
+    ensure_files_owned_by(db, user, [item["file_key"] for item in items])
+
+
+def _actual_page_count(db: Session, file_key: str) -> int | None:
+    """读取服务端解析出的真实页数；测试替身可返回 None 表示跳过。"""
+    from app.services.doc_parser import parse_document
+
+    report = parse_document(db, file_key)
+    try:
+        page_count = int(report.get("page_count") or 0)
+    except (TypeError, ValueError) as exc:
+        raise BusinessError("无法读取文件真实页数，请重新上传", code=40054) from exc
+    if page_count <= 0:
+        raise BusinessError("无法读取文件真实页数，请重新上传", code=40054)
+    return page_count
+
+
+def validate_declared_page_counts(db: Session, items: list[dict]) -> None:
+    """落单前用服务端解析结果校验页数，避免客户端改小页数少付钱。"""
+    for position, item in enumerate(items, start=1):
+        actual = _actual_page_count(db, str(item["file_key"]))
+        if actual is None:
+            continue
+        declared = int(item["page_count"])
+        if actual != declared:
+            index = int(item.get("file_index") or position)
+            raise BusinessError(
+                f"第 {index} 个文件实际为 {actual} 页，与提交的 {declared} 页不一致，"
+                "请刷新页数后重试",
+                code=40054,
             )
-        ).all()
-    }
-    for item in items:
-        owner_id = owners.get(str(item["file_key"]))
-        if owner_id is None or owner_id != int(user.id):
-            raise BusinessError("文件不存在或不属于当前用户，请重新上传", code=40404)
 
 
 def _prepare_items(db: Session, user: User, payload) -> list[dict]:
@@ -177,6 +195,7 @@ def _prepare_items(db: Session, user: User, payload) -> list[dict]:
 def create_order(db: Session, user: User, payload) -> Order:
     """下单：支持单文件旧写法与文件清单新写法，状态置 pending_pay。"""
     items = _prepare_items(db, user, payload)
+    validate_declared_page_counts(db, items)
 
     # 截单不拒绝下单：仅把订单排到下一个打印时段（首页会给出提示）
     session_info = current_session_info(db)

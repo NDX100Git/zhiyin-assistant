@@ -33,6 +33,27 @@ CHUNK_SIZE = 1024 * 1024
 RUNTIME_TMP_DIR = BACKEND_DIR / "runtime" / "tmp"
 
 
+def ensure_files_owned_by(db: Session, user: User, file_keys: list[str]) -> None:
+    """确认每个文件都有当前用户的上传记录。
+
+    「不存在」和「属于别人」使用同一个错误，避免泄露别人的文件状态。
+    """
+    keys = list(dict.fromkeys(str(key) for key in file_keys if key))
+    if not keys:
+        return
+    owners = {
+        str(file_key): int(owner_id)
+        for file_key, owner_id in db.execute(
+            select(UploadedFile.file_key, UploadedFile.user_id).where(
+                UploadedFile.file_key.in_(keys)
+            )
+        ).all()
+    }
+    for file_key in keys:
+        if owners.get(file_key) != int(user.id):
+            raise BusinessError("文件不存在或不属于当前用户，请重新上传", code=40404)
+
+
 def _save_to_temp(upload: UploadFile, ext: str, max_bytes: int) -> tuple[Path, Path, int]:
     """把上传流落到临时文件，同时做大小上限校验。
 
