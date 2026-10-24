@@ -259,7 +259,7 @@
         <text>{{ files.length }} 个文件 · 文档 {{ docPages }} 页 · 打印 {{ printPages === null ? '—' : printPages }} 页</text>
         <text class="money">预计 {{ formatMoney(quoteAmount) }}</text>
       </view>
-      <button class="primary block" :disabled="busy || !plan || !!quoteError" @click="createOrder">
+      <button class="primary block" :disabled="busy || !plan || !!quoteError || quoting || !!created" @click="createOrder">
         {{ files.length > 1 ? `确认下单（${files.length} 个文件 · ${docPages} 页）` : '确认下单' }}
       </button>
     </view>
@@ -356,8 +356,13 @@ const paperSizes = PAPER_SIZES
 const quote = ref(null)
 /** 报价失败的原因：失败时保留上一次结果，并把原因写清楚。 */
 const quoteError = ref('')
+// 报价进行中（含自动重试）。重试间隙不能解锁下单按钮，否则会拿还没取到的金额下单。
+const quoting = ref(false)
 let quoteTimer = null
 let quoteSeq = 0
+// 报价失败最多自动重试几次：后端重启、网络抖一下都会让报价失败一次。
+// 早期实现失败后只有改参数才会重新报价，等于把下单按钮永久锁死。
+const MAX_QUOTE_RETRIES = 3
 
 /** 当前报价里对应第 index 份文件的那一行（按 file_key 对，不靠下标猜）。 */
 function lineOf(index) {
@@ -425,7 +430,7 @@ function scheduleQuote() {
 }
 
 /** 调服务端报价；失败时保留上一次结果并记下原因，不静默显示错误金额。 */
-async function refreshQuote() {
+async function refreshQuote(retry = 0) {
   if (!files.value.length) {
     quote.value = null
     quoteError.value = ''
@@ -434,6 +439,7 @@ async function refreshQuote() {
   // 页数还没读到就报不了价（page_count 必须 ≥ 1）
   if (files.value.some((item) => !(Number(item.page_count) >= 1))) return
   const seq = ++quoteSeq
+  quoting.value = true
   try {
     const data = await quoteOrder(quotePayload())
     // 已经有更新的请求发出去了，旧结果直接丢掉
@@ -442,7 +448,17 @@ async function refreshQuote() {
     quoteError.value = ''
   } catch (error) {
     if (seq !== quoteSeq) return
+    if (retry < MAX_QUOTE_RETRIES) {
+      // 退避重试；用户改参数时 scheduleQuote 会清掉这个定时器，等于取消重试
+      quoteTimer = setTimeout(() => {
+        quoteTimer = null
+        refreshQuote(retry + 1)
+      }, 1000 * (retry + 1))
+      return
+    }
     quoteError.value = error.message || '报价失败，请稍后重试'
+  } finally {
+    if (seq === quoteSeq && !quoteTimer) quoting.value = false
   }
 }
 
@@ -779,7 +795,8 @@ async function changeCopies(delta) {
 }
 
 async function createOrder() {
-  if (busy.value || !plan.value || files.value.length === 0) return
+  // created 非空表示这一单已经下过了：不清空 files/plan 的情况下连点会出第二张订单
+  if (busy.value || !plan.value || files.value.length === 0 || created.value) return
   busy.value = true
   try {
     // 文件清单是权威字段；逐份参数随清单一起交给服务端（与报价接口同一份参数）

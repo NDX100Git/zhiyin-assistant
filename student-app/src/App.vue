@@ -1,12 +1,20 @@
 <script>
 import { warnOnPlatformConfig } from '@/config'
 import { ensureLogin } from '@/services/auth'
+import { AUTH_EXPIRED_EVENT } from '@/services/api'
 
 export default {
   onLaunch() {
     warnOnPlatformConfig()
     // 启动即静默登录（设备标识），失败不影响浏览，页面会再兜底一次
     ensureLogin().catch((error) => console.warn('[auth] 静默登录失败', error))
+
+    // 登录失效自愈：请求层发现 token 不被认可时会清掉它并广播，这里重新登录。
+    // 没有这一步，token 一旦失效（过期 / 换密钥 / 演示前重建数据库），
+    // 页面每个请求都是 401 且无法恢复。
+    uni.$on(AUTH_EXPIRED_EVENT, () => {
+      ensureLogin().catch((error) => console.warn('[auth] 失效后重新登录失败', error))
+    })
   },
 }
 </script>

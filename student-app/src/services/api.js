@@ -17,6 +17,15 @@ export function clearToken() {
   uni.removeStorageSync(STORAGE_KEYS.token)
 }
 
+/**
+ * 登录失效的业务码。后端统一返回 HTTP 200 + 业务 code，只能按 code 判断：
+ * 40100=没有带 token，40101=token 无效或账号不存在（例如演示前重建了数据库）。
+ */
+const AUTH_EXPIRED_CODES = [40100, 40101]
+
+/** 登录失效时广播的全局事件，由 App.vue 监听并静默重新登录。 */
+export const AUTH_EXPIRED_EVENT = 'zhiyin:auth-expired'
+
 function buildHeader(auth = true) {
   const header = { 'Content-Type': 'application/json' }
   const token = getToken()
@@ -67,6 +76,15 @@ export function request(path, options = {}) {
         const body = parseBody(response.data)
         if (body && body.code === 0) {
           resolve(body.data)
+          return
+        }
+        if (body && AUTH_EXPIRED_CODES.includes(body.code)) {
+          // 本地 token 已经不被服务端认可（过期、换密钥、演示前重建了数据库）。
+          // 必须清掉：login() 见到本地有 token 就直接返回，留着它会让之后每个
+          // 请求都 401，页面永远自愈不了。清掉后由 App.vue 静默重新登录。
+          clearToken()
+          uni.$emit(AUTH_EXPIRED_EVENT)
+          reject(new Error(body.message || '登录已失效，正在重新登录'))
           return
         }
         if (body && typeof body.code !== 'undefined') {
