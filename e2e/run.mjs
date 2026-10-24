@@ -161,6 +161,8 @@ async function startStack() {
         CLEANUP_ENABLED: 'false',
         AUTO_CREATE_TABLES: 'true',
         DEBUG: 'false',
+        // 回归环境没有真实密钥，跳过弱凭据启动自检（与单测 conftest 一致）
+        ALLOW_INSECURE_DEFAULTS: 'true',
       },
     },
   )

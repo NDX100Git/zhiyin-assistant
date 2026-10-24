@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -14,6 +15,10 @@ from sqlalchemy.orm import sessionmaker
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
+
+# 单测环境没有真实密钥，弱凭据自检会直接拒绝启动，这里统一豁免。
+# 必须在 import app.config 之前设置：配置是模块级实例化的。
+os.environ.setdefault("ALLOW_INSECURE_DEFAULTS", "true")
 
 import app.models  # noqa: E402  确保所有表注册到 metadata
 from app.config import settings  # noqa: E402

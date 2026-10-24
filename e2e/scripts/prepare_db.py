@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -20,6 +21,8 @@ def main() -> int:
     args = parser.parse_args()
 
     sys.path.insert(0, str(args.backend.resolve()))
+    # 与单测一致：回归环境没有真实密钥，弱凭据自检会拒绝加载配置
+    os.environ.setdefault("ALLOW_INSECURE_DEFAULTS", "true")
     from app.config import settings
 
     name = settings.db_name

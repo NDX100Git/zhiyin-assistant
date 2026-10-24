@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from functools import cache
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,29 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # backend/ 目录与 config/ 目录的绝对路径
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 CONFIG_DIR = BACKEND_DIR / "config"
+
+# 弱凭据黑名单。这些值出现在公开仓库的示例配置里，继续用就等于没设：
+# JWT 是对称密钥，拿到就能自己签发任意 role 的 token；管理员口令是文印室后台的唯一入口。
+WEAK_CREDENTIALS = frozenset(
+    {"", "change_me", "changeme", "admin", "123456", "password", "secret"}
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+def is_weak_credential(value: str) -> bool:
+    """判断是否为公开示例值：命中黑名单，或仍带着 change_me / change-me 字样。
+
+    示例文件里的 `please_change_me_to_...` 这类提示串同样要拦住，否则照抄示例
+    就能绕过自检。
+    """
+    normalized = (value or "").strip().lower()
+    return (
+        normalized in WEAK_CREDENTIALS
+        or "change_me" in normalized
+        or "change-me" in normalized
+    )
 
 
 class Settings(BaseSettings):
@@ -118,6 +142,10 @@ class Settings(BaseSettings):
     wechat_api_key: str = ""
     wechat_notify_url: str = ""
 
+    # 安全自检开关。仅本机演示与单测使用：true 时允许弱密钥/弱口令启动，
+    # 生产环境绝不能开。开了会在启动日志里留一条醒目告警。
+    allow_insecure_defaults: bool = False
+
     @model_validator(mode="after")
     def _check_file_retention(self) -> Settings:
         """文件物理保留期必须长于下单宽限期，否则学生会引用到已删除的文件。"""
@@ -125,6 +153,40 @@ class Settings(BaseSettings):
             raise ValueError(
                 "FILE_EXPIRE_HOURS 必须大于 ORDER_FILE_GRACE_HOURS："
                 f"当前为 {self.file_expire_hours} 与 {self.order_file_grace_hours}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_weak_credentials(self) -> Settings:
+        """默认密钥与管理员口令必须换掉，否则拒绝启动。
+
+        JWT_SECRET 是 HS256 的对称密钥，泄露即等于任何人都能给自己签发
+        role=admin 的 token；ADMIN_PASSWORD 是老师端后台的唯一入口。这两项留在
+        公开示例值上运行，等于把文印室后台公开给整个网络。
+
+        本机演示与跑单测时可用 ALLOW_INSECURE_DEFAULTS=true 豁免。
+        """
+        if self.allow_insecure_defaults:
+            logger.warning(
+                "安全警告：ALLOW_INSECURE_DEFAULTS=true，弱密钥与弱口令自检已跳过。"
+                "当前 JWT_SECRET / ADMIN_PASSWORD 若是公开示例值，任何人都能伪造管理员"
+                " token 接管老师端后台。生产环境禁止开启本开关。"
+            )
+            return self
+
+        weak = [
+            name
+            for name, value in (
+                ("JWT_SECRET", self.jwt_secret),
+                ("ADMIN_PASSWORD", self.admin_password),
+            )
+            if is_weak_credential(value)
+        ]
+        if weak:
+            raise ValueError(
+                "以下配置仍是公开示例值，拒绝启动：" + "、".join(weak)
+                + "。请在 backend/.env 中改成随机值（JWT_SECRET 建议 32 字节以上）；"
+                "本机演示或跑单测可临时设 ALLOW_INSECURE_DEFAULTS=true。"
             )
         return self
 
