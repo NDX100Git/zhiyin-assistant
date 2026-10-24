@@ -25,6 +25,9 @@ TASK_TTL_SECONDS = 3600
 class TaskState:
     task_id: str
     kind: str
+    # 发起人标识（str(user.id)）。校对结果里是论文原文片段，只能让本人看到，
+    # 所以轮询接口必须校验 owner；to_dict 不输出它，避免把用户标识回给前端。
+    owner: str = ""
     status: str = STATUS_PENDING
     total: int = 0
     done: int = 0
@@ -66,17 +69,29 @@ _tasks: dict[str, TaskState] = {}
 _lock = threading.Lock()
 
 
-def create_task(kind: str, total: int = 0, message: str = "") -> TaskState:
-    task = TaskState(task_id=uuid.uuid4().hex, kind=kind, total=total, message=message)
+def create_task(kind: str, total: int = 0, message: str = "", owner: str = "") -> TaskState:
+    task = TaskState(
+        task_id=uuid.uuid4().hex, kind=kind, owner=owner, total=total, message=message
+    )
     with _lock:
         _tasks[task.task_id] = task
         _purge_locked()
     return task
 
 
-def get_task(task_id: str) -> TaskState | None:
+def get_task(task_id: str, owner: str | None = None) -> TaskState | None:
+    """按 task_id 取任务。
+
+    传了 owner 就校验归属，不匹配时返回 None（与「不存在」同一结果，避免泄露
+    别人的任务是否存在）。不传 owner 表示内部流程（如后台 worker 自己更新进度）。
+    """
     with _lock:
-        return _tasks.get(task_id)
+        task = _tasks.get(task_id)
+    if task is None:
+        return None
+    if owner is not None and task.owner != owner:
+        return None
+    return task
 
 
 def update(task_id: str, **fields: Any) -> TaskState | None:

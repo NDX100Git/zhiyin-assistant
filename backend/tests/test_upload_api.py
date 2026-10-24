@@ -123,16 +123,26 @@ def test_未登录不能载入示例论文(client):
     assert client.post("/api/file/demo").json()["code"] == 40100
 
 
-def test_读取页数不调用AI(client, monkeypatch):
+def test_读取页数不调用AI(client, test_storage, monkeypatch):
+    """页数接口走的是服务端解析，不调模型；归属校验要求 file_key 是自己上传的。"""
     token = login(client)
+    uploaded = client.post(
+        "/api/file/upload",
+        files={"file": ("demo.pdf", PDF_BYTES, "application/pdf")},
+        headers=auth_header(token),
+    ).json()
+    assert uploaded["code"] == 0, uploaded
+    file_key = uploaded["data"]["file_key"]
+
+    # 打桩解析函数：既保证「不调用 AI」，也避免真的去解析这份最小 PDF
     monkeypatch.setattr(
         "app.routers.file.parse_document", lambda db, key: {"page_count": 12}
     )
     body = client.post(
         "/api/file/page-count",
-        json={"file_key": "files/2026/10/demo.pdf"},
+        json={"file_key": file_key},
         headers=auth_header(token),
     ).json()
 
-    assert body["code"] == 0
+    assert body["code"] == 0, body
     assert body["data"]["page_count"] == 12

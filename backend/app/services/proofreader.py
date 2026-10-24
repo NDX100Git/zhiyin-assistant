@@ -236,17 +236,21 @@ def _worker(task_id: str, file_key: str, session_factory=SessionLocal) -> None:
         db.close()
 
 
-def start_proofread(file_key: str, session_factory=SessionLocal) -> dict:
-    """创建后台任务并立即返回 task_id，前端用轮询查看进度。"""
+def start_proofread(file_key: str, session_factory=SessionLocal, owner: str = "") -> dict:
+    """创建后台任务并立即返回 task_id，前端用轮询查看进度。
+
+    owner 记下发起人用户 id：任务结果里是论文原文片段，轮询时只认本人。
+    """
     if not file_key:
         raise BusinessError("缺少文件标识", code=40073)
-    task = task_registry.create_task("proofread", message="任务已创建")
+    task = task_registry.create_task("proofread", message="任务已创建", owner=owner)
     _executor.submit(_worker, task.task_id, file_key, session_factory)
     return task.to_dict(with_result=False)
 
 
-def get_progress(task_id: str) -> dict:
-    task = task_registry.get_task(task_id)
+def get_progress(task_id: str, owner: str = "") -> dict:
+    """查进度。owner 对不上时按「任务不存在」返回，不泄露他人任务是否存在。"""
+    task = task_registry.get_task(task_id, owner)
     if task is None:
         raise BusinessError("任务不存在或已过期", code=40403)
     return task.to_dict()

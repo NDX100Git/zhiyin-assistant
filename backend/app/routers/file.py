@@ -14,7 +14,12 @@ from app.models.user import User
 from app.schemas.ai import PageCountRequest
 from app.schemas.file import FileDeleteRequest
 from app.services.doc_parser import parse_document
-from app.services.file_service import delete_uploaded_file, load_demo_document, store_upload
+from app.services.file_service import (
+    delete_uploaded_file,
+    ensure_files_owned_by,
+    load_demo_document,
+    store_upload,
+)
 from app.utils.response import ok
 from app.utils.security import get_current_user
 
@@ -53,9 +58,13 @@ def upload_demo(
 @router.post("/page-count", summary="读取页数（不调用 AI）", response_model=None)
 def page_count(
     payload: PageCountRequest,
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    """只做文档解析取页数，供「跳过 AI 体检、直接打印」的学生使用。"""
+    """只做文档解析取页数，供「跳过 AI 体检、直接打印」的学生使用。
+
+    校验归属：页数背后是整篇正文，不能让登录用户拿别人的 file_key 来读。
+    """
+    ensure_files_owned_by(db, user, [payload.file_key])
     parsed = parse_document(db, payload.file_key)
     return ok({"file_key": payload.file_key, "page_count": parsed.get("page_count", 1)})
