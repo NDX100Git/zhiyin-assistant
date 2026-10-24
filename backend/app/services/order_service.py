@@ -46,7 +46,11 @@ from app.services.order_state import (
 )
 from app.services.payment import get_payment_provider
 from app.services.queue_service import batch_wait_info, new_order_wait_info, order_wait_info
-from app.services.session_service import current_session_info, get_or_create_session
+from app.services.session_service import (
+    current_session_info,
+    get_or_create_session,
+    release_session_slot,
+)
 from app.services.storage import get_storage
 from app.utils.exceptions import BusinessError
 
@@ -380,6 +384,8 @@ def cancel_order(db: Session, user: User, order_id: int, reason: str | None = No
     expire_pending_changes(db, order.id, "订单已取消，换文件请求失效", "student")
     change_status(db, order, STATUS_CANCELLED, operator="student",
                   note=reason or "学生取消订单")
+    # 不打印了，把下单时占用的时段容量还回去（容量只增不减会让时段永久显示已截单）
+    release_session_slot(db, order.created_at or datetime.now())
     db.commit()
     db.refresh(order)
     return order

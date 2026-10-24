@@ -60,6 +60,29 @@ def get_or_create_session(db: Session, day: date_type, name: str) -> QueueSessio
     ).scalar_one()
 
 
+def release_session_slot(db: Session, moment: datetime) -> bool:
+    """把某笔订单占用的时段容量还回去；时段行不存在或已归零时返回 False。
+
+    下单时只有「本时段收单中」才自增（见 order_service.create_order）。取消订单与
+    关闭异常单都意味着这单不再消耗产能，容量必须归还 —— 否则取消几单之后，该时段
+    会一直显示「已截单」，新订单全被排到下一时段，老师手动重开也救不回来。
+
+    容量按订单创建时刻反推所属时段，减到 0 为止，不会减成负数。
+    """
+    name = resolve_session_name(moment)
+    if name is None:
+        return False
+    row = db.execute(
+        select(QueueSession)
+        .where(QueueSession.date == moment.date(), QueueSession.session == name)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if row is None or row.used <= 0:
+        return False
+    row.used -= 1
+    return True
+
+
 def current_session_info(db: Session, now: datetime | None = None) -> dict:
     """当前收单状态，供首页与下单提示使用。
 

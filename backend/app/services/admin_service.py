@@ -42,7 +42,7 @@ from app.services.order_state import (
 )
 from app.services.printer import get_printer_provider
 from app.services.queue_service import batch_wait_info, order_wait_info, queue_order_by
-from app.services.session_service import get_or_create_session
+from app.services.session_service import get_or_create_session, release_session_slot
 from app.services.storage import get_storage
 from app.utils.exceptions import BusinessError
 
@@ -235,14 +235,26 @@ def confirm_files_seen(db: Session, order: Order, operator: str) -> dict:
 
 def complete_print(db: Session, order: Order, operator: str,
                    amount_cents: int | None = None) -> dict:
-    """打印完成：printing -> ready，系统计价预填，老师可改（改价写日志留痕）。"""
+    """打印完成：printing -> ready，老师可改价（改价写日志留痕）。
+
+    不传金额时**沿用订单已有的成交价**：下单时算的价、老师改过的价、换文件流程里
+    老师确认的价都落在 order.amount_cents 上，它们是已经跟学生达成的价格。
+    只有订单还没有成交价（0）时才用系统价兜底。
+
+    早期实现用系统重算价直接覆盖，会把换文件确认价无声抹掉：学生已付 500、
+    老师确认改到 800，批量完成时不传金额就被改回系统价，差额两头对不上。
+    """
     system_amount = system_total_cents(db, order)
-    final_amount = system_amount if amount_cents is None else int(amount_cents)
+    current_amount = int(order.amount_cents or 0)
+    final_amount = (current_amount or system_amount) if amount_cents is None else int(amount_cents)
     if final_amount < 0:
         raise BusinessError("金额不能为负数", code=40061)
 
     if amount_cents is None:
-        note = f"打印完成，系统计价 {final_amount} 分"
+        if final_amount == system_amount:
+            note = f"打印完成，系统计价 {final_amount} 分"
+        else:
+            note = f"打印完成，沿用成交价 {final_amount} 分（系统计价 {system_amount} 分）"
     elif final_amount == system_amount:
         note = f"打印完成，老师确认金额 {final_amount} 分（与系统一致）"
     else:
@@ -279,7 +291,8 @@ def batch_complete(db: Session, order_ids: list[int], operator: str) -> dict:
     for order_id in order_ids:
         try:
             order = get_order(db, order_id)
-            result = complete_print(db, order, operator)
+            # 显式沿用当前成交价：不传就会走系统价，把换文件确认价和改价抹掉
+            result = complete_print(db, order, operator, int(order.amount_cents or 0) or None)
             succeeded.append(
                 {"order_id": order_id, "order_no": result["order"]["order_no"],
                  "amount_cents": result["amount_cents"]}
@@ -396,6 +409,8 @@ def cancel_abnormal(db: Session, order: Order, reason: str | None, operator: str
     order.cancel_reason = note
     expire_pending_changes(db, order.id, "异常单已关闭，换文件请求失效", operator)
     change_status(db, order, "cancelled", operator=operator, note=note)
+    # 异常单作废也不再消耗本时段产能，容量要还回去
+    release_session_slot(db, order.created_at or datetime.now())
     db.commit()
     db.refresh(order)
     return order_admin_view(db, order)

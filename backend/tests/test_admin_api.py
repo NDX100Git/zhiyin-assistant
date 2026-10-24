@@ -164,6 +164,44 @@ def test_老师改价写入操作日志(client, db_session):
     assert any("630" in (log.note or "") and "700" in (log.note or "") for log in logs)
 
 
+def test_不传金额时沿用成交价不被系统价覆盖(client, db_session):
+    """换文件流程里老师确认的价格，不能被系统重算价无声抹掉。"""
+    token = admin_token(client)
+    order = _make_order(db_session, status="printing")
+    # 模拟换文件确认后落库的成交价：下单 630，老师确认改到 800
+    order.amount_cents = 800
+    db_session.commit()
+
+    body = client.post(
+        f"/api/admin/order/{order.id}/complete", headers=auth(token)
+    ).json()
+
+    assert body["code"] == 0, body
+    assert body["data"]["system_amount_cents"] == 630  # 系统价照常返回，只供参考
+    assert body["data"]["amount_cents"] == 800  # 实收沿用成交价
+    assert body["data"]["price_changed"] is True
+
+    db_session.expire_all()
+    assert db_session.get(Order, order.id).amount_cents == 800
+
+
+def test_批量完成沿用成交价(client, db_session):
+    """批量完成没有传金额的入口，必须自己沿用成交价。"""
+    token = admin_token(client)
+    order = _make_order(db_session, status="printing")
+    order.amount_cents = 800
+    db_session.commit()
+
+    body = client.post(
+        "/api/admin/order/batch-complete",
+        json={"order_ids": [order.id]},
+        headers=auth(token),
+    ).json()
+
+    assert body["code"] == 0, body
+    assert body["data"]["succeeded"][0]["amount_cents"] == 800
+
+
 def test_批量标记完成返回成功与失败明细(client, db_session):
     token = admin_token(client)
     first = _make_order(db_session, status="printing")

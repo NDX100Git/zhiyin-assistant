@@ -12,7 +12,9 @@ class AdminLoginRequest(BaseModel):
 
 class CompleteRequest(BaseModel):
     amount_cents: int | None = Field(
-        default=None, ge=0, description="不传则使用系统按 pricing.json 计算的值"
+        default=None,
+        ge=0,
+        description="不传则沿用订单当前成交价；订单还没有成交价时才按 pricing.json 计算",
     )
 
 
