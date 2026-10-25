@@ -362,3 +362,46 @@ def test_可重试与不可重试的分流规则() -> None:
     assert llm.is_permanent_error(_api_error(400)) is True
     assert llm.is_permanent_error(_api_error(500)) is False
     assert llm.is_permanent_error(RuntimeError("网络抖动")) is False
+
+
+# ---------------------------------------------------------------- 客户端的懒加载
+# 首次被并发调用时，几个线程同时看到 None，各建一个客户端，后建的把先建的覆盖掉。
+# 被覆盖的连接池没人关闭（AsyncOpenAI 还绑着事件循环），「第一次有人点体检」就是
+# 一个稳定的连接泄漏点。锁只包住创建那一段，模型请求一行都不能进锁。
+def _race_lazy_loader(monkeypatch, class_attr: str, cache_attr: str, getter) -> None:
+    created: list[object] = []
+    threads_count = 6
+    barrier = threading.Barrier(threads_count)
+
+    class _SlowClient:
+        def __init__(self, **kwargs) -> None:
+            time.sleep(0.02)  # 放大竞态窗口：没锁时几个线程都会各自建一个
+            created.append(self)
+
+    monkeypatch.setattr(llm, class_attr, _SlowClient)
+    monkeypatch.setattr(llm, cache_attr, None)
+    monkeypatch.setattr(settings, "llm_api_key", "sk-test-lazy-load")
+
+    clients: list[object] = []
+
+    def worker() -> None:
+        barrier.wait()
+        clients.append(getter())
+
+    threads = [threading.Thread(target=worker) for _ in range(threads_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(created) == 1, f"并发首次调用只该建一个客户端，实际 {len(created)} 个"
+    assert len(clients) == threads_count
+    assert all(client is created[0] for client in clients)
+
+
+def test_并发首次调用只创建一个同步客户端(monkeypatch) -> None:
+    _race_lazy_loader(monkeypatch, "OpenAI", "_client", llm.get_client)
+
+
+def test_并发首次调用只创建一个异步客户端(monkeypatch) -> None:
+    _race_lazy_loader(monkeypatch, "AsyncOpenAI", "_async_client", llm.get_async_client)

@@ -32,7 +32,7 @@ from sqlalchemy.orm import Session
 
 from app.config import BACKEND_DIR, settings
 from app.models.ai_report import AiReport
-from app.services.spreadsheet import render_pdf
+from app.services.spreadsheet import remaining_render_seconds, render_pdf
 from app.services.storage import get_storage
 from app.utils.exceptions import BusinessError
 from app.utils.filetype import normalize_ext
@@ -163,6 +163,33 @@ def save_report(
     db.add(AiReport(file_key=file_key, user_id=owner, report_json=data))
     db.commit()
     return data
+
+
+def get_cached_parse(db: Session, file_key: str) -> dict | None:
+    """取解析缓存：没有账号上下文的链路复用同一份解析结果。
+
+    解析结果只跟文件本身有关（页数、正文、版式事实），与账号无关。但老实现里
+    页数读取、下单、打印方案这三条链路没有账号上下文，只认 user_id 为空的那一行：
+    而体检链路带账号，写的是自己名下的行。于是一条「先体检、再读页数」的链路会
+    把整篇文档重新解析一遍，并在 ai_reports 里再留一行解析缓存；每多一条无账号
+    链路就多一行，表跟着膨胀。
+
+    所以没有账号上下文时直接复用这个文件已有的那一行：不重解析、不新写行、也不
+    改归属（老行的认领仍然只发生在带账号的链路里）。
+    带账号的链路仍按「账号 + 文件」取：体检、校对、修复报告是按账号隔离的。
+    """
+    cached = get_cached_report(db, file_key, "parse")
+    if cached is not None or report_owner(db) is not None:
+        return cached
+
+    row = db.execute(
+        select(AiReport)
+        .where(AiReport.file_key == file_key)
+        .where(AiReport.report_json["kind"].as_string() == "parse")
+        .order_by(AiReport.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    return None if row is None else row.report_json
 
 
 # ---------------------------------------------------------------- 页数快读
@@ -345,10 +372,16 @@ class _ConversionGate:
             return self._slots, limit
 
     @contextmanager
-    def slot(self):
-        """占一个转换槽位；排队超时抛 50046。"""
+    def slot(self, wait_seconds: float | None = None):
+        """占一个转换槽位；排队超时抛 50046。
+
+        wait_seconds 为 None 时用配置值；表格渲染会传「剩余预算」进来，
+        排队也不能把一条请求的耗时推过预算。
+        """
         semaphore, limit = self._current()
         wait = max(0.0, float(settings.soffice_queue_wait_seconds))
+        if wait_seconds is not None:
+            wait = min(wait, max(0.0, float(wait_seconds)))
         if not semaphore.acquire(timeout=wait):
             raise BusinessError(
                 f"文档转换排队已满（同时最多 {limit} 个），等了 {wait:g} 秒仍没有空位，"
@@ -364,9 +397,24 @@ class _ConversionGate:
 _conversion_gate = _ConversionGate()
 
 
-def conversion_slot():
+def conversion_slot(wait_seconds: float | None = None):
     """转换槽位上下文管理器；测试与转换函数共用这一个入口。"""
-    return _conversion_gate.slot()
+    return _conversion_gate.slot(wait_seconds)
+
+
+def conversion_timeout_seconds() -> float:
+    """这一次转换允许等多久：配置的单次超时，并且不超过表格渲染剩余的预算。
+
+    表格放宽横向页数时会重跑多轮转换，每一轮都占着同一个 AI 并发名额。
+    只在 spreadsheet.render_pdf 里数次数没用：一轮转换自己就能跑满 180 秒，
+    两轮就是 260 秒以上，排在后面的人只看到超时。所以预算必须一直传到
+    真正等 soffice 的这一层：额度用尽就按剩余时间等，杀进程、归还名额。
+    """
+    timeout = max(1.0, float(settings.soffice_timeout_seconds))
+    remaining = remaining_render_seconds()
+    if remaining is None:
+        return timeout
+    return min(timeout, remaining)
 
 
 def _kill_process_tree(proc: subprocess.Popen) -> None:
@@ -452,7 +500,7 @@ def _run_soffice(
             start_new_session=(os.name != "nt"),
         )
         try:
-            proc.wait(timeout=settings.soffice_timeout_seconds)
+            proc.wait(timeout=conversion_timeout_seconds())
         except subprocess.TimeoutExpired as exc:
             _kill_process_tree(proc)
             raise BusinessError("文档转换超时，请稍后重试", code=50041) from exc
@@ -467,7 +515,7 @@ def convert_document(input_path: Path, out_dir: Path, target: str = "pdf") -> Pa
     cmd = _soffice_command(input_path, out_dir, profile_dir, target)
     logger.info("调用 LibreOffice 转换：%s -> %s", input_path.name, target)
 
-    with conversion_slot():
+    with conversion_slot(remaining_render_seconds()):
         _run_soffice(cmd, out_dir, stdout_log, stderr_log)
 
     output = out_dir / f"{input_path.stem}.{target}"
@@ -760,7 +808,7 @@ def parse_document(db: Session, file_key: str, force: bool = False) -> dict:
     if not file_key:
         raise BusinessError("缺少文件标识", code=40073)
     if not force:
-        cached = get_cached_report(db, file_key, "parse")
+        cached = get_cached_parse(db, file_key)
         if cached is not None:
             logger.info("命中解析缓存：%s", file_key)
             return cached
