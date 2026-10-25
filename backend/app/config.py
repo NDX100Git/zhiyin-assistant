@@ -25,6 +25,8 @@ CONFIG_DIR = BACKEND_DIR / "config"
 WEAK_CREDENTIALS = frozenset(
     {"", "change_me", "changeme", "admin", "123456", "password", "secret"}
 )
+MIN_JWT_SECRET_BYTES = 32
+MIN_ADMIN_PASSWORD_CHARS = 8
 
 
 logger = logging.getLogger(__name__)
@@ -193,18 +195,22 @@ class Settings(BaseSettings):
             )
             return self
 
-        weak = [
-            name
-            for name, value in (
-                ("JWT_SECRET", self.jwt_secret),
-                ("ADMIN_PASSWORD", self.admin_password),
-            )
-            if is_weak_credential(value)
-        ]
+        weak: list[str] = []
+        if (
+            is_weak_credential(self.jwt_secret)
+            or len(self.jwt_secret.encode("utf-8")) < MIN_JWT_SECRET_BYTES
+        ):
+            weak.append("JWT_SECRET")
+        if (
+            is_weak_credential(self.admin_password)
+            or len(self.admin_password) < MIN_ADMIN_PASSWORD_CHARS
+        ):
+            weak.append("ADMIN_PASSWORD")
         if weak:
             raise ValueError(
-                "以下配置仍是公开示例值，拒绝启动：" + "、".join(weak)
-                + "。请在 backend/.env 中改成随机值（JWT_SECRET 建议 32 字节以上）；"
+                "以下配置过弱，拒绝启动：" + "、".join(weak)
+                + f"。JWT_SECRET 至少 {MIN_JWT_SECRET_BYTES} 字节，"
+                f"ADMIN_PASSWORD 至少 {MIN_ADMIN_PASSWORD_CHARS} 个字符；"
                 "本机演示或跑单测可临时设 ALLOW_INSECURE_DEFAULTS=true。"
             )
         return self

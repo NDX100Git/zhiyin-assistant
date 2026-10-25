@@ -128,7 +128,9 @@ async def ai_key_check(
         raise BusinessError(
             f"请求头 {USER_KEY_HEADER} 里没有密钥，请先在设置里填写", code=50036
         )
-    verify_user_key(api_key)
+    # 这是同步网络调用，可能在模型超时与重试上等待几十秒；放进 AI 专用线程池，
+    # 不能直接在 async 端点里执行，否则一个密钥检查就会阻塞整个事件循环。
+    await run_ai_job(verify_user_key, api_key)
     return ok(
         {
             "ok": True,

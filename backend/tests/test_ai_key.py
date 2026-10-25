@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -21,6 +22,7 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.models.base import Base
+from app.routers import ai as ai_router
 from app.services import llm, proofreader, task_registry
 from app.utils.exceptions import BusinessError
 
@@ -394,6 +396,29 @@ def test_key_check没带密钥时报错(client) -> None:
 
     assert body["code"] == 50036, body
     assert llm.USER_KEY_HEADER in body["message"]
+
+
+def test_key_check的模型调用不阻塞事件循环(monkeypatch) -> None:
+    """用 0.2 秒同步等待模拟模型调用，事件循环应照常在 0.05 秒时拿到控制权。"""
+    monkeypatch.setattr(settings, "llm_user_key_enabled", True)
+    monkeypatch.setattr(
+        ai_router,
+        "verify_user_key",
+        lambda key: time.sleep(0.2) or "OK",
+    )
+
+    async def scenario():
+        started = time.monotonic()
+        task = asyncio.create_task(ai_router.ai_key_check(None, STUDENT_KEY, None))
+        await asyncio.sleep(0.05)
+        ticked_after = time.monotonic() - started
+        body = await task
+        return ticked_after, body
+
+    ticked_after, body = asyncio.run(scenario())
+
+    assert ticked_after < 0.15, f"密钥检查阻塞事件循环 {ticked_after:.3f} 秒"
+    assert body["data"]["ok"] is True
 
 
 def test_密钥格式明显不对时就地拒绝不打模型(

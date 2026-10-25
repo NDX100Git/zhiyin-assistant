@@ -97,7 +97,7 @@ jobs:
             fi
             sleep 1
           done
-          pytest -q -p no:logging
+          pytest -q
 
   teacher-web:
     name: Teacher web build / lint / test
@@ -187,15 +187,6 @@ jobs:
           --health-interval=5s
           --health-timeout=5s
           --health-retries=20
-      minio:
-        image: minio/minio:RELEASE.2024-06-13T22-53-53Z
-        env:
-          MINIO_ROOT_USER: ci_minio_access
-          MINIO_ROOT_PASSWORD: ci_minio_secret
-        ports:
-          - 9000:9000
-        # 不在容器里写 health-cmd：minio 镜像不一定带 curl，健康检查写错会让
-        # 整个服务等不到「healthy」。改用下面的「等待依赖就绪」步骤轮询。
     env:
       # run.mjs --start 会用 DB_NAME=zhiyin_e2e 重建库、用独立桶，这里给出连接参数
       DB_HOST: 127.0.0.1
@@ -208,6 +199,7 @@ jobs:
       MINIO_SECRET_KEY: ci_minio_secret
       MINIO_BUCKET: zhiyin-files-e2e
       MINIO_SECURE: "false"
+      AWS_DEFAULT_REGION: us-east-1
       # 回归环境没有真实密钥，老师端登录口令由 e2e 自己读这里
       E2E_ADMIN_USERNAME: admin
       E2E_ADMIN_PASSWORD: ci_admin_password
@@ -255,45 +247,28 @@ jobs:
         with:
           chrome-version: stable
 
-      # run.mjs --start 只等后端 /api/health，但后端启动就要连库与建桶，
-      # 先把两个依赖轮询到就绪，避免偶发的「第一次跑就红」。
-      # 用 python 轮询而不是 mysqladmin：runner 镜像里不保证装了 mysql 客户端。
-      - name: Wait for MySQL and MinIO
-        run: |
-          python - <<'PY'
-          import socket, time, urllib.request
-
-          def mysql_ready():
-              try:
-                  with socket.create_connection(("127.0.0.1", 3306), timeout=2):
-                      return True
-              except OSError:
-                  return False
-
-          def minio_ready():
-              try:
-                  with urllib.request.urlopen(
-                      "http://127.0.0.1:9000/minio/health/live", timeout=2
-                  ) as response:
-                      return response.status == 200
-              except Exception:
-                  return False
-
-          for attempt in range(60):
-              if mysql_ready() and minio_ready():
-                  print(f"依赖就绪（第 {attempt + 1} 次尝试）")
-                  break
-              time.sleep(2)
-          else:
-              raise SystemExit("MySQL 或 MinIO 在 120 秒内没有就绪")
-          PY
-
       - name: Run browser regression
         working-directory: e2e
         env:
           E2E_PYTHON: python
           PUPPETEER_EXECUTABLE_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
-        run: node run.mjs --start
+        run: |
+          # e2e 只需要兼容 S3 的对象存储。用已随测试依赖安装的 moto，
+          # 避免再拉第三方容器；MySQL service 由 Actions 等健康后再执行本步骤。
+          moto_server -H 127.0.0.1 -p 9000 > "${RUNNER_TEMP}/moto-s3-e2e.log" 2>&1 &
+          moto_pid=$!
+          trap 'kill "$moto_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/moto-api/ > /dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              cat "${RUNNER_TEMP}/moto-s3-e2e.log"
+              exit 1
+            fi
+            sleep 1
+          done
+          node run.mjs --start
 
       - name: Upload artifacts
         if: always()

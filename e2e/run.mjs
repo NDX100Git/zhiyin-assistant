@@ -4110,8 +4110,6 @@ async function fillFirstInput(page, selector, value) {
 
 async function runStudentKeyPhase({ student, step }) {
   const result = {
-    skipped: false,
-    reason: '',
     panelEntry: '',
     testReason: '',
     headerOnly: null,
@@ -4130,10 +4128,7 @@ async function runStudentKeyPhase({ student, step }) {
     await waitBody(student, '全部', 60000)
     result.panelEntry = await findKeyPanelEntry(student)
     if (!result.panelEntry) {
-      result.skipped = true
-      result.reason = KEY_PANEL_MISSING
-      console.log(`\n      跳过：${KEY_PANEL_MISSING}`)
-      return
+      throw new Error(KEY_PANEL_MISSING)
     }
     await clickByText(student, result.panelEntry)
     await waitVisible(student, KEY_PANEL_SELECTOR, 20000)
@@ -4158,12 +4153,7 @@ async function runStudentKeyPhase({ student, step }) {
   })
 
   await step('密钥：只出现在请求头里，页面地址与请求体里都没有', async () => {
-    if (result.skipped || !result.panelEntry) {
-      result.skipped = true
-      result.reason = result.reason || KEY_PANEL_MISSING
-      console.log(`\n      跳过：${result.reason}`)
-      return
-    }
+    if (!result.panelEntry) throw new Error(KEY_PANEL_MISSING)
     const key = 'sk-e2e-header-probe-0123456789'
 
     // 这一步必须真的发出一次 AI 请求：面板上的「保存」只写本机存储、一个请求都不发
@@ -4407,11 +4397,6 @@ async function main() {
     return 1
   }
   console.log(`\n全部通过：${results.map((item) => item.viewport).join('、')} 两个视口`)
-  for (const item of results) {
-    if (item.studentKey && item.studentKey.skipped) {
-      console.log(`  视口 ${item.viewport} 跳过：${item.studentKey.reason}`)
-    }
-  }
   console.log(`记录：${ARTIFACTS}/result.json`)
   return 0
 }

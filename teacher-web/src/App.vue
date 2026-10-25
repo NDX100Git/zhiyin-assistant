@@ -7,7 +7,6 @@ import { onMounted, onUnmounted } from 'vue'
 import {
   UI_THEMES,
   applyUiScheme,
-  applyUiTheme,
   getUiScheme,
   getUiTheme,
   themeClass,

@@ -35,6 +35,18 @@ def test_弱JWT密钥拒绝启动() -> None:
     assert "JWT_SECRET" in str(excinfo.value)
 
 
+def test_过短的JWT密钥拒绝启动() -> None:
+    """只拦固定示例值不够：一个字符的 HS256 密钥同样能被立即猜中。"""
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(
+            _env_file=None,
+            allow_insecure_defaults=False,
+            jwt_secret="a",
+            admin_password=STRONG_PASSWORD,
+        )
+    assert "JWT_SECRET" in str(excinfo.value)
+
+
 def test_弱管理员口令拒绝启动() -> None:
     with pytest.raises(ValidationError) as excinfo:
         Settings(
@@ -42,6 +54,17 @@ def test_弱管理员口令拒绝启动() -> None:
             allow_insecure_defaults=False,
             jwt_secret=STRONG_JWT,
             admin_password="admin",
+        )
+    assert "ADMIN_PASSWORD" in str(excinfo.value)
+
+
+def test_过短的管理员口令拒绝启动() -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(
+            _env_file=None,
+            allow_insecure_defaults=False,
+            jwt_secret=STRONG_JWT,
+            admin_password="1",
         )
     assert "ADMIN_PASSWORD" in str(excinfo.value)
 

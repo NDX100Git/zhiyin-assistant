@@ -124,7 +124,6 @@ import { useUiTheme } from '@/ui/theme'
 const order = ref(null)
 const orderId = ref('')
 const { uiThemeClass, uiSchemeClass } = useUiTheme()
-let visible = false
 
 const isActive = computed(() => order.value && ['queuing', 'printing'].includes(order.value.status))
 
@@ -205,7 +204,6 @@ onLoad((options) => {
 })
 
 onShow(async () => {
-  visible = true
   try {
     await ensureLogin()
     poller.start()
@@ -215,7 +213,6 @@ onShow(async () => {
 })
 
 onHide(() => {
-  visible = false
   poller.stop()
 })
 onUnmounted(() => poller.stop())
