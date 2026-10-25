@@ -1,67 +1,120 @@
 """时段容量归还（取消 / 关闭异常单不占名额）。
 
-用假会话验证分支，不连数据库：容量只增不减会让时段在取消几单后永久显示「已截单」，
-老师手动重开也救不回来。
+只归还「本次下单确实占到」的额度：截单与满员时下的单没有自增容量，取消时也不能减。
+历史问题：取消时无条件 `used -= 1`，把别人占着的额度还掉了（实测已用数从 5 掉到 2），
+紧接着放进来的新单就是超卖。
 """
 
 from __future__ import annotations
 
+import itertools
 from datetime import date, datetime, time
-from types import SimpleNamespace
-from unittest.mock import MagicMock
 
+from sqlalchemy import select
+
+from app.models.order import Order
+from app.models.queue_session import QueueSession
+from app.models.uploaded_file import UploadedFile
+from app.services import session_service
 from app.services.session_service import release_session_slot
+from app.utils.security import decode_token
 
 _TODAY = date.today()
+_seq = itertools.count(1)
 
 
-def _fake_db(row):
-    db = MagicMock()
-    db.execute.return_value.scalar_one_or_none.return_value = row
-    return db
+def _order_row(db_session, *, moment: datetime, took_slot: bool) -> Order:
+    """造一张订单；took_slot=True 时把「占到名额」的凭证写进库。"""
+    index = next(_seq)
+    order = Order(
+        order_no=f"0999-{index:03d}",
+        pickup_code=f"0999-{index:03d}-A",
+        user_id=1,
+        status="pending_pay",
+        page_count=1,
+        print_side=1,
+        color_mode=0,
+        copies=1,
+        paper_size="A4",
+        amount_cents=15,
+        created_at=moment,
+    )
+    db_session.add(order)
+    db_session.commit()
+    if took_slot:
+        assert session_service.mark_session_slot_taken(db_session, order.id) is True
+        db_session.commit()
+    return order
 
 
-def _at(hour: int) -> datetime:
-    return datetime.combine(_TODAY, time(hour, 0))
+def _session_row(db_session, name: str, used: int) -> QueueSession:
+    row = session_service.ensure_session(db_session, _TODAY, name)
+    row.used = used
+    row.capacity = max(used, 1)
+    db_session.commit()
+    db_session.refresh(row)
+    return row
 
 
-def test_取消订单归还一个名额():
-    row = SimpleNamespace(date=_TODAY, session="pm", used=5)
-    assert release_session_slot(_fake_db(row), _at(14)) is True
-    assert row.used == 4
+def _used_now(db_session, row: QueueSession) -> int:
+    db_session.expire_all()
+    return int(db_session.get(QueueSession, row.id).used)
 
 
-def test_已归零不再减():
-    row = SimpleNamespace(date=_TODAY, session="pm", used=0)
-    assert release_session_slot(_fake_db(row), _at(14)) is False
-    assert row.used == 0
+def _at(hour: int, minute: int = 0) -> datetime:
+    return datetime.combine(_TODAY, time(hour, minute))
 
 
-def test_时段行不存在时安全跳过():
-    assert release_session_slot(_fake_db(None), _at(14)) is False
+def test_占到名额的订单取消归还一个(db_session):
+    row = _session_row(db_session, "pm", used=5)
+    order = _order_row(db_session, moment=_at(14), took_slot=True)
+    assert release_session_slot(db_session, order) is True
+    db_session.commit()
+    assert _used_now(db_session, row) == 4
 
 
-def test_非收单时段不动容量():
-    db = _fake_db(SimpleNamespace(date=_TODAY, session="pm", used=5))
-    assert release_session_slot(db, _at(23)) is False
-    assert db.execute.called is False
+def test_已归零不再减(db_session):
+    row = _session_row(db_session, "pm", used=0)
+    order = _order_row(db_session, moment=_at(14), took_slot=True)
+    assert release_session_slot(db_session, order) is False
+    assert _used_now(db_session, row) == 0
 
 
-def test_上午订单归还到上午时段():
-    row = SimpleNamespace(date=_TODAY, session="am", used=2)
-    assert release_session_slot(_fake_db(row), _at(10)) is True
-    assert row.used == 1
+def test_时段行不存在时安全跳过(db_session):
+    order = _order_row(db_session, moment=_at(14), took_slot=True)
+    assert release_session_slot(db_session, order) is False
+
+
+def test_非收单时段不动容量(db_session):
+    order = _order_row(db_session, moment=_at(23), took_slot=True)
+    assert release_session_slot(db_session, order) is False
+    assert list(db_session.execute(select(QueueSession)).scalars()) == []
+
+
+def test_上午订单归还到上午时段(db_session):
+    row = _session_row(db_session, "am", used=2)
+    order = _order_row(db_session, moment=_at(10), took_slot=True)
+    assert release_session_slot(db_session, order) is True
+    db_session.commit()
+    assert _used_now(db_session, row) == 1
+
+
+def test_同一单不会归还两次(db_session):
+    """归还成功就把凭证清掉：重复走到这里不会再减一次容量。"""
+    row = _session_row(db_session, "pm", used=3)
+    order = _order_row(db_session, moment=_at(14), took_slot=True)
+
+    assert release_session_slot(db_session, order) is True
+    db_session.commit()
+    assert _used_now(db_session, row) == 2
+
+    assert release_session_slot(db_session, order) is False
+    db_session.commit()
+    assert _used_now(db_session, row) == 2
 
 
 # ---------------------------------------------------------------- 真实数据库：容量归还与读优先
 
-
-from sqlalchemy import select  # noqa: E402
-
-from app.models.queue_session import QueueSession  # noqa: E402
-from app.models.uploaded_file import UploadedFile  # noqa: E402
-from app.services import session_service  # noqa: E402
-from app.utils.security import decode_token  # noqa: E402
 
 _FILE_KEY = "files/2026/10/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pdf"
 _ORDER_PAYLOAD = {
@@ -239,3 +292,132 @@ def test_时段行不存在时首页仍能正常返回(client, db_session, monke
     rows = list(db_session.execute(select(QueueSession)).scalars())
     assert len(rows) == 1
     assert int(rows[0].used) == 0
+
+
+# ---------------------------------------------------------------- 只归还「确实占到」的名额
+
+
+def test_满员下的订单取消不会把别人的名额还掉(client, db_session, monkeypatch):
+    """满员时下的单没有自增容量，取消它绝不能减 used。
+
+    历史问题：截单/满员的订单取消时无条件 `used -= 1`，把别人占着的额度还掉了，
+    实测已用数从 5 掉到 2；接着又放进新单，就是超卖。
+    """
+    monkeypatch.setattr(session_service, "resolve_session_name", lambda now: "pm")
+    row = _pm_row(db_session, capacity=1)
+    token = _student_token(client, db_session)
+
+    first = _create_order(client, token)  # 占到名额
+    assert _used(db_session, row) == 1
+    later = [_create_order(client, token) for _ in range(2)]  # 满员，没占到名额
+    assert _used(db_session, row) == 1, "满员后的订单不该再加容量"
+
+    for order in later:
+        body = client.post(
+            f"/api/order/{order['id']}/cancel", json={"reason": "不打了"}, headers=_auth(token)
+        ).json()
+        assert body["code"] == 0, body
+    assert _used(db_session, row) == 1, "取消没占到名额的单，已用数不能减"
+
+    # 真正占到名额的那单取消才归还
+    body = client.post(
+        f"/api/order/{first['id']}/cancel", json={"reason": "不打了"}, headers=_auth(token)
+    ).json()
+    assert body["code"] == 0, body
+    assert _used(db_session, row) == 0
+
+
+def test_容量5时取消满员期3单已用数仍是5(client, db_session, monkeypatch):
+    """验收实测的场景：容量 5 占满后又下 3 单，取消这 3 单后已用数必须还是 5。"""
+    monkeypatch.setattr(session_service, "resolve_session_name", lambda now: "pm")
+    row = _pm_row(db_session, capacity=5)
+    token = _student_token(client, db_session)
+
+    holders = [_create_order(client, token) for _ in range(5)]
+    assert _used(db_session, row) == 5
+
+    extra = [_create_order(client, token) for _ in range(3)]
+    assert _used(db_session, row) == 5
+
+    for order in extra:
+        client.post(f"/api/order/{order['id']}/cancel", headers=_auth(token))
+    assert _used(db_session, row) == 5, "取消满员期的订单不能动别人占着的名额"
+
+    # 占到名额的单取消，才正常减 1
+    client.post(f"/api/order/{holders[0]['id']}/cancel", headers=_auth(token))
+    assert _used(db_session, row) == 4
+
+
+def test_占到名额的标记落在订单上(db_session):
+    """凭证落在 orders.slot_taken：占到=1，没占到=0，取消归还后清回 0。"""
+    from sqlalchemy import text
+
+    from app.models.order import Order
+
+    row = _pm_row(db_session, capacity=1)
+    row.used = 1  # 这单下单时自增过的那一格
+    db_session.commit()
+    order = Order(
+        order_no="0999-901",
+        pickup_code="0999-901-A",
+        user_id=1,
+        status="pending_pay",
+        page_count=1,
+        print_side=1,
+        color_mode=0,
+        copies=1,
+        paper_size="A4",
+        amount_cents=15,
+    )
+    db_session.add(order)
+    db_session.commit()
+
+    def slot_taken() -> int:
+        db_session.rollback()
+        return int(
+            db_session.execute(
+                text("SELECT slot_taken FROM `orders` WHERE id = :id"), {"id": order.id}
+            ).scalar_one()
+        )
+
+    assert slot_taken() == 0, "默认不占名额"
+
+    assert session_service.mark_session_slot_taken(db_session, order.id) is True
+    db_session.commit()
+    assert slot_taken() == 1
+
+    db_session.rollback()
+    assert session_service.release_session_slot(db_session, order) is True
+    db_session.commit()
+    assert _used(db_session, row) == 0
+    assert slot_taken() == 0, "归还过一次就清标记，重复归还不会减第二次"
+
+
+def test_没占到名额的订单不归还容量(db_session):
+    from datetime import datetime
+
+    from app.models.order import Order
+
+    row = _pm_row(db_session, capacity=3)
+    row.used = 2
+    db_session.commit()
+
+    order = Order(
+        order_no="0999-902",
+        pickup_code="0999-902-A",
+        user_id=1,
+        status="pending_pay",
+        page_count=1,
+        print_side=1,
+        color_mode=0,
+        copies=1,
+        paper_size="A4",
+        amount_cents=15,
+        created_at=datetime.combine(_TODAY, time(14, 0)),
+    )
+    db_session.add(order)
+    db_session.commit()
+
+    assert session_service.release_session_slot(db_session, order) is False
+    db_session.commit()
+    assert _used(db_session, row) == 2, "没占到名额就不该动 used"

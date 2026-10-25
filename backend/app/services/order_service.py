@@ -49,6 +49,7 @@ from app.services.queue_service import batch_wait_info, new_order_wait_info, ord
 from app.services.session_service import (
     current_session_info,
     ensure_session,
+    mark_session_slot_taken,
     release_session_slot,
 )
 from app.services.storage import get_storage
@@ -247,7 +248,7 @@ def create_order(db: Session, user: User, payload) -> Order:
         # 只读优先拿行（加一靠下面带条件的原子 UPDATE），不在下单路径上带行锁
         session_row = ensure_session(db, day, session_info["session"])
         # 带条件的原子自增：判定与加一在同一条语句里，满员不再加，不会超卖
-        db.execute(
+        taken = db.execute(
             update(QueueSession)
             .where(
                 QueueSession.id == session_row.id,
@@ -255,6 +256,10 @@ def create_order(db: Session, user: User, payload) -> Order:
             )
             .values(used=QueueSession.used + 1)
         )
+        # 把「这一单确实占到了名额」记到订单上：满员时 UPDATE 改 0 行，就不记。
+        # 取消时凭这个凭证决定要不要归还容量，不然后续取消会把别人的名额还掉。
+        if int(taken.rowcount or 0) > 0:
+            mark_session_slot_taken(db, order.id)
 
     get_notifier(db).send(
         user_id=user.id,
@@ -425,8 +430,9 @@ def cancel_order(db: Session, user: User, order_id: int, reason: str | None = No
     expire_pending_changes(db, order.id, "订单已取消，换文件请求失效", "student")
     change_status(db, order, STATUS_CANCELLED, operator="student",
                   note=reason or "学生取消订单")
-    # 不打印了，把下单时占用的时段容量还回去（容量只增不减会让时段永久显示已截单）
-    release_session_slot(db, order.created_at or datetime.now())
+    # 不打印了，把下单时占用的时段容量还回去（只还确实占到的那一份；容量只增不减
+    # 会让时段永久显示已截单，无条件还则会还掉别人占着的名额，造成超卖）
+    release_session_slot(db, order)
     db.commit()
     db.refresh(order)
     return order

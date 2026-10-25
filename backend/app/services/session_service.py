@@ -14,8 +14,17 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.config import get_order_rules
+from app.models.order import Order
 from app.models.queue_session import QueueSession
 from app.utils.exceptions import BusinessError
+
+# `orders.slot_taken`：这一单下单时是否占到本时段名额。
+#
+# 这一列只由 migrations.py 补（本轮文件边界不含 models/ 与 schema.sql，模型里没有映射），
+# 所以读写都走原生 SQL，集中在这里，别处不要再拼。
+SLOT_TAKEN_SELECT_SQL = text("SELECT `slot_taken` FROM `orders` WHERE id = :order_id")
+SLOT_TAKEN_MARK_SQL = text("UPDATE `orders` SET `slot_taken` = 1 WHERE id = :order_id")
+SLOT_TAKEN_CLEAR_SQL = text("UPDATE `orders` SET `slot_taken` = 0 WHERE id = :order_id")
 
 
 def _parse_hhmm(value: str) -> time:
@@ -103,15 +112,20 @@ def get_or_create_session(db: Session, day: date_type, name: str) -> QueueSessio
     ).scalar_one()
 
 
-def release_session_slot(db: Session, moment: datetime) -> bool:
-    """把某笔订单占用的时段容量还回去；时段行不存在或已归零时返回 False。
+def release_session_slot(db: Session, order: Order) -> bool:
+    """把订单占用的时段容量还回去；这一单当时没占到名额时什么都不动。
 
-    下单时只有「本时段收单中」才自增（见 order_service.create_order）。取消订单与
-    关闭异常单都意味着这单不再消耗产能，容量必须归还 —— 否则取消几单之后，该时段
-    会一直显示「已截单」，新订单全被排到下一时段，老师手动重开也救不回来。
+    下单时只有「本时段收单中且未满员」才自增容量（见 order_service.create_order），
+    而截单与满员时下的单**没有**自增。所以归还不能无条件做：不看凭证就减，
+    减掉的是别人占着的额度，紧接着放进来的新单就是超卖（实测已用数从 5 掉到 2）。
 
-    容量按订单创建时刻反推所属时段，减到 0 为止，不会减成负数。
+    凭证是订单行上的 `slot_taken`：下单自增成功才置 1；归还成功就清回 0，
+    同一单重复走到这里也只会减一次。容量按订单创建时刻反推所属时段，
+    减到 0 为止，不会减成负数。
     """
+    if slot_taken(db, order.id) != 1:
+        return False
+    moment = order.created_at or datetime.now()
     name = resolve_session_name(moment)
     if name is None:
         return False
@@ -123,7 +137,24 @@ def release_session_slot(db: Session, moment: datetime) -> bool:
     if row is None or row.used <= 0:
         return False
     row.used -= 1
+    _clear_slot_taken(db, order.id)
     return True
+
+
+def mark_session_slot_taken(db: Session, order_id: int) -> bool:
+    """标记这一单确实占到了本时段的名额（下单时容量自增成功后调用）。"""
+    result = db.execute(SLOT_TAKEN_MARK_SQL, {"order_id": int(order_id)})
+    return bool(int(result.rowcount or 0))
+
+
+def slot_taken(db: Session, order_id: int) -> int:
+    """这一单是否占到名额：1=占到，0=没占到（或已归还）。"""
+    value = db.execute(SLOT_TAKEN_SELECT_SQL, {"order_id": int(order_id)}).scalar_one_or_none()
+    return int(value or 0)
+
+
+def _clear_slot_taken(db: Session, order_id: int) -> None:
+    db.execute(SLOT_TAKEN_CLEAR_SQL, {"order_id": int(order_id)})
 
 
 def current_session_info(db: Session, now: datetime | None = None) -> dict:

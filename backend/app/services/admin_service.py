@@ -253,11 +253,17 @@ def start_print(db: Session, order: Order, operator: str) -> dict:
 
     订单一旦进入打印中就不能再换文件，所以先把待确认请求置为失效，
     避免老师在打印后才看到一个无法执行的确认请求。
+
+    签发链接前必须先探活（与 download_url 同一道校验）：开始打印也会把链接交给
+    老师，文件已被定时清理时照签不误，等于把一条指向空对象的链接交出去，订单却
+    已经推进到「打印中」——既打不出东西，也回不到队列。探活要放在改状态之前，
+    被拒时订单状态一动不动。
     """
-    expire_pending_changes(db, order.id, "订单已开始打印，换文件请求失效", operator)
-    change_status(db, order, STATUS_PRINTING, operator=operator, note="老师开始打印")
     storage = get_storage()
     rows = files_view(db, order)
+    _ensure_objects_exist(storage, [row["file_key"] for row in rows])
+    expire_pending_changes(db, order.id, "订单已开始打印，换文件请求失效", operator)
+    change_status(db, order, STATUS_PRINTING, operator=operator, note="老师开始打印")
     file_links = [
         {**row, "signed_url": storage.signed_url(row["file_key"])} for row in rows
     ]
@@ -540,8 +546,8 @@ def cancel_abnormal(db: Session, order: Order, reason: str | None, operator: str
             db, order, "refund",
             note=f"老师关闭订单并登记退款 {refund} 分", operator=operator,
         )
-    # 异常单作废也不再消耗本时段产能，容量要还回去
-    release_session_slot(db, order.created_at or datetime.now())
+    # 异常单作废也不再消耗本时段产能，容量要还回去；只还这一单确实占到的那一份
+    release_session_slot(db, order)
     try:
         db.commit()
     except IntegrityError as exc:  # 幂等键撞车：同一单重复退

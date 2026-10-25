@@ -924,3 +924,118 @@ def test_文件被清理后拒绝签发下载链接(client, db_session, test_sto
     assert gone["code"] == 40406, gone
     assert "已过期清理" in gone["message"]
     assert gone["data"] is None, "被拒时不能带出签名链接"
+
+
+# ---------------------------------------------------------------- 钱：上限与零元
+
+
+def _create_order_via_api(client, db_session, payload: dict) -> tuple[dict, str]:
+    """走真实下单接口造订单：参数、页数、文件归属都过一遍校验，才算「合法订单」。"""
+    from app.models.uploaded_file import UploadedFile
+    from app.utils.security import decode_token
+
+    token = student_token(client)
+    db_session.add(
+        UploadedFile(
+            user_id=int(decode_token(token)["sub"]),
+            file_key=payload["file_key"],
+            file_name=payload["file_name"],
+            size=0,
+            content_type="application/pdf",
+        )
+    )
+    db_session.commit()
+    body = client.post("/api/order/create", json=payload, headers=auth(token)).json()
+    assert body["code"] == 0, body
+    return body["data"], token
+
+
+def test_一千六百元的合法订单能完成改价与核销(client, db_session):
+    """护栏上限必须罩得住配置允许的最大单，否则合法单永远走不完闭环。
+
+    400 页 × 5 份 × 彩色 80 分 = 160_000 分（1600 元），完全合法：
+    页数 400 ≤ 1000，份数 5 ≤ 50。历史上绝对上限写死 1000 元，这一单在
+    「完成打印」那一步就被 40062 拒掉，改价与核销跟着全挂。
+    """
+    payload = {
+        "file_key": "files/2026/10/1600yuan00000000000000000000000.pdf",
+        "file_name": "开题报告.pdf",
+        "page_count": 400,
+        "print_side": 1,
+        "color_mode": 1,
+        "copies": 5,
+        "paper_size": "A4",
+    }
+    order, student = _create_order_via_api(client, db_session, payload)
+    assert order["amount_cents"] == 160_000
+
+    paid = client.post(f"/api/order/{order['id']}/pay", headers=auth(student)).json()
+    assert paid["code"] == 0, paid
+
+    token = admin_token(client)
+    started = client.post(f"/api/admin/order/{order['id']}/start", headers=auth(token)).json()
+    assert started["code"] == 0, started
+
+    # 改价：从 1600 元改到 1550 元，必须成功落库
+    done = client.post(
+        f"/api/admin/order/{order['id']}/complete",
+        json={"amount_cents": 155_000},
+        headers=auth(token),
+    ).json()
+    assert done["code"] == 0, done
+    assert done["data"]["order"]["status"] == "ready"
+    assert done["data"]["system_amount_cents"] == 160_000
+    assert done["data"]["amount_cents"] == 155_000
+    assert done["data"]["price_changed"] is True
+
+    verified = client.post(
+        f"/api/admin/order/{order['id']}/verify", headers=auth(token)
+    ).json()
+    assert verified["code"] == 0, verified
+    assert verified["data"]["order"]["status"] == "completed"
+
+    db_session.expire_all()
+    assert db_session.get(Order, order["id"]).amount_cents == 155_000
+
+
+def test_改价为零元被拒且金额不变(client, db_session):
+    """0 元成交价与已收款并存会让对账分叉，必须整单拒绝、库里的金额一动不动。"""
+    token = admin_token(client)
+    order = _make_order(db_session, status="printing")
+
+    body = client.post(
+        f"/api/admin/order/{order.id}/complete",
+        json={"amount_cents": 0},
+        headers=auth(token),
+    ).json()
+
+    assert body["code"] == 40061, body
+    assert "大于 0" in body["message"]
+    assert body["data"] is None
+
+    db_session.expire_all()
+    refreshed = db_session.get(Order, order.id)
+    assert refreshed.amount_cents == 630, "被拒时不能改动金额"
+    assert refreshed.status == "printing", "被拒时不能推进状态"
+
+
+def test_文件被清理后拒绝开始打印(client, db_session, test_storage, monkeypatch):
+    """开始打印也会签发下载链接，对象没了必须整单拒绝，不能把失效链接交给老师。
+
+    对象被定时清理后，`start_print` 若照签不误，老师拿到的是指向空对象的链接，
+    订单却已经推进到「打印中」：既打印不出东西，也没法回到队列。
+    """
+    from app.services.storage.minio_store import MinioStorage
+
+    token = admin_token(client)
+    order = _make_order(db_session, status="queuing")
+
+    monkeypatch.setattr(MinioStorage, "stat_modified", lambda self, key: None)
+    refused = client.post(f"/api/admin/order/{order.id}/start", headers=auth(token)).json()
+
+    assert refused["code"] == 40406, refused
+    assert "已过期清理" in refused["message"]
+    assert refused["data"] is None, "被拒时不能带出签名链接"
+
+    db_session.expire_all()
+    assert db_session.get(Order, order.id).status == "queuing", "被拒时不能推进状态"
