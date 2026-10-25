@@ -1023,8 +1023,7 @@ async function waitMessageText(page, text, timeout = 20000) {
   )
 }
 
-/** 记录老师端「开始打印」接口调用，用来断言第一次点击真的没有调接口。 */
-function recordStartCalls(page) {
+/** 记录老师端「开始打印」接口调用，用来断言第一次点击真的没有调接口。 */function recordStartCalls(page) {
   const calls = []
   const handler = (request) => {
     try {
@@ -1048,6 +1047,33 @@ async function waitStartCalls(record, count, timeout = 20000) {
     await sleep(200)
   }
   throw new Error(`没有等到第 ${count} 次开始打印接口调用（实际 ${record.calls.length} 次）`)
+}
+
+/**
+ * 摘掉「这一步有意制造的失败」在异常汇总里的记录。
+ *
+ * watchPage 会记下所有 console 错误与 4xx/5xx 接口；本轮的回归里有两步要故意
+ * 让报价与设置页接口失败，不清掉就会把整轮判红。只按「这一步新增的 + 匹配谓词」
+ * 摘除，其他地方的同类异常照旧计数。
+ */
+function dropExpectedProblems(problems, from, predicate) {
+  let dropped = 0
+  for (let index = problems.length - 1; index >= from; index -= 1) {
+    if (predicate(problems[index])) {
+      problems.splice(index, 1)
+      dropped += 1
+    }
+  }
+  return dropped
+}
+
+/** 下单页的「确认下单」按钮现在是不是禁用状态。 */
+function orderButtonState(page) {
+  return page.evaluate(() => {
+    const button = document.querySelector('.plan-card .primary')
+    if (!button) return 'missing'
+    return button.hasAttribute('disabled') || button.disabled === true ? 'disabled' : 'enabled'
+  })
 }
 
 function watchPage(page, label, bucket) {
@@ -1324,12 +1350,24 @@ async function runViewport(browser, viewport) {
       step,
       orderId: startGuard.id,
     })
+    const copyAndRetry = await runCopyAndRetryPhase({
+      student,
+      teacher,
+      viewport,
+      problems,
+      step,
+    })
 
     if (problems.length) {
-      throw Object.assign(new Error(`页面/接口有 ${problems.length} 条异常记录`), {
-        step: '页面错误汇总',
-        stepIndex,
-      })
+      throw Object.assign(
+        new Error(
+          `页面/接口有 ${problems.length} 条异常记录：${problems.slice(0, 6).join('；')}`,
+        ),
+        {
+          step: '页面错误汇总',
+          stepIndex,
+        },
+      )
     }
     return {
       viewport: label,
@@ -1340,6 +1378,7 @@ async function runViewport(browser, viewport) {
       theme,
       startGuard,
       darkMode,
+      copyAndRetry,
     }
   } finally {
     await context.close()
@@ -2391,6 +2430,235 @@ async function runDarkModePhase({ student, teacher, viewport, step, orderId }) {
           .join('、')}`,
       )
     }
+  })
+
+  return result
+}
+
+// ---------------------------------------------------------------- 口径与重试
+/**
+ * 本轮新增的三条回归：收费口径说明、报价失败后的手动重试、设置页失败不白屏。
+ *
+ * 都跑在原有 41 步之后（两个视口各自编号 42–44），不改动也不放宽原有断言：
+ * 42 下单页只写「预计张数、实际以老师确认为准」，金额仍等于服务端报价；
+ * 43 让报价连续失败四次（首轮 + 3 次自动重试）后点「重新报价」能恢复并解锁下单；
+ * 44 老师端设置页两个接口失败时给出中文提示、页面不白屏、输入内容不丢。
+ */
+async function runCopyAndRetryPhase({ student, teacher, viewport, problems, step }) {
+  const result = { savingsTip: '', quoteAmount: '', retryAborts: 0, settingsNotice: '' }
+  let orderPayload = null
+
+  await step('口径：下单页写明「预计张数」，金额仍取服务端报价', async () => {
+    await gotoFresh(student, `${STUDENT_URL}/#/pages/order/order`)
+    await waitBody(student, '选择要打印的文件', 90000)
+    const quotes = recordQuoteRequests(student)
+    try {
+      await pickFile(student, '选择文档', FIXTURES.v1)
+      await waitBody(student, '3. 打印方案', 90000)
+      await sleep(1500)
+      await waitVisible(student, '.savings-tip', 30000)
+      if (!quotes.items.length) throw new Error('页面没有调用 /api/order/quote')
+      orderPayload = quotes.items[quotes.items.length - 1].payload
+    } finally {
+      quotes.stop()
+    }
+
+    const savings = await student.evaluate(() => {
+      const box = document.querySelector('.savings')
+      const tip = document.querySelector('.savings-tip')
+      return {
+        all: box ? (box.textContent || '').replace(/\s+/g, ' ').trim() : '',
+        tip: tip ? (tip.textContent || '').replace(/\s+/g, ' ').trim() : '',
+      }
+    })
+    if (!savings.tip.includes('预计张数')) {
+      throw new Error(`下单页没有写明「预计张数」：${savings.all || '（找不到说明行）'}`)
+    }
+    if (!savings.tip.includes('实际以老师确认为准')) {
+      throw new Error(`下单页没有写明「实际以老师确认为准」：${savings.tip}`)
+    }
+    // 不再出现「省 N 张」这种收费承诺
+    if (/省\s*\d+\s*张/.test(savings.all)) {
+      throw new Error(`下单页还在承诺省张数：${savings.all}`)
+    }
+
+    // 同页金额仍以服务端报价为准：脚本自己调一次报价接口，数字必须一致
+    const body = await quoteFromPage(student, orderPayload)
+    if (!body || body.code !== 0) throw new Error(`报价接口返回 ${JSON.stringify(body)}`)
+    const summary = await readQuoteSummary(student)
+    if (summary['应付金额'] !== money(body.data.amount_cents)) {
+      throw new Error(
+        `页面应付金额显示「${summary['应付金额'] || '无'}」，服务端报价是 ${money(body.data.amount_cents)}`,
+      )
+    }
+    result.savingsTip = savings.tip
+    result.quoteAmount = summary['应付金额']
+    if (viewport.mobile) await assertNoOverflow(student, '学生端预计张数说明')
+  })
+
+  await step('报价失败后点「重新报价」能恢复并解锁下单', async () => {
+    // uni.request 走 XHR，把它当网络中断：首轮 + 3 次自动重试共 4 次全部失败
+    const expected = { aborts: 0, wanted: 4 }
+    const quotes = recordQuoteRequests(student)
+    await student.setRequestInterception(true)
+    const abortQuote = (request) => {
+      if (
+        expected.aborts < expected.wanted &&
+        request.method() === 'POST' &&
+        request.url().includes('/api/order/quote')
+      ) {
+        expected.aborts += 1
+        request.abort('failed')
+        return
+      }
+      request.continue()
+    }
+    student.on('request', abortQuote)
+    const problemsBefore = problems.length
+    let retryPayload = null
+    try {
+      // 改一次颜色触发报价：自动重试 3 次全部会失败，之后页面必须给出手动出口
+      const switched = await student.evaluate(() => {
+        const rows = [...document.querySelectorAll('.plan-card .opt-row')]
+        const row = rows.find((item) =>
+          ((item.querySelector('.opt-label') || {}).textContent || '').includes('颜色'),
+        )
+        if (!row) return null
+        const target = [...row.querySelectorAll('.seg-item')].find(
+          (item) => !item.classList.contains('on'),
+        )
+        if (!target) return null
+        target.click()
+        return (target.textContent || '').trim()
+      })
+      if (!switched) throw new Error('下单页找不到可切换的颜色选项')
+      await waitBody(student, '服务端报价失败', 90000)
+      await waitBody(student, '重新报价', 30000)
+      if (expected.aborts !== expected.wanted) {
+        throw new Error(
+          `预期拦下 ${expected.wanted} 次报价请求（首轮 + 3 次重试），实际 ${expected.aborts} 次`,
+        )
+      }
+    } finally {
+      student.off('request', abortQuote)
+      await student.setRequestInterception(false)
+    }
+    dropExpectedProblems(
+      problems,
+      problemsBefore,
+      (text) =>
+        text.includes('/api/order/quote') ||
+        text.includes('ERR_FAILED') ||
+        text.includes('报价'),
+    )
+    result.retryAborts = expected.aborts
+
+    // 报价没成功之前不能拿旧金额下单
+    if ((await orderButtonState(student)) !== 'disabled') {
+      throw new Error('报价失败后「确认下单」仍然可以点，会拿旧金额下单')
+    }
+
+    // 点手动重试：立刻重新请求并解锁
+    await clickByText(student, '重新报价')
+    await waitGone(student, '服务端报价失败', 30000)
+    await waitGone(student, '重新报价', 30000)
+    await sleep(500)
+    retryPayload = quotes.items.length
+      ? quotes.items[quotes.items.length - 1].payload
+      : orderPayload
+    quotes.stop()
+    const body = await quoteFromPage(student, retryPayload)
+    if (!body || body.code !== 0) throw new Error(`重试后报价接口仍返回 ${JSON.stringify(body)}`)
+    const summary = await readQuoteSummary(student)
+    if (summary['应付金额'] !== money(body.data.amount_cents)) {
+      throw new Error(
+        `重试后页面应付金额「${summary['应付金额'] || '无'}」，服务端报价 ${money(body.data.amount_cents)}`,
+      )
+    }
+    const state = await orderButtonState(student)
+    if (state !== 'enabled') throw new Error(`重试成功后「确认下单」仍不可点（${state}）`)
+  })
+
+  await step('设置页：接口失败有中文提示、页面不白屏、公告不丢内容', async () => {
+    const failures = { sessions: 0, notice: 0 }
+    await teacher.setRequestInterception(true)
+    const failSettings = (request) => {
+      const url = request.url()
+      const isGet = request.method() === 'GET'
+      if (isGet && url.includes('/api/admin/sessions')) {
+        failures.sessions += 1
+        request.respond({
+          status: 500,
+          contentType: 'application/json',
+          body: JSON.stringify({ code: 50000, message: '模拟服务端故障' }),
+        })
+        return
+      }
+      if (request.method() === 'POST' && url.includes('/api/admin/notice')) {
+        failures.notice += 1
+        request.respond({
+          status: 500,
+          contentType: 'application/json',
+          body: JSON.stringify({ code: 50000, message: '模拟公告存储故障' }),
+        })
+        return
+      }
+      request.continue()
+    }
+    teacher.on('request', failSettings)
+    const problemsBefore = problems.length
+    try {
+      await gotoFresh(teacher, `${TEACHER_URL}/#/settings`)
+      // 1) 时段列表失败：必须出现中文提示，并且页面主体还在（不白屏）
+      await waitBody(teacher, '收单管理', 60000)
+      await waitBody(teacher, '收单时段失败', 30000)
+      if (!failures.sessions) throw new Error('没有拦到 /api/admin/sessions 请求')
+      const layout = await teacher.evaluate(() => {
+        const root = document.querySelector('.settings')
+        return {
+          settings: Boolean(root),
+          cards: document.querySelectorAll('.settings .page-card').length,
+          text: (document.body.innerText || '').slice(0, 4000),
+        }
+      })
+      if (!layout.settings || layout.cards < 2) {
+        throw new Error(`设置页白屏了：${JSON.stringify({ ...layout, text: undefined })}`)
+      }
+      if (!layout.text.includes('发布公告')) {
+        throw new Error('设置页少了「发布公告」卡片，页面没有完整渲染')
+      }
+      result.settingsNotice = '收单时段失败：已提示且页面不白屏'
+
+      // 2) 发布公告失败：提示要出现，输入的内容不能被清空
+      await clickSelector(teacher, '.notice-input textarea')
+      await teacher.type('.notice-input textarea', '回归用公告：设备检修', { delay: 10 })
+      await clickByText(teacher, '发布公告')
+      await waitBody(teacher, '公告发布失败', 30000)
+      if (!failures.notice) throw new Error('没有拦到 /api/admin/notice 请求')
+      const kept = await teacher.evaluate(() => {
+        const box = document.querySelector('.notice-input textarea')
+        return box ? box.value : ''
+      })
+      if (!kept.includes('设备检修')) {
+        throw new Error(`发布失败后公告内容被清空了：「${kept}」`)
+      }
+      result.settingsNotice += '；公告失败：已提示且内容保留'
+    } finally {
+      teacher.off('request', failSettings)
+      await teacher.setRequestInterception(false)
+    }
+    dropExpectedProblems(
+      problems,
+      problemsBefore,
+      (text) =>
+        text.includes('/api/admin/sessions') ||
+        text.includes('/api/admin/notice') ||
+        text.includes('模拟服务端故障') ||
+        text.includes('模拟公告存储故障') ||
+        // Chrome 对 5xx 的 console 记录只写状态码、不带路径，
+        // 这一步范围内的同类记录都属于本次有意制造的失败
+        text.includes('Failed to load resource'),
+    )
   })
 
   return result

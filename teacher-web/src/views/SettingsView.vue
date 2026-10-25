@@ -85,18 +85,31 @@ async function loadSessions() {
   try {
     const data = await fetchSessions(day.value)
     sessions.value = data.items || []
+  } catch (error) {
+    // 只有 try/finally 时，失败会抛成未处理的 Promise，页面停在旧数据上没有任何提示。
+    // 拦截器已经弹过一次服务端原话，这里补一句带上下文的提示，并保住表格不白屏。
+    console.warn('[设置] 加载收单时段失败', error)
+    ElMessage.error(`加载 ${day.value} 的收单时段失败：${error.message || '网络错误'}，请稍后重试`)
   } finally {
     loadingSessions.value = false
   }
 }
 
 async function switchSession(row, open) {
-  if (open) {
-    await openSession(day.value, row.session)
-    ElMessage.success(`${row.label}已恢复收单`)
-  } else {
-    await closeSession(day.value, row.session)
-    ElMessage.success(`${row.label}已截单，新订单将排到下一时段`)
+  try {
+    if (open) {
+      await openSession(day.value, row.session)
+      ElMessage.success(`${row.label}已恢复收单`)
+    } else {
+      await closeSession(day.value, row.session)
+      ElMessage.success(`${row.label}已截单，新订单将排到下一时段`)
+    }
+  } catch (error) {
+    // 开/截单失败必须说清「哪个时段没改成」：未捕获时按钮看起来像没反应
+    console.warn('[设置] 切换收单状态失败', error)
+    ElMessage.error(
+      `${row.label}${open ? '恢复收单' : '截单'}失败：${error.message || '网络错误'}，列表保持原状态`,
+    )
   }
   loadSessions()
 }
@@ -111,6 +124,10 @@ async function submitNotice() {
     await publishNotice(notice.value.trim())
     ElMessage.success('公告已发布')
     notice.value = ''
+  } catch (error) {
+    // 发布失败不能把输入框清空：老师写的公告还留在框里，可以直接重试
+    console.warn('[设置] 发布公告失败', error)
+    ElMessage.error(`公告发布失败：${error.message || '网络错误'}，内容已保留`)
   } finally {
     publishing.value = false
   }
