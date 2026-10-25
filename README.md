@@ -35,7 +35,7 @@ AI 体检、修复建议和 OCR，不是基础上传与下单功能的必要条�
 zhiyin-assistant/
 ├─ docs/
 │  └─ HANDOFF.md            # 项目交接文档（规格全文，唯一需求来源）
-├─ backend/                 # Python 3.11+ / FastAPI
+├─ backend/                 # Python 3.12+ / FastAPI
 │  ├─ app/
 │  │  ├─ main.py            # FastAPI 入口
 │  │  ├─ config.py          # 配置读取（环境变量 + config/*.json）
@@ -83,7 +83,7 @@ zhiyin-assistant/
 
 | 组件 | 版本 | 说明 |
 |---|---|---|
-| Python | 3.11+ | 用系统 Python 创建 venv（本机验证 3.14.7） |
+| Python | 3.12+ | 用系统 Python 创建 venv（本机验证 3.14.7） |
 | MySQL | 8.x | 免安装版默认解压到 `backend\.tools\mysql8` |
 | MinIO | 最新版 | 阶段 2 使用，可本机安装或用 docker-compose |
 | LibreOffice | 7.x+ | 阶段 5-A 使用，可本机安装或用 docker-compose |

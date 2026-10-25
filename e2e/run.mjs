@@ -493,6 +493,10 @@ async function readQueueNote(page) {
 const QUEUE_ROW_SELECTOR = '.order-card, .el-table__row'
 /** 后端 /api/admin/queue 的 page_size 上限（DashboardView.vue 的 QUEUE_PAGE_SIZE_MAX）。 */
 const QUEUE_PAGE_SIZE_MAX = 200
+/** 轮询一屏的条数（DashboardView.vue 的 QUEUE_PAGE_SIZE_POLL）。 */
+const QUEUE_PAGE_SIZE_POLL = 60
+/** 「加载更多」每次多要的条数（DashboardView.vue 的 QUEUE_LOAD_MORE_STEP）。 */
+const QUEUE_LOAD_MORE_STEP = 60
 
 /**
  * 同一帧里读全「页面列出来多少单」与「页面对隐藏了多少单的说法」。
@@ -564,6 +568,83 @@ function queueNoteProblem(snapshot, total) {
     return `还有 ${hidden} 单没显示，却没给「加载更多」：「${snapshot.note}」`
   }
   return null
+}
+
+/**
+ * 打开一个假的 `/api/admin/queue` 返回，其余请求照常放行。
+ *
+ * `buildData()` 每次请求都会重新造一份数据（页面会自己重拉，不能给它同一个可变对象）。
+ * `records` 按顺序记下页面真实请求过的 `page_size`，后面的断言全靠这份记录：
+ * 「点过加载更多之后，下一拍轮询按多少条拉」就是要看请求参数，而不是看页面文案。
+ */
+async function openFakeQueue(page, buildData) {
+  const records = []
+  await page.setRequestInterception(true)
+  const handler = (request) => {
+    const url = request.url()
+    if (request.method() === 'GET' && url.includes('/api/admin/queue')) {
+      records.push(Number(new URL(url).searchParams.get('page_size')) || 0)
+      request.respond({
+        status: 200,
+        contentType: 'application/json',
+        // 页面与接口不同源，不带 CORS 头浏览器会直接拦掉，测到的就只是网络错误
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Headers': '*',
+          'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+        },
+        body: JSON.stringify({ code: 0, message: 'ok', data: buildData() }),
+      })
+      return
+    }
+    request.continue()
+  }
+  page.on('request', handler)
+  return {
+    records,
+    async close() {
+      page.off('request', handler)
+      await page.setRequestInterception(false)
+    },
+  }
+}
+
+/**
+ * 把真实队列项复制成 n 条假数据（每条 id / 订单号 / 文件 id 都唯一）。
+ *
+ * 造 200 条不能直接复用同一个对象：el-table 的 row-key 是 id，重复 key 会让行渲染
+ * 与 DOM 数量对不上，断言就变成测 Element Plus 的容忍度了。
+ */
+function cloneQueueItems(items, count) {
+  const source = items.length ? items : [{}]
+  return Array.from({ length: count }, (_, index) => {
+    const base = source[index % source.length]
+    const files = (base.files || []).map((file, fileIndex) => ({
+      ...file,
+      id: `fake-${index}-file-${fileIndex + 1}`,
+    }))
+    return {
+      ...base,
+      id: `fake-${index + 1}`,
+      order_no: `FAKE${String(index + 1).padStart(4, '0')}`,
+      pickup_code: `F-${index + 1}`,
+      files,
+    }
+  })
+}
+
+/**
+ * 等到页面再发一次指定 page_size 的队列请求（轮询每 5 秒一次）。
+ * `from` 之后新出现的记录才算，避免拿历史请求充数。
+ */
+async function waitQueuePageSize(records, size, from = 0, timeout = 25000) {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    const hit = records.slice(from).findIndex((value) => value === size)
+    if (hit !== -1) return from + hit
+    await sleep(200)
+  }
+  return -1
 }
 
 // ---------------------------------------------------------------- 多文件场景
@@ -1532,6 +1613,8 @@ async function runViewport(browser, viewport) {
       problems,
       step,
     })
+    // 自带 AI 密钥两条：界面不在本分支时显式跳过并标注依赖（不写恒真断言）
+    const studentKey = await runStudentKeyPhase({ student, step })
 
     if (problems.length) {
       throw Object.assign(
@@ -1555,6 +1638,7 @@ async function runViewport(browser, viewport) {
       darkMode,
       copyAndRetry,
       priceAndRefund,
+      studentKey,
     }
   } finally {
     await context.close()
@@ -2668,8 +2752,148 @@ async function runPriceAndRefundPhase({ student, teacher, viewport, step }) {
     await sleep(1200)
   }, teacher)
 
-  // ---- 7. 生产构建里不许出现内网与本机回环地址
-  await step('配置：生产构建产物里不出现内网与本机回环地址', async () => {
+  // ---- 7. 点过「加载更多」之后，下一拍轮询必须回落到第一屏
+  await step('队列：点过「加载更多」后，下一拍轮询回落到第一屏 60 条', async () => {
+    // 页头文案与实际行为必须一致：文案写「每 5 秒自动刷新第一屏 60 条」，
+    // 轮询就得只拉 60 条。以前点过一次「加载更多」，轮询把增量带到了以后每一拍（120/180/200）。
+    const headerText = await teacher.evaluate(() => document.body.innerText || '')
+    if (!headerText.includes('每 5 秒自动刷新第一屏 60 条')) {
+      throw new Error('队列页头没有写「每 5 秒自动刷新第一屏 60 条」，文案与轮询行为无法对照')
+    }
+
+    // 库里现在没那么多单，造一个必然有「没显示」的单数：真实单 + 34 单
+    const real = await fetchQueueFromPage(teacher, 60)
+    const items = cloneQueueItems(real.items || [], 60)
+    const total = items.length + 34
+    const fake = { ...real, items, total, page: 1, page_size: 60 }
+    const queue = await openFakeQueue(teacher, () => ({ ...fake, items: [...fake.items] }))
+    try {
+      // 手点「刷新」按一页 200 条拉，先把「加载更多」逗出来（隐藏 34 单）
+      const beforeRefresh = queue.records.length
+      await clickByText(teacher, '刷新')
+      await waitBody(teacher, `还有 ${total - items.length} 单未显示`, 30000)
+      if (!queue.records.slice(beforeRefresh).includes(QUEUE_PAGE_SIZE_MAX)) {
+        throw new Error(
+          `手点「刷新」没有按一页 ${QUEUE_PAGE_SIZE_MAX} 条拉，实际：` +
+            `${queue.records.slice(beforeRefresh).join(',') || '无'}`,
+        )
+      }
+
+      // 第一次「加载更多」：在第一屏 60 条的基础上 +60 条 = 120
+      const beforeLoadMore = queue.records.length
+      await clickByText(teacher, '加载更多')
+      const firstLoadMoreAt = await waitQueuePageSize(
+        queue.records,
+        QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP,
+        beforeLoadMore,
+        15000,
+      )
+      if (firstLoadMoreAt === -1) {
+        throw new Error(
+          `「加载更多」没有按 ${QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP} 条重拉，实际：` +
+            `${queue.records.slice(beforeLoadMore).join(',') || '无'}`,
+        )
+      }
+
+      // 下一拍轮询（5 秒一次）必须回到第一屏 60 条
+      const pollAt = await waitQueuePageSize(
+        queue.records,
+        QUEUE_PAGE_SIZE_POLL,
+        firstLoadMoreAt + 1,
+        25000,
+      )
+      if (pollAt === -1) {
+        throw new Error(
+          `加载更多之后的轮询没有回落到第一屏 ${QUEUE_PAGE_SIZE_POLL} 条，实际：` +
+            `${queue.records.slice(firstLoadMoreAt + 1).join(',') || '无'}`,
+        )
+      }
+      result.pollFallback = queue.records.slice(beforeLoadMore)
+      console.log(
+        `      队列：刷新→加载更多→轮询 请求 page_size ${queue.records.slice(beforeRefresh).join('→')}`,
+      )
+
+      // 增量不累积：回落后再点一次「加载更多」，仍然只到 120，不是 180
+      const beforeSecond = queue.records.length
+      await clickByText(teacher, '加载更多')
+      const secondAt = await waitQueuePageSize(
+        queue.records,
+        QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP,
+        beforeSecond,
+        15000,
+      )
+      if (secondAt === -1) {
+        throw new Error(
+          `轮询回落后再点「加载更多」没按 ${QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP} 条拉，实际：` +
+            `${queue.records.slice(beforeSecond).join(',') || '无'}`,
+        )
+      }
+      const bigger = queue.records
+        .slice(beforeSecond, secondAt + 1)
+        .filter((size) => size > QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP)
+      if (bigger.length) {
+        throw new Error(
+          `「加载更多」的增量累积了（出现 ${bigger.join(',')} 条请求），应该每次只 +${QUEUE_LOAD_MORE_STEP}`,
+        )
+      }
+      result.loadMoreAfterFallback = queue.records[secondAt]
+    } finally {
+      await queue.close()
+    }
+    // 回到真实数据：刷新一次，别把假数据带到后面的步骤里
+    await clickByText(teacher, '刷新')
+    await sleep(1200)
+  }, teacher)
+
+  // ---- 8. 超过 200 单：必须说「已显示前 200 单」，并且不再给「加载更多」
+  await step('队列：超过 200 单时提示封顶且不再给「加载更多」', async () => {
+    // 库里只有不到 200 单，永远触发不到封顶分支；这里把返回伪造到 200 条明细 + 260 总数，
+    // 正好落在「page_size 已顶到后端上限、还有单没显示」这个分支上。
+    const real = await fetchQueueFromPage(teacher, QUEUE_PAGE_SIZE_MAX)
+    const items = cloneQueueItems(real.items || [], QUEUE_PAGE_SIZE_MAX)
+    const total = QUEUE_PAGE_SIZE_MAX + 60
+    const fake = { ...real, items, total, page: 1, page_size: QUEUE_PAGE_SIZE_MAX }
+    const queue = await openFakeQueue(teacher, () => ({ ...fake, items: [...fake.items] }))
+    try {
+      const before = queue.records.length
+      await clickByText(teacher, '刷新')
+      if ((await waitQueuePageSize(queue.records, QUEUE_PAGE_SIZE_MAX, before, 30000)) === -1) {
+        throw new Error(
+          `手点「刷新」没有按一页 ${QUEUE_PAGE_SIZE_MAX} 条拉，实际：` +
+            `${queue.records.slice(before).join(',') || '无'}`,
+        )
+      }
+      await waitBody(teacher, `已显示前 ${QUEUE_PAGE_SIZE_MAX} 单`, 30000)
+
+      // 同一帧里读条数与提示（队列会自己轮询回 60 条，分两次读会读到两个状态）
+      const snapshot = await readQueueSnapshot(teacher)
+      const problem = queueNoteProblem(snapshot, total)
+      if (problem) throw new Error(`${problem}（假 total ${total}）`)
+      if (snapshot.rows < QUEUE_PAGE_SIZE_MAX) {
+        throw new Error(`页面只列了 ${snapshot.rows} 单，没到封顶的 ${QUEUE_PAGE_SIZE_MAX} 单`)
+      }
+      if (snapshot.hasLoadMore) {
+        throw new Error(`已经顶到单页上限，还给了「加载更多」：「${snapshot.note}」`)
+      }
+      if (!snapshot.note.includes(`还有 ${total - QUEUE_PAGE_SIZE_MAX} 单未显示`)) {
+        throw new Error(
+          `封顶提示没写剩余单数（应写「还有 ${total - QUEUE_PAGE_SIZE_MAX} 单未显示」）：「${snapshot.note}」`,
+        )
+      }
+      result.queueCap = { rows: snapshot.rows, note: snapshot.note, total }
+      console.log(
+        `      队列封顶：列出 ${snapshot.rows} 单 / 假 total ${total} / 提示「${snapshot.note}」/ 加载更多 ${snapshot.hasLoadMore ? '还在' : '已隐藏'}`,
+      )
+    } finally {
+      await queue.close()
+    }
+    // 回到真实数据：刷新一次，并等轮询把条数接回第一屏
+    await clickByText(teacher, '刷新')
+    await sleep(1200)
+  }, teacher)
+
+  // ---- 9. 生产构建里不许出现内网与本机回环地址
+  await step('配置：学生端生产构建产物里不出现内网与本机回环地址', async () => {
     const scan = await studentProductionBundleScan()
     result.bundle = { dir: scan.dir, files: scan.files, bytes: scan.bytes, hits: scan.hits.length }
     if (scan.hits.length) {
@@ -2680,6 +2904,38 @@ async function runPriceAndRefundPhase({ student, teacher, viewport, step }) {
           .join('；')}`,
       )
     }
+  })
+
+  // ---- 10. 老师端生产构建同样不许带地址出去（上线当天最先炸的就是这条）
+  await step('配置：老师端生产构建产物里不出现内网与本机回环地址', async () => {
+    const scan = await teacherProductionBundleScan()
+    result.teacherBundle = {
+      dir: scan.dir,
+      files: scan.files,
+      bytes: scan.bytes,
+      hits: scan.hits.length,
+      apiBase: scan.apiBase,
+    }
+    if (scan.hits.length) {
+      throw new Error(
+        `老师端生产产物里出现了本机/内网地址：${scan.hits
+          .slice(0, 5)
+          .map((hit) => `${hit.file} → ${hit.match}`)
+          .join('；')}`,
+      )
+    }
+    // 配置契约：.env.production 必须有 VITE_API_BASE_URL 且留空（同源相对路径）
+    if (!scan.hasApiBaseKey) {
+      throw new Error(`${scan.envFile} 里没有 VITE_API_BASE_URL，生产构建的接口地址没有唯一来源`)
+    }
+    if (scan.apiBase !== '') {
+      throw new Error(
+        `老师端 .env.production 的 VITE_API_BASE_URL 应该留空（同源相对路径），实际是「${scan.apiBase}」`,
+      )
+    }
+    console.log(
+      `      老师端产物：${scan.files} 个文件 / ${Math.round(scan.bytes / 1024)} KB / 本机与内网地址 ${scan.hits.length} 处 / VITE_API_BASE_URL 留空`,
+    )
   })
 
   return { orderNo: order.orderNo, pickup: order.pickup, ...result }
@@ -2805,6 +3061,108 @@ function buildAndScanStudentBundle() {
     }
     walk(outDir)
     return { dir: path.relative(REPO_ROOT, outDir), files, bytes, hits }
+  })()
+}
+
+/**
+ * 用 `.env.production` 打一次老师端生产包，再扫产物里有没有本机/内网地址。
+ *
+ * 为什么单独扫一次：老师端以前没有生产配置文件，请求地址兜底写死了
+ * `http://127.0.0.1:8000`，构建产物里真的带着它——柜台机上线就全站打到自己电脑。
+ * 这条断言就是那个事故的回归：产物里一个回环地址都不许有。
+ *
+ * 只打一次：两个视口共用同一份结果。`VITE_API_BASE_URL` 从环境里摘掉，
+ * 就是要验证「生产配置留空 → 同源相对路径」这一支的真实行为。
+ */
+let teacherBundleScanPromise = null
+function teacherProductionBundleScan() {
+  if (!teacherBundleScanPromise) teacherBundleScanPromise = buildAndScanTeacherBundle()
+  return teacherBundleScanPromise
+}
+
+function buildAndScanTeacherBundle() {
+  return (async () => {
+    const appDir = path.join(REPO_ROOT, 'teacher-web')
+    const cli = path.join(appDir, 'node_modules', 'vite', 'bin', 'vite.js')
+    if (!fs.existsSync(cli)) throw new Error(`老师端 Vite CLI 不存在：${cli}`)
+    const envFile = path.join(appDir, '.env.production')
+    if (!fs.existsSync(envFile)) {
+      throw new Error(`老师端没有生产配置文件：${envFile}（生产接口地址就没有唯一来源）`)
+    }
+    const envValues = readEnvFile(envFile)
+    const hasApiBaseKey = Object.prototype.hasOwnProperty.call(envValues, 'VITE_API_BASE_URL')
+    const apiBase = String(envValues.VITE_API_BASE_URL || '').trim()
+
+    const env = { ...process.env }
+    delete env.VITE_API_BASE_URL
+    const outDir = path.join(appDir, 'dist')
+    const build = spawnSync(process.execPath, [cli, 'build'], {
+      cwd: appDir,
+      env,
+      encoding: 'utf8',
+      timeout: 900000,
+    })
+    if (build.status !== 0) {
+      throw new Error(
+        `老师端生产构建失败（code=${build.status}）：${(build.stderr || build.stdout || '').slice(-1500)}`,
+      )
+    }
+    if (!fs.existsSync(path.join(outDir, 'index.html'))) {
+      throw new Error(`老师端构建产物没有 index.html：${outDir}`)
+    }
+
+    // 不把裸 `//localhost` 当命中：axios 内部有 `window.location.href || "http://localhost"`
+    // 这种第三方兜底字符串，它不带端口也不指向任何服务。这里扫的是「能被当成服务地址用」
+    // 的写法：回环、IPv6 回环、带端口的 localhost、三段内网网段。
+    const patterns = [
+      { name: '本机回环 127.0.0.1', regex: /127\.0\.0\.1/g },
+      { name: 'IPv6 回环 [::1]', regex: /\[::1\]/g },
+      { name: '本机回环 localhost:端口', regex: /localhost:\d+/g },
+      { name: '内网 192.168.x.x', regex: /192\.168\.\d{1,3}\.\d{1,3}/g },
+      { name: '内网 10.x.x.x', regex: /(?<![\d.])10\.\d{1,3}\.\d{1,3}\.\d{1,3}(?![\d.])/g },
+      {
+        name: '内网 172.16-31.x.x',
+        regex: /(?<![\d.])172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}(?![\d.])/g,
+      },
+    ]
+    const hits = []
+    let files = 0
+    let bytes = 0
+    const walk = (dir) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name)
+        if (entry.isDirectory()) {
+          walk(full)
+          continue
+        }
+        if (!/\.(js|mjs|css|html|json|map)$/i.test(entry.name)) continue
+        const text = fs.readFileSync(full, 'utf8')
+        files += 1
+        bytes += text.length
+        for (const pattern of patterns) {
+          pattern.regex.lastIndex = 0
+          let match = pattern.regex.exec(text)
+          while (match) {
+            hits.push({
+              file: path.relative(outDir, full),
+              pattern: pattern.name,
+              match: match[0],
+            })
+            match = pattern.regex.exec(text)
+          }
+        }
+      }
+    }
+    walk(outDir)
+    return {
+      dir: path.relative(REPO_ROOT, outDir),
+      files,
+      bytes,
+      hits,
+      envFile: path.relative(REPO_ROOT, envFile),
+      hasApiBaseKey,
+      apiBase,
+    }
   })()
 }
 
@@ -3390,6 +3748,168 @@ async function runCopyAndRetryPhase({ student, teacher, viewport, problems, step
   return result
 }
 
+// ---------------------------------------------------------------- 学生端自带 AI 密钥
+/**
+ * 学生自带 AI 密钥（两条回归）。
+ *
+ * 依赖另一路的界面：「我的」页里的 AI 密钥面板。面板不在本分支时，这两步
+ * **显式跳过并标注依赖**（打印出原因、写进 result），**不写成恒真断言**：
+ * 界面合入后同一条代码路径直接生效，不需要回头改回归。
+ */
+const KEY_PANEL_MISSING =
+  '依赖未合入：「我的」页 AI 密钥面板不在本分支（另一路负责界面），步骤已跳过'
+const KEY_PANEL_TEXT_RE = 'AI\\s*密钥|自带密钥|我的密钥'
+
+/** 在「我的」页里找 AI 密钥面板的入口（找不到说明那一版界面还没合入）。 */
+async function findKeyPanelEntry(page) {
+  return page.evaluate((pattern) => {
+    const regex = new RegExp(pattern)
+    const nodes = [
+      ...document.querySelectorAll('.page button, .page uni-button, .page view, .page [role="button"]'),
+    ].filter((node) => node.getClientRects().length > 0)
+    const hit = nodes.find((node) => regex.test(node.innerText || node.textContent || ''))
+    return hit ? (hit.innerText || hit.textContent || '').trim().slice(0, 40) : ''
+  }, KEY_PANEL_TEXT_RE)
+}
+
+/** 给页面上第一个匹配的输入框填值（v-model 跟随 input 事件）。 */
+async function fillFirstInput(page, selector, value) {
+  const ok = await page.evaluate(
+    ({ selector, value }) => {
+      const input =
+        document.querySelector(`${selector} input`) || document.querySelector(selector)
+      if (!input) return false
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        'value',
+      ).set
+      setter.call(input, String(value))
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      input.dispatchEvent(new Event('change', { bubbles: true }))
+      input.blur()
+      return true
+    },
+    { selector, value },
+  )
+  if (!ok) throw new Error(`找不到输入框：${selector}`)
+}
+
+async function runStudentKeyPhase({ student, step }) {
+  const result = { skipped: false, reason: '', panelEntry: '', testReason: '', headerOnly: null }
+
+  await step('密钥：「我的」页打开 AI 密钥面板，无效密钥给出可读原因，清除后回到学校共享', async () => {
+    await gotoFresh(student, `${STUDENT_URL}/#/pages/mine/mine`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    })
+    await waitBody(student, '全部', 60000)
+    result.panelEntry = await findKeyPanelEntry(student)
+    if (!result.panelEntry) {
+      result.skipped = true
+      result.reason = KEY_PANEL_MISSING
+      console.log(`\n      跳过：${KEY_PANEL_MISSING}`)
+      return
+    }
+    await clickByText(student, result.panelEntry)
+    await waitVisible(student, '.key-panel, .ai-key-panel, .key-sheet', 20000)
+
+    // 1) 填一个必然无效的密钥，点「测试连通」：必须给出能读的原因，不能只说“失败”
+    await fillFirstInput(student, '.key-panel input, .ai-key-panel input, .key-sheet input', 'sk-e2e-invalid-key')
+    await clickByText(student, '测试连通')
+    await student.waitForFunction(
+      () => /失败|无效|不可用|错误|超时/.test(document.body.innerText || ''),
+      { timeout: 30000, polling: 300 },
+    )
+    const failureText = await visibleKeyPanelText(student)
+    if (/连通正常|可用|成功/.test(failureText) && !/失败|无效|不可用/.test(failureText)) {
+      throw new Error(`无效密钥居然测通了：「${failureText.slice(0, 200)}」`)
+    }
+    result.testReason = failureText.slice(0, 300)
+
+    // 2) 清除后必须回到「学校共享」
+    await clickByText(student, '清除')
+    await waitBody(student, '学校共享', 30000)
+    result.clearedToShared = true
+  })
+
+  await step('密钥：只出现在请求头里，页面地址与请求体里都没有', async () => {
+    if (result.skipped || !result.panelEntry) {
+      result.skipped = true
+      result.reason = result.reason || KEY_PANEL_MISSING
+      console.log(`\n      跳过：${result.reason}`)
+      return
+    }
+    const key = 'sk-e2e-header-probe-0123456789'
+    const seen = []
+    const collect = (request) => {
+      const headers = request.headers() || {}
+      seen.push({
+        url: request.url(),
+        postData: request.postData() || '',
+        headerKeys: Object.entries(headers)
+          .filter(([, value]) => String(value).includes(key))
+          .map(([name]) => name),
+      })
+    }
+    student.on('request', collect)
+    try {
+      await gotoFresh(student, `${STUDENT_URL}/#/pages/mine/mine`, {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+      })
+      await waitBody(student, '全部', 60000)
+      await clickByText(student, result.panelEntry)
+      await waitVisible(student, '.key-panel, .ai-key-panel, .key-sheet', 20000)
+      await fillFirstInput(student, '.key-panel input, .ai-key-panel input, .key-sheet input', key)
+      await clickByText(student, '保存')
+      // 保存后会走一次真实 AI 请求，这里不要求它成功，只看密钥去哪了
+      await sleep(3000)
+    } finally {
+      student.off('request', collect)
+    }
+
+    const withKey = seen.filter((item) => item.headerKeys.length)
+    const inUrl = seen.filter((item) => item.url.includes(key))
+    const inBody = seen.filter((item) => item.postData.includes(key))
+    const panelText = await visibleKeyPanelText(student)
+    const pageUrl = await student.evaluate(() => window.location.href)
+    result.headerOnly = {
+      requests: seen.length,
+      withKeyHeader: withKey.length,
+      inUrl: inUrl.length,
+      inBody: inBody.length,
+    }
+    if (!withKey.length) {
+      throw new Error('保存密钥后没有任何请求把密钥带在请求头里，无法确认密钥真的生效')
+    }
+    if (inUrl.length) {
+      throw new Error(`密钥出现在请求地址里：${inUrl[0].url.replace(key, '<密钥>')}`)
+    }
+    if (inBody.length) {
+      throw new Error(`密钥出现在请求体里：${inBody.map((item) => item.url).join(',')}`)
+    }
+    if (pageUrl.includes(key)) {
+      throw new Error('密钥出现在页面地址里')
+    }
+    if (panelText.includes(key)) {
+      throw new Error('密钥以明文整串显示在页面上（应只显示后四位）')
+    }
+  })
+
+  return result
+}
+
+/** 密钥面板的正文（面板没渲染就是空串）。 */
+async function visibleKeyPanelText(page) {
+  return page.evaluate(() => {
+    const panels = [
+      ...document.querySelectorAll('.key-panel, .ai-key-panel, .key-sheet'),
+    ].filter((node) => node.getClientRects().length > 0)
+    const panel = panels[panels.length - 1]
+    return panel ? panel.innerText || panel.textContent || '' : ''
+  })
+}
+
 // ---------------------------------------------------------------- 入口
 async function main() {
   console.log(`智印助手浏览器回归 · ${STAMP}`)
@@ -3459,6 +3979,11 @@ async function main() {
     return 1
   }
   console.log(`\n全部通过：${results.map((item) => item.viewport).join('、')} 两个视口`)
+  for (const item of results) {
+    if (item.studentKey && item.studentKey.skipped) {
+      console.log(`  视口 ${item.viewport} 跳过：${item.studentKey.reason}`)
+    }
+  }
   console.log(`记录：${ARTIFACTS}/result.json`)
   return 0
 }

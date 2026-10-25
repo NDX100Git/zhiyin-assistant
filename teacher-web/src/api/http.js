@@ -98,9 +98,22 @@ export function createResponseHandlers({ notify = defaultNotify } = {}) {
   }
 }
 
+/**
+ * 接口地址只从构建环境来（`VITE_API_BASE_URL`），代码里**没有任何地址兜底**。
+ *
+ * 以前这里兜底写死 `http://127.0.0.1:8000`，问题不是“开发方便”，而是会跟着
+ * 生产包一起发出去：`.env.production` 一漏配，老师端柜台机上线就全站打到本机
+ * 回环，控制台一片网络错误，还让人以为后端挂了。
+ *
+ * 现在口径与 `vite.config.js`、`.env.production` 一致：
+ * - 留空（生产同源部署的默认值）= 相对路径 `''`，请求 `/api/...`，由 Nginx 反代；
+ * - 开发由 `.env.development` 给绝对地址，真机/独立域名用命令行环境变量覆盖。
+ * 单测在 Node 里 import 本模块时没有 Vite 注入的 import.meta.env，用可选链兜住。
+ */
+const API_BASE_URL = String((import.meta.env && import.meta.env.VITE_API_BASE_URL) || '')
+
 const http = axios.create({
-  // 单测在 Node 里 import 本模块时没有 Vite 注入的 import.meta.env，用可选链兜住
-  baseURL: import.meta.env?.VITE_API_BASE_URL || 'http://127.0.0.1:8000',
+  baseURL: API_BASE_URL,
   timeout: 120000,
 })
 
