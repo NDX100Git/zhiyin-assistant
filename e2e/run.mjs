@@ -392,6 +392,103 @@ async function clickDialog(page, label) {
   if (!clicked) throw new Error(`弹窗里找不到「${label}」按钮`)
 }
 
+/**
+ * 点掉 uni.showModal 的“确定”（学生端点「取消订单」会用到）。
+ *
+ * 两个坑：
+ * 1. uni H5 的确认框是 <uni-modal> + div.uni-modal__btn，不是 <button>；
+ * 2. 项目没配 uni 语言包，默认按钮文案是 OK / Cancel，不是中文。
+ * 所以不按文字找，直接点主按钮，再校验它确实是确认键。
+ */
+async function confirmUniModal(page, timeout = 20000) {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    const text = await page.evaluate(() => {
+      const modal = [...document.querySelectorAll('uni-modal, .uni-modal')]
+        .filter((element) => element.getClientRects().length > 0)
+        .pop()
+      if (!modal) return ''
+      const button = modal.querySelector('.uni-modal__btn_primary')
+      if (!button) return ''
+      button.click()
+      return (button.innerText || button.textContent || '').trim()
+    })
+    if (text) {
+      if (!/^(OK|确定|确认)$/.test(text)) {
+        throw new Error(`确认框主按钮文案异常：「${text}」，可能点错了按钮`)
+      }
+      return text
+    }
+    await sleep(300)
+  }
+  throw new Error('学生端取消订单的确认框没有出现')
+}
+
+/** 给 el-input-number 里的原生 input 赋值（v-model 跟随 input 事件）。 */
+async function setNumberInput(page, selector, value) {
+  const ok = await page.evaluate(
+    ({ selector, value }) => {
+      const input =
+        document.querySelector(`${selector} input`) || document.querySelector(selector)
+      if (!input) return false
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
+      setter.call(input, String(value))
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      input.dispatchEvent(new Event('change', { bubbles: true }))
+      input.blur()
+      return true
+    },
+    { selector, value },
+  )
+  if (!ok) throw new Error(`找不到金额输入框：${selector}`)
+}
+
+/** 读 el-input-number 里原生 input 当前显示的值。 */
+async function readNumberInput(page, selector) {
+  return page.evaluate((selector) => {
+    const input = document.querySelector(`${selector} input`) || document.querySelector(selector)
+    return input ? String(input.value).trim() : ''
+  }, selector)
+}
+
+/** 最近一个可见弹窗的正文（弹窗里没渲染出来就算空）。 */
+async function visibleDialogText(page) {
+  return page.evaluate(() => {
+    const dialogs = [...document.querySelectorAll('.el-dialog')].filter(
+      (element) => element.getClientRects().length > 0,
+    )
+    const dialog = dialogs[dialogs.length - 1]
+    return dialog ? dialog.innerText || dialog.textContent || '' : ''
+  })
+}
+
+/** 老师端队列接口的原始返回（带管理员 token），用来算“还有多少单没显示”。 */
+async function fetchQueueFromPage(page, pageSize = 60) {
+  const body = await page.evaluate(
+    async ({ backendUrl, pageSize }) => {
+      const token = localStorage.getItem('zhiyin_admin_token')
+      if (!token) return { error: 'localStorage 里没有管理员 token' }
+      const response = await fetch(`${backendUrl}/api/admin/queue?page=1&page_size=${pageSize}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      return response.json()
+    },
+    { backendUrl: BACKEND_URL, pageSize },
+  )
+  if (!body || body.code !== 0) throw new Error(`队列接口返回 ${JSON.stringify(body)}`)
+  return body.data
+}
+
+/** 队列末尾的「还有 N 单未显示」提示文案，没有就是空串。 */
+async function readQueueNote(page) {
+  return page.evaluate(() => {
+    const note = [...document.querySelectorAll('.queue-more-note')].filter(
+      (element) => element.getClientRects().length > 0,
+    )[0]
+    return note ? (note.innerText || note.textContent || '').trim() : ''
+  })
+}
+
 // ---------------------------------------------------------------- 多文件场景
 /**
  * 切页并强制重建页面实例。
@@ -1343,6 +1440,7 @@ async function runViewport(browser, viewport) {
     const fourFile = await runFourFilePhase({ student, teacher, viewport, step })
     const theme = await runThemePhase({ student, teacher, viewport, step })
     const startGuard = await runStartGuardPhase({ student, teacher, viewport, step })
+    const priceAndRefund = await runPriceAndRefundPhase({ student, teacher, viewport, step })
     const darkMode = await runDarkModePhase({
       student,
       teacher,
@@ -1379,6 +1477,7 @@ async function runViewport(browser, viewport) {
       startGuard,
       darkMode,
       copyAndRetry,
+      priceAndRefund,
     }
   } finally {
     await context.close()
@@ -2080,6 +2179,503 @@ async function runStartGuardPhase({ student, teacher, viewport, step }) {
   }, teacher)
 
   return { orderNo: order.orderNo, pickup: order.pickup, id: order.id, ...result }
+}
+
+// ---------------------------------------------------------------- 改价与退款
+/**
+ * 资金口径收口：确认价不能被系统价抹掉，已付款单的取消与退款各有出口。
+ *
+ * 流程（一单到底，不另造脏数据）：
+ * 1. 用 2 页的 v2 下一单并支付（已付款排队单）；用 1 页的 v1 换文件，
+ *    这样「系统重算价 < 学生已付」——确认价可以落在两者之间，既与系统价不同，
+ *    又不超过已收，后面的退款才说得清。
+ * 2. 老师把确认价改成两者之间（不是系统价），走完「开始打印 → 打印完成」，
+ *    断言弹窗预填的是确认价，落库金额仍是确认价。
+ * 3. 这一单再标记异常 → 关单时填退款金额，断言「已退款 X 元」与超额拦截。
+ * 4. 另下一单不付款：待支付单仍能自助取消；已付款单只能找老师。
+ */
+async function runPriceAndRefundPhase({ student, teacher, viewport, step }) {
+  const order = { orderNo: '', pickup: '', id: 0 }
+  const result = {}
+
+  // ---- 1. 已付款排队单：取消按钮必须收起来，换成找老师的提示
+  await step('改价：下一单并支付，学生端已付款排队单看不到取消按钮', async () => {
+    await gotoFresh(student, `${STUDENT_URL}/#/pages/order/order`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    })
+    await waitBody(student, '选择要打印的文件', 90000)
+    // 用 2 页的 v2：换成 1 页的 v1 后系统价会降，确认价才有夹在中间的空间
+    await pickFile(student, '选择文档', FIXTURES.v2)
+    await waitBody(student, '3. 打印方案', 90000)
+    await waitBody(student, '确认下单', 60000)
+    await clickByText(student, '确认下单')
+    await waitBody(student, '下单成功', 60000)
+    Object.assign(order, await readOrderResult(student))
+    order.id = await orderIdFromApi(student, order.orderNo)
+    await clickByTextRetry(student, '模拟支付')
+    await waitGone(student, '模拟支付', 30000)
+
+    // 列表页：已付款排队单不该有「取消」，要有“找文印室老师”的提示
+    await gotoFresh(student, `${STUDENT_URL}/#/pages/mine/mine`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    })
+    await waitBody(student, '全部', 60000)
+    await waitBody(student, order.orderNo, 60000)
+    const row = await student.evaluate((orderNo) => {
+      const cards = [...document.querySelectorAll('.card.order')]
+      const card = cards.find((element) => (element.innerText || '').includes(orderNo))
+      if (!card) return { found: false }
+      return {
+        found: true,
+        // uni-app 的 <button> 在 H5 里渲染成 <uni-button>，两种都要算上
+        buttons: [...card.querySelectorAll('button, uni-button')].map((item) =>
+          (item.innerText || item.textContent || '').trim(),
+        ),
+        hint: (() => {
+          const node = card.querySelector('.cancel-hint')
+          return node ? (node.innerText || node.textContent || '').trim() : ''
+        })(),
+      }
+    }, order.orderNo)
+    if (!row.found) throw new Error(`「我的订单」里找不到 ${order.orderNo}`)
+    if (row.buttons.some((text) => text.includes('取消'))) {
+      throw new Error(`已付款排队单还显示取消按钮：${row.buttons.join(' / ')}`)
+    }
+    if (!row.hint.includes('请联系文印室老师')) {
+      throw new Error(`已付款排队单没有给出“找老师”的提示，实际提示：「${row.hint}」`)
+    }
+    result.mineHint = row.hint
+
+    // 详情页同样不给取消入口
+    await gotoFresh(student, `${STUDENT_URL}/#/pages/mine/detail?id=${order.id}`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    })
+    await waitBody(student, '取件码 · 凭此码到文印室取件', 60000)
+    const detail = await student.evaluate(() => ({
+      buttons: [...document.querySelectorAll('.actions button, .actions uni-button')].map(
+        (item) => (item.innerText || item.textContent || '').trim(),
+      ),
+      hint: (() => {
+        const node = document.querySelector('.cancel-hint')
+        return node ? (node.innerText || node.textContent || '').trim() : ''
+      })(),
+    }))
+    if (detail.buttons.some((text) => text.includes('取消'))) {
+      throw new Error(`已付款排队单详情页还显示取消按钮：${detail.buttons.join(' / ')}`)
+    }
+    if (!detail.hint.includes('请联系文印室老师')) {
+      throw new Error(`详情页没有给出“找老师”的提示，实际提示：「${detail.hint}」`)
+    }
+    result.detailHint = detail.hint
+    if (viewport.mobile) await assertNoOverflow(student, '学生端已付款订单详情')
+  })
+
+  // ---- 2. 换文件 → 老师按「不是系统价」的确认价通过
+  await step('改价：学生换文件，老师按高于系统价的确认价通过', async () => {
+    await gotoFresh(student, `${STUDENT_URL}/#/pages/mine/replace?id=${order.id}`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    })
+    await waitBody(student, '当前订单', 60000)
+    await pickFile(student, '选择文档', FIXTURES.v1)
+    await submitChangeRequest(student, '2. 确认变更')
+    await waitBody(student, '已提交一份换文件申请', 45000)
+
+    const before = await orderDetailFromApi(student, order.id)
+    result.paidCents = Number(before.amount_cents) || 0
+    if (!before.file_change) throw new Error('学生提交后订单上没有待确认的换文件申请')
+    const systemCents = Number(before.file_change.new_amount_cents) || 0
+    if (!(result.paidCents > systemCents)) {
+      throw new Error(
+        `换文件后系统价 ${systemCents} 分不低于已付 ${result.paidCents} 分：` +
+          '这一轮需要「已付 > 系统价」才能夹出确认价',
+      )
+    }
+    // 确认价夹在“系统价”与“已付”之间：既不等于系统价（能证伪预填），也不超过已收（退款才成立）
+    const confirmed = systemCents + Math.floor((result.paidCents - systemCents) / 2)
+    result.systemCents = systemCents
+    result.confirmCents = confirmed
+
+    await searchQueue(teacher, order.pickup)
+    await waitRowText(teacher, order.pickup, '文件待确认', 45000)
+    await clickRowButton(teacher, order.pickup, '确认换文件')
+    await waitBody(teacher, '系统重算价', 30000)
+    const shownSystem = await visibleDialogText(teacher)
+    if (!shownSystem.includes(money(systemCents))) {
+      throw new Error(`确认弹窗里的系统重算价不是 ${money(systemCents)}：${shownSystem.slice(0, 200)}`)
+    }
+    await setNumberInput(teacher, '.file-change-dialog .el-input-number', confirmed / 100)
+    await clickDialog(teacher, '通过')
+    // 「排队中」在换文件之前就已经是这个状态，不能当信号；「已替换」才是确认落库后的标记
+    await waitRowText(teacher, order.pickup, '已替换', 45000)
+
+    const after = await waitOrderAmount(student, order.id, confirmed, 30000)
+    if (Number(after.amount_cents) !== confirmed) {
+      throw new Error(`确认换文件后落库金额是 ${after.amount_cents} 分，预期确认价 ${confirmed} 分`)
+    }
+  })
+
+  // ---- 3. 打印完成：预填与提交都用当前成交价（本轮最高优先）
+  await step('改价：「打印完成」预填成交价，提交后金额不被抹回系统价', async () => {
+    // 换过文件后队列带「已替换未确认」：先下载确认，再走正常开始打印
+    await teacher.evaluate(() => {
+      window.open = () => null
+    })
+    await clickRowButton(teacher, order.pickup, '下载')
+    await waitBody(teacher, '已确认看到新文件', 30000)
+    await sleep(800)
+    await clickRowButton(teacher, order.pickup, '开始打印')
+    await clickDialog(teacher, '开始')
+    await waitRowText(teacher, order.pickup, '打印中', 45000)
+
+    await clickRowButton(teacher, order.pickup, '打印完成')
+    await waitBody(teacher, '确认完成', 30000)
+    const dialog = await visibleDialogText(teacher)
+    if (!dialog.includes('当前成交价')) {
+      throw new Error(`「打印完成」弹窗没有「当前成交价」这一项：${dialog.slice(0, 200)}`)
+    }
+    if (!dialog.includes(money(result.confirmCents))) {
+      throw new Error(`弹窗里成交价不是 ${money(result.confirmCents)}：${dialog.slice(0, 200)}`)
+    }
+    const prefilled = await readNumberInput(teacher, '.complete-amount-input')
+    const prefilledCents = Math.round(Number(prefilled) * 100)
+    if (prefilledCents !== result.confirmCents) {
+      throw new Error(
+        `弹窗预填 ${prefilled} 元（${prefilledCents} 分），预期确认价 ${result.confirmCents} 分；` +
+          `系统价 ${result.systemCents} 分又被拿回来了`,
+      )
+    }
+    result.prefilledCents = prefilledCents
+
+    await clickDialog(teacher, '确认完成')
+    await waitRowText(teacher, order.pickup, '待取件', 45000)
+    const done = await waitOrderAmount(student, order.id, result.confirmCents, 30000)
+    if (Number(done.amount_cents) !== result.confirmCents) {
+      throw new Error(
+        `打印完成后落库金额是 ${done.amount_cents} 分，确认价 ${result.confirmCents} 分被抹掉了`,
+      )
+    }
+    if (Number(done.amount_cents) === result.systemCents) {
+      throw new Error('落库金额等于系统价：确认价被系统价覆盖了')
+    }
+    result.completedCents = Number(done.amount_cents)
+    if (!done.paid) {
+      throw new Error('确认价没超过已付款，这一单不该变成待补款，退款口径就测不到了')
+    }
+  })
+
+  // ---- 4. 异常单处置：退款金额入口 + 超额拦截
+  await step('退款：关闭异常单可填退款金额，超额被拦，成功提示写明已退款', async () => {
+    await clickRowButton(teacher, order.pickup, '异常')
+    await waitBody(teacher, '确认标记', 30000)
+    await clickDialog(teacher, '确认标记')
+    // 「异常」两个字在按钮里也有，不能当信号；只有异常单才有关闭异常单按钮
+    await waitRowText(teacher, order.pickup, '关闭异常单', 45000)
+
+    await clickRowButton(teacher, order.pickup, '关闭异常单')
+    await waitVisible(teacher, '.cancel-abnormal-dialog', 30000)
+    const dialog = await visibleDialogText(teacher)
+    if (!dialog.includes('已收金额')) {
+      throw new Error(`关闭异常单弹窗没有「已收金额」：${dialog.slice(0, 200)}`)
+    }
+    if (!dialog.includes(money(result.completedCents))) {
+      throw new Error(`弹窗里的已收金额不是 ${money(result.completedCents)}：${dialog.slice(0, 200)}`)
+    }
+    const defaultRefund = await readNumberInput(teacher, '.cancel-refund-input')
+    if (Math.round(Number(defaultRefund) * 100) !== result.completedCents) {
+      throw new Error(`退款金额默认值 ${defaultRefund} 元，预期全额 ${money(result.completedCents)}`)
+    }
+    result.defaultRefundYuan = defaultRefund
+
+    // 超过已收：前端当场拦住，用的就是后端 40062 的那句话
+    await setNumberInput(teacher, '.cancel-refund-input', 999)
+    await clickDialog(teacher, '确认关闭')
+    await waitBody(teacher, '金额超出允许范围', 20000)
+    const stillOpen = await teacher.evaluate(
+      () =>
+        [...document.querySelectorAll('.cancel-abnormal-dialog')].filter(
+          (element) => element.getClientRects().length > 0,
+        ).length > 0,
+    )
+    if (!stillOpen) throw new Error('退款金额超额时弹窗被关掉了，应该留在原地报错')
+    result.overLimitBlocked = true
+
+    // 回到全额再提交
+    await setNumberInput(teacher, '.cancel-refund-input', result.completedCents / 100)
+    await clickDialog(teacher, '确认关闭')
+    const expected = `已退款 ${money(result.completedCents)}`
+    await waitMessageText(teacher, expected, 30000)
+    result.successMessage = expected
+    await waitRowText(teacher, order.pickup, '已取消', 45000)
+    const closed = await waitOrderStatus(student, order.id, 'cancelled', 30000)
+    if (closed.status !== 'cancelled') {
+      throw new Error(`关单后状态是 ${closed.status}，预期 cancelled`)
+    }
+  }, teacher)
+
+  // ---- 5. 待支付单：学生仍能自助取消
+  await step('取消：待支付单学生仍能自助取消，取消后状态变成已取消', async () => {
+    const unpaid = { orderNo: '', pickup: '', id: 0 }
+    await gotoFresh(student, `${STUDENT_URL}/#/pages/order/order`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    })
+    await waitBody(student, '选择要打印的文件', 90000)
+    await pickFile(student, '选择文档', FIXTURES.v1)
+    await waitBody(student, '3. 打印方案', 90000)
+    await waitBody(student, '确认下单', 60000)
+    await clickByText(student, '确认下单')
+    await waitBody(student, '下单成功', 60000)
+    Object.assign(unpaid, await readOrderResult(student))
+    unpaid.id = await orderIdFromApi(student, unpaid.orderNo)
+
+    await gotoFresh(student, `${STUDENT_URL}/#/pages/mine/mine`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    })
+    await waitBody(student, '全部', 60000)
+    await waitBody(student, unpaid.orderNo, 60000)
+    const row = await student.evaluate((orderNo) => {
+      const cards = [...document.querySelectorAll('.card.order')]
+      const card = cards.find((element) => (element.innerText || '').includes(orderNo))
+      if (!card) return { found: false }
+      return {
+        found: true,
+        // uni-app 的 <button> 在 H5 里渲染成 <uni-button>，两种都要算上
+        buttons: [...card.querySelectorAll('button, uni-button')].map((item) =>
+          (item.innerText || item.textContent || '').trim(),
+        ),
+        hint: (() => {
+          const node = card.querySelector('.cancel-hint')
+          return node ? (node.innerText || node.textContent || '').trim() : ''
+        })(),
+      }
+    }, unpaid.orderNo)
+    if (!row.found) throw new Error(`「我的订单」里找不到 ${unpaid.orderNo}`)
+    if (!row.buttons.some((text) => text === '取消')) {
+      throw new Error(`待支付单找不到取消按钮，实际按钮：${row.buttons.join(' / ')}`)
+    }
+    if (row.hint) throw new Error(`待支付单不该出现“找老师”的提示：「${row.hint}」`)
+
+    await clickCancelButtonInRow(student, unpaid.orderNo)
+    await confirmUniModal(student)
+    const cancelled = await waitOrderStatus(student, unpaid.id, 'cancelled', 30000)
+    if (cancelled.status !== 'cancelled') {
+      throw new Error(`学生取消后状态是 ${cancelled.status}，预期 cancelled`)
+    }
+    result.cancelledUnpaid = cancelled.order_no
+  })
+
+  // ---- 6. 队列只拉一屏时，必须说清“还有多少单没显示”
+  await step('队列：只拉一屏时提示还有多少单未显示，并能加载更多', async () => {
+    await searchQueue(teacher, '')
+    await sleep(1000)
+    const real = await fetchQueueFromPage(teacher, 60)
+    const hidden = Math.max(Number(real.total) - (real.items || []).length, 0)
+    const note = await readQueueNote(teacher)
+    if (hidden === 0) {
+      if (note) throw new Error(`队列已经全部显示，却出现了提示：「${note}」`)
+    } else if (!note.includes(`还有 ${hidden} 单未显示`)) {
+      throw new Error(`队列还有 ${hidden} 单没显示，提示却是：「${note}」`)
+    }
+    result.realHidden = hidden
+
+    // 造一个必然超量的返回：total 抬高 34 单，items 仍是真实数据
+    const faked = {
+      ...real,
+      total: (real.items || []).length + 34,
+      page: 1,
+      page_size: 60,
+    }
+    await teacher.setRequestInterception(true)
+    const requests = []
+    const handler = (request) => {
+      const url = request.url()
+      if (request.method() === 'GET' && url.includes('/api/admin/queue')) {
+        requests.push(Number(new URL(url).searchParams.get('page_size')) || 0)
+        request.respond({
+          status: 200,
+          contentType: 'application/json',
+          // 页面在 3219、接口在 8218，是跳源请求；不带 CORS 头浏览器会直接拦掉，
+          // 页面只能看到网络错误，测不到提示逻辑。
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': '*',
+            'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+          },
+          body: JSON.stringify({ code: 0, message: 'ok', data: faked }),
+        })
+        return
+      }
+      request.continue()
+    }
+    teacher.on('request', handler)
+    try {
+      await clickByText(teacher, '查询')
+      await waitBody(teacher, '还有 34 单未显示', 30000)
+      const fakedNote = await readQueueNote(teacher)
+      if (!fakedNote.includes(`共 ${faked.total} 单`)) {
+        throw new Error(`提示里没写总条数：「${fakedNote}」`)
+      }
+      result.fakedNote = fakedNote
+
+      await clickByText(teacher, '加载更多')
+      await sleep(1500)
+      const loaded = requests.filter((size) => size >= 120)
+      if (loaded.length === 0) {
+        throw new Error(`「加载更多」没有按更大条数重拉队列，实际请求 page_size：${requests.join(',')}`)
+      }
+      result.loadMorePageSizes = requests.slice()
+    } finally {
+      teacher.off('request', handler)
+      await teacher.setRequestInterception(false)
+    }
+    // 回到真实数据：刷新一次，别把假 total 带到后面的步骤里
+    await clickByText(teacher, '刷新')
+    await sleep(1200)
+  }, teacher)
+
+  // ---- 7. 生产构建里不许出现内网与本机回环地址
+  await step('配置：生产构建产物里不出现内网与本机回环地址', async () => {
+    const scan = await studentProductionBundleScan()
+    result.bundle = { dir: scan.dir, files: scan.files, bytes: scan.bytes, hits: scan.hits.length }
+    if (scan.hits.length) {
+      throw new Error(
+        `生产产物里出现了本机/内网地址：${scan.hits
+          .slice(0, 5)
+          .map((hit) => `${hit.file} → ${hit.match}`)
+          .join('；')}`,
+      )
+    }
+  })
+
+  return { orderNo: order.orderNo, pickup: order.pickup, ...result }
+}
+
+/** 点「我的订单」里某一单自己的取消按钮（卡片上有多个按钮，按订单号定位）。 */
+async function clickCancelButtonInRow(page, orderNo) {
+  const clicked = await page.evaluate((orderNo) => {
+    const cards = [...document.querySelectorAll('.card.order')].filter(
+      (element) => (element.innerText || '').includes(orderNo),
+    )
+    const card = cards[0]
+    if (!card) return 'no-row'
+    const button = [...card.querySelectorAll('button, uni-button')].find(
+      (item) => (item.innerText || item.textContent || '').trim() === '取消',
+    )
+    if (!button) return 'no-button'
+    button.click()
+    return 'ok'
+  }, orderNo)
+  if (clicked !== 'ok') throw new Error(`订单 ${orderNo} 上点不到取消（${clicked}）`)
+}
+
+/** 轮询订单详情直到状态变成预期值（学生取消后列表要等一次刷新）。 */
+async function waitOrderStatus(page, orderId, status, timeout = 30000) {
+  const deadline = Date.now() + timeout
+  let last = null
+  while (Date.now() < deadline) {
+    last = await orderDetailFromApi(page, orderId)
+    if (last.status === status) return last
+    await sleep(500)
+  }
+  return last
+}
+
+/** 轮询订单详情直到金额变成预期值（后台落库与页面读之间有拍延迟）。 */
+async function waitOrderAmount(page, orderId, cents, timeout = 30000) {
+  const deadline = Date.now() + timeout
+  let last = null
+  while (Date.now() < deadline) {
+    last = await orderDetailFromApi(page, orderId)
+    if (Number(last.amount_cents) === cents) return last
+    await sleep(500)
+  }
+  return last
+}
+
+/**
+ * 用 .env.production 打一次学生端 H5 生产包，再扫产物里有没有本机/内网地址。
+ *
+ * 只打一次：两个视口共用同一份结果（构建要一分多钟，没必要跑两遍）。
+ * 构建命令走 node 直接执行 uni CLI，与本文件启动 dev server 的做法一致，
+ * 并把 VITE_API_BASE_URL 从环境里摘掉——就是要验证「留空」这一支的行为。
+ */
+let bundleScanPromise = null
+function studentProductionBundleScan() {
+  if (!bundleScanPromise) bundleScanPromise = buildAndScanStudentBundle()
+  return bundleScanPromise
+}
+
+function buildAndScanStudentBundle() {
+  return (async () => {
+    const appDir = path.join(REPO_ROOT, 'student-app')
+    const cli = path.join(appDir, 'node_modules', '@dcloudio', 'vite-plugin-uni', 'bin', 'uni.js')
+    if (!fs.existsSync(cli)) throw new Error(`学生端 CLI 不存在：${cli}`)
+    const env = { ...process.env }
+    delete env.VITE_API_BASE_URL
+    const outDir = path.join(appDir, 'dist', 'build', 'h5')
+    fs.rmSync(outDir, { recursive: true, force: true })
+    const build = spawnSync(process.execPath, [cli, 'build'], {
+      cwd: appDir,
+      env,
+      encoding: 'utf8',
+      timeout: 900000,
+    })
+    if (build.status !== 0) {
+      throw new Error(
+        `学生端生产构建失败（code=${build.status}）：${(build.stderr || build.stdout || '').slice(-1500)}`,
+      )
+    }
+    if (!fs.existsSync(path.join(outDir, 'index.html'))) {
+      throw new Error(`构建产物没有 index.html：${outDir}`)
+    }
+
+    const patterns = [
+      { name: '本机回环 127.0.0.1', regex: /127\.0\.0\.1/g },
+      { name: '本机回环 localhost', regex: /\/\/localhost/g },
+      { name: 'IPv6 回环 [::1]', regex: /\[::1\]/g },
+      { name: '内网 192.168.x.x', regex: /192\.168\.\d{1,3}\.\d{1,3}/g },
+      { name: '内网 10.x.x.x', regex: /(?<![\d.])10\.\d{1,3}\.\d{1,3}\.\d{1,3}(?![\d.])/g },
+      {
+        name: '内网 172.16-31.x.x',
+        regex: /(?<![\d.])172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}(?![\d.])/g,
+      },
+    ]
+    const hits = []
+    let files = 0
+    let bytes = 0
+    const walk = (dir) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name)
+        if (entry.isDirectory()) {
+          walk(full)
+          continue
+        }
+        if (!/\.(js|mjs|css|html|json|map)$/i.test(entry.name)) continue
+        const text = fs.readFileSync(full, 'utf8')
+        files += 1
+        bytes += text.length
+        for (const pattern of patterns) {
+          pattern.regex.lastIndex = 0
+          let match = pattern.regex.exec(text)
+          while (match) {
+            hits.push({
+              file: path.relative(outDir, full),
+              pattern: pattern.name,
+              match: match[0],
+            })
+            match = pattern.regex.exec(text)
+          }
+        }
+      }
+    }
+    walk(outDir)
+    return { dir: path.relative(REPO_ROOT, outDir), files, bytes, hits }
+  })()
 }
 
 // ---------------------------------------------------------------- 深色模式

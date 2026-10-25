@@ -12,15 +12,27 @@ npm.cmd run build:app     # App 资源，供 HBuilderX 云打包
 
 > PowerShell 执行策略可能禁止 `npm.ps1`，本项目统一用 `npm.cmd` / `npx.cmd`。
 
-## API 地址（真机调试必看）
+## API 地址（部署与真机调试必看）
 
 API 地址通过 `.env.development` / `.env.production` 的 `VITE_API_BASE_URL` 注入，
-代码里没有硬编码。**真机不能填 127.0.0.1**（那指向手机自己），要填电脑的局域网 IP：
+代码里没有硬编码。**留空就是同源相对路径**（请求 `/api/...`），`src/config/index.js`
+的兜底也是空字符串，**不会**退回 `127.0.0.1:8000`——线上漏配只会变成「当前域名 + /api」
+然后 404，而不是把请求打到用户自己的电脑上。
 
 ```ini
+# .env.development（开发机，本仓库已配好）
 VITE_API_BASE_URL=http://127.0.0.1:8000      # H5 在电脑浏览器预览
-VITE_API_BASE_URL=http://192.168.1.100:8000  # 真机调试：改成电脑局域网 IP（ipconfig 查看）
+
+# 真机调试：真机不能填 127.0.0.1（那指向手机自己），要填电脑的局域网 IP
+VITE_API_BASE_URL=http://<电脑局域网IP>:8000  # ipconfig / ifconfig 查看，例如 10.0.0.5
+
+# .env.production（生产构建）
+VITE_API_BASE_URL=                            # H5 与后端同源部署：留空走相对路径
+VITE_API_BASE_URL=https://print.example.edu   # 独立域名 / 小程序：必须绝对 HTTPS 地址
 ```
+
+小程序不支持相对路径：上线必须是 HTTPS 且已备案的域名，并在小程序后台配好
+request 与 uploadFile 白名单；留空时 `warnOnPlatformConfig()` 会在控制台点名提醒。
 
 换网络后记得同步修改，并让后端监听 `0.0.0.0`：
 
