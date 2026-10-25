@@ -109,7 +109,13 @@ function stopStack() {
   stopping = true
   for (const { child } of services) {
     try {
-      process.kill(-child.pid, 'SIGTERM')
+      if (process.platform === 'win32') {
+        // Windows 不支持负数 PID 的进程组语义，process.kill(-pid) 会直接抛错，
+        // 结果就是 dev server 与后端一直挂着、node 不退出。用 taskkill /T 连子进程一起收。
+        spawnSync('taskkill', ['/F', '/T', '/PID', String(child.pid)], { stdio: 'ignore' })
+      } else {
+        process.kill(-child.pid, 'SIGTERM')
+      }
     } catch {
       /* 已经退出 */
     }
@@ -166,16 +172,31 @@ async function startStack() {
       },
     },
   )
+  // 直接 spawn node_modules/.bin/uni 在 Windows 上会 ENOENT：那边只有 uni.cmd / uni.ps1，
+  // 无扩展名的那个是 Unix shell 脚本，Windows 不认。统一用 node 执行 CLI 的 js 入口，
+  // 两个平台同一条路径，也不必绕 shell（Node 22 起 spawn .cmd 需要 shell:true，容易出幺蛾子）。
+  const studentCli = path.join(
+    REPO_ROOT, 'student-app', 'node_modules', '@dcloudio', 'vite-plugin-uni', 'bin', 'uni.js',
+  )
+  const teacherCli = path.join(
+    REPO_ROOT, 'teacher-web', 'node_modules', 'vite', 'bin', 'vite.js',
+  )
+  for (const [label, cli] of [['学生端', studentCli], ['老师端', teacherCli]]) {
+    if (!fs.existsSync(cli)) {
+      throw new Error(`${label} CLI 不存在：${cli}，请先在对应目录执行 npm install`)
+    }
+  }
+
   startService(
     'student',
-    path.join(REPO_ROOT, 'student-app', 'node_modules', '.bin', 'uni'),
-    ['--host', '127.0.0.1', '--port', new URL(STUDENT_URL).port, '--strictPort'],
+    process.execPath,
+    [studentCli, '--host', '127.0.0.1', '--port', new URL(STUDENT_URL).port, '--strictPort'],
     { cwd: path.join(REPO_ROOT, 'student-app'), env: { VITE_API_BASE_URL: BACKEND_URL } },
   )
   startService(
     'teacher',
-    path.join(REPO_ROOT, 'teacher-web', 'node_modules', '.bin', 'vite'),
-    ['--host', '127.0.0.1', '--port', new URL(TEACHER_URL).port, '--strictPort'],
+    process.execPath,
+    [teacherCli, '--host', '127.0.0.1', '--port', new URL(TEACHER_URL).port, '--strictPort'],
     { cwd: path.join(REPO_ROOT, 'teacher-web'), env: { VITE_API_BASE_URL: BACKEND_URL } },
   )
 
@@ -265,6 +286,20 @@ async function waitGone(page, text, timeout = 45000) {
     { timeout, polling: 250 },
     text,
   )
+}
+
+/**
+ * 提交换文件申请。
+ *
+ * 上传完之后页面还要取页数、重新报价，这期间按钮文案是「提交中…」且处于 disabled，
+ * 只等「确认变更」这个静态标题出现就去点，会点在禁用状态的按钮上（dev 模式按需编译
+ * 慢的时候必现）。这里等中间态消失、按钮文案恢复成「提交换文件申请」再点。
+ */
+async function submitChangeRequest(page, confirmText, timeout = 90000) {
+  await waitBody(page, confirmText, timeout)
+  await waitGone(page, '正在读取页数…', 60000)
+  await waitBody(page, '提交换文件申请', 60000)
+  await clickByText(page, '提交换文件申请')
 }
 
 /**
@@ -1184,8 +1219,7 @@ async function runViewport(browser, viewport) {
       })
       await waitBody(student, '当前订单', 60000)
       await pickFile(student, '选择文档', FIXTURES.v2)
-      await waitBody(student, '2. 确认变更', 90000)
-      await clickByText(student, '提交换文件申请')
+      await submitChangeRequest(student, '2. 确认变更')
       await waitBody(student, '换文件待老师确认', 45000)
     })
 
@@ -1560,8 +1594,7 @@ async function runMultiFilePhase({ student, teacher, viewport, step }) {
     await waitBody(student, '1. 选要换哪一份', 60000)
     await clickTargetRow(student, 'thesis-v3.pdf')
     await pickFile(student, '选择文档', FIXTURES.v2)
-    await waitBody(student, '3. 确认变更', 90000)
-    await clickByText(student, '提交换文件申请')
+    await submitChangeRequest(student, '3. 确认变更')
     await waitBody(student, '已提交一份换文件申请', 45000)
     // 整页刷新后页面栈里没有上一页，navigateBack 退不回去；直接去详情页看待确认状态
     await gotoFresh(student, `${STUDENT_URL}/#/pages/mine/detail?id=${order.id}`)
@@ -1945,8 +1978,7 @@ async function runStartGuardPhase({ student, teacher, viewport, step }) {
     })
     await waitBody(student, '当前订单', 60000)
     await pickFile(student, '选择文档', FIXTURES.v2)
-    await waitBody(student, '2. 确认变更', 90000)
-    await clickByText(student, '提交换文件申请')
+    await submitChangeRequest(student, '2. 确认变更')
     // 整页刷新进来时页面栈里没有上一页，提交后 navigateBack 退不回去，
     // 先等本页的提交成功标记，再自己走详情页看待确认状态。
     await waitBody(student, '已提交一份换文件申请', 45000)
