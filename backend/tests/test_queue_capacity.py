@@ -191,10 +191,10 @@ def _action_pay(client, student, admin):
 
 
 def _action_cancel(client, student, admin):
-    """取消出队。"""
+    """取消出队：学生只能取消未支付的单，已付款的由老师走异常处置关单（登记退款）。"""
     order = queued_order(client, student)
-    body = client.post(f"/api/order/{order['id']}/cancel", json={}, headers=student).json()
-    assert body["code"] == 0, body
+    admin_post(client, admin, f"/order/{order['id']}/abnormal", {"reason": "学生不要了"})
+    admin_post(client, admin, f"/order/{order['id']}/cancel", {"reason": "学生不要了"})
     return {"left": order["id"]}
 
 

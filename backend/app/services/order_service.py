@@ -48,7 +48,7 @@ from app.services.payment import get_payment_provider
 from app.services.queue_service import batch_wait_info, new_order_wait_info, order_wait_info
 from app.services.session_service import (
     current_session_info,
-    get_or_create_session,
+    ensure_session,
     release_session_slot,
 )
 from app.services.storage import get_storage
@@ -244,7 +244,8 @@ def create_order(db: Session, user: User, payload) -> Order:
     create_initial_version(db, order, rows)
     # 仅在本时段仍收单时占用容量；截单后的订单算下一个时段
     if session_info["session"] and session_info["is_open"]:
-        session_row = get_or_create_session(db, day, session_info["session"])
+        # 只读优先拿行（加一靠下面带条件的原子 UPDATE），不在下单路径上带行锁
+        session_row = ensure_session(db, day, session_info["session"])
         # 带条件的原子自增：判定与加一在同一条语句里，满员不再加，不会超卖
         db.execute(
             update(QueueSession)
@@ -290,6 +291,25 @@ def quote_order(db: Session, user: User, payload) -> dict:
 def get_owned_order(db: Session, user: User, order_id: int) -> Order:
     """取订单并校验归属，避免越权查看他人订单。"""
     order = db.get(Order, order_id)
+    if order is None or order.user_id != user.id:
+        raise BusinessError("订单不存在", code=40400)
+    return order
+
+
+def lock_owned_order(db: Session, user: User, order_id: int) -> Order:
+    """锁住订单行再返回，锁一直持有到本事务提交或回滚。
+
+    `SELECT ... FOR UPDATE` 是锁定读：并发请求会在这里排队，拿到锁时读到的是
+    前一个事务刚提交的最新值（`populate_existing` 强制覆盖会话里可能过期的对象）。
+    需要「先判断再写入」的路径（支付、取消）必须从这一步开始，
+    否则两个请求能同时通过判断，各自扣一次钱。
+    """
+    order = db.execute(
+        select(Order)
+        .where(Order.id == order_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
     if order is None or order.user_id != user.id:
         raise BusinessError("订单不存在", code=40400)
     return order
@@ -375,9 +395,28 @@ def order_to_dict(db: Session, order: Order, wait: dict | None = None,
 
 
 def cancel_order(db: Session, user: User, order_id: int, reason: str | None = None) -> Order:
-    """取消订单：仅 pending_pay / queuing 允许。"""
-    order = get_owned_order(db, user, order_id)
+    """学生取消订单：只有未支付的待支付单可以自己取消。
+
+    已付款订单不再允许学生自助取消（钱已经收了，必须由老师在后台关单并登记退款，
+    见 admin_service.cancel_abnormal），所以这里按「是否已收款」单独给一条明确提示，
+    不能落成含混的状态错误，更不能静默成功。
+    """
+    order = lock_owned_order(db, user, order_id)
+    paid_total = int(
+        db.execute(
+            select(func.coalesce(func.sum(PaymentLog.amount_cents), 0)).where(
+                PaymentLog.order_id == order.id
+            )
+        ).scalar_one()
+    )
+    if order.paid or paid_total > 0:
+        # 先放掉行锁再报错：锁要持有到事务结束，不能带着锁把错误抛出去
+        db.rollback()
+        raise BusinessError(
+            "订单已支付，不能自助取消；如需退款请联系老师处理", code=40905
+        )
     if order.status not in STUDENT_CANCELLABLE:
+        db.rollback()
         raise BusinessError(
             f"订单当前状态为「{status_label(order.status)}」，不能取消", code=40901
         )
@@ -394,9 +433,19 @@ def cancel_order(db: Session, user: User, order_id: int, reason: str | None = No
 
 
 def pay_order(db: Session, user: User, order_id: int) -> dict:
-    """模拟支付：调用支付 Provider，成功后转 queuing（这段逻辑与支付方式无关）。"""
-    order = get_owned_order(db, user, order_id)
+    """模拟支付：调用支付 Provider，成功后转 queuing（这段逻辑与支付方式无关）。
+
+    并发下的「只扣一次」靠两层保证：
+    1. 事务一开始就 `SELECT ... FOR UPDATE` 锁住订单行（lock_owned_order）。锁持有到
+       提交，同一单的第二个支付请求会阻塞在行锁上；它拿到锁时读到的是最新状态
+       queuing，直接 40902 返回，不会两个请求都通过 pending_pay 判断、各扣一次款。
+       先锁后调通道的顺序不能反：先调通道的话，两次调用都已经扣完钱才发现状态不对。
+    2. payment_logs 上 (order_id, idempotency_key) 唯一索引兜底：任何路径重复写同一笔
+       流水都会被数据库拒绝（IntegrityError -> 40905），不依赖应用层判断。
+    """
+    order = lock_owned_order(db, user, order_id)
     if order.status != STATUS_PENDING_PAY:
+        db.rollback()  # 先放掉行锁再报错，不把锁带出这个请求
         raise BusinessError(
             f"订单当前状态为「{status_label(order.status)}」，不能支付", code=40902
         )
@@ -404,6 +453,8 @@ def pay_order(db: Session, user: User, order_id: int) -> dict:
     provider = get_payment_provider()
     params = provider.create(order)
     if not provider.confirm(str(order.id)):
+        # 通道没确认成功就放掉行锁，不留一个「已锁但没结果」的事务
+        db.rollback()
         raise BusinessError("支付未完成，请重试", code=40060)
 
     # ↓ 与具体支付方式无关的公共逻辑
@@ -417,10 +468,15 @@ def pay_order(db: Session, user: User, order_id: int) -> dict:
             amount_cents=order.amount_cents,
             method=order.pay_method,
             operator="student",
+            idempotency_key=f"pay:{order.id}",
         )
     )
     change_status(db, order, "queuing", operator="student", note="支付成功，进入队列")
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:  # 幂等键撞车：同一单的第二笔支付流水
+        db.rollback()
+        raise BusinessError("订单已支付，请勿重复提交", code=40905) from exc
     db.refresh(order)
 
     return {

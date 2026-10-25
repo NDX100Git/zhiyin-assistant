@@ -598,6 +598,24 @@ def _reject_change(db: Session, order: Order, change: OrderFileChange, operator:
     return {"approved": False, "change": change}
 
 
+def _new_file_page_count(change: OrderFileChange, target: OrderFile) -> int:
+    """换进来的那一份文件自己的页数。
+
+    `new_file_page_count` 是这一份文件的页数，`new_page_count` 是整单总页数，
+    在多文件订单上两者不是一回事，不能互相回退。老的待确认请求没有单文件页数时，
+    只能用整单页数的变化量把这一份推出来：
+    该行原页数 + (新整单页数 - 老整单页数)。
+    直接回退到整单总页数，会把整单页数写进这一行，页数、行金额与打印页数全错位。
+    两个整单页数也缺时，保持该行原页数不变，不动比写错安全。
+    """
+    if change.new_file_page_count is not None:
+        return int(change.new_file_page_count)
+    own_pages = int(target.page_count or 0)
+    if change.old_page_count is None or change.new_page_count is None:
+        return own_pages
+    return max(0, own_pages + int(change.new_page_count) - int(change.old_page_count))
+
+
 def _approve_change(
     db: Session, order: Order, change: OrderFileChange, operator: str,
     amount_cents: int | None,
@@ -615,7 +633,7 @@ def _approve_change(
     )
 
     rows, target = resolve_file_row(db, order, change.file_index)
-    new_file_pages = int(change.new_file_page_count or change.new_page_count)
+    new_file_pages = _new_file_page_count(change, target)
     _ensure_total_pages(order, target, new_file_pages)
 
     old = {

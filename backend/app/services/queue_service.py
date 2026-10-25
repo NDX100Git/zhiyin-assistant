@@ -159,16 +159,23 @@ def estimate_minutes(db: Session, orders: list[Order]) -> int:
 
 
 def queue_position(db: Session, order: Order) -> int:
-    """当前订单前面还有多少单（不含自己）。"""
+    """当前订单前面还有多少单（不含自己）。
+
+    走数据库聚合计数，不把前序订单的 id 读进 Python 再 len()：一万单排队时
+    前者是一次 COUNT（毫秒级），后者要传回并物化一万行。口径与同文件的
+    `order_wait_info`、`_build_snapshot` 一致，都按 `_ahead_condition` 算。
+    """
     if order.status not in ACTIVE_STATUSES:
         return 0
-    ahead = db.execute(
-        select(Order.id)
-        .where(Order.status.in_(ACTIVE_STATUSES))
-        .where(Order.id != order.id)
-        .where(_ahead_condition(order))
-    ).scalars()
-    return len(list(ahead))
+    return int(
+        db.execute(
+            select(func.count())
+            .select_from(Order)
+            .where(Order.status.in_(ACTIVE_STATUSES))
+            .where(Order.id != order.id)
+            .where(_ahead_condition(order))
+        ).scalar_one()
+    )
 
 
 def _read_active_rows(db: Session) -> list:

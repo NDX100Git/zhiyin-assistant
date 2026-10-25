@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import re
+import threading
 from datetime import date
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.models.notification import Notification
@@ -14,6 +16,9 @@ from app.models.order import Order
 from app.models.payment_log import PaymentLog
 from app.models.print_log import PrintLog
 from app.models.uploaded_file import UploadedFile
+from app.models.user import User
+from app.services import order_service
+from app.utils.exceptions import BusinessError
 from app.utils.security import decode_token
 
 PDF_BYTES = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< >>\n%%EOF\n"
@@ -266,30 +271,205 @@ def test_重复支付被拒绝(client, open_session):
     assert again["code"] == 40902
 
 
-def test_排队中可取消_打印完成后不能取消(client, open_session, db_session):
+def _pending_order(client, token: str) -> tuple[int, int]:
+    """造一张待支付单，返回 (订单 id, 下单学生 id)。"""
+    body = client.post("/api/order/create", json=ORDER_PAYLOAD, headers=auth(token)).json()
+    assert body["code"] == 0, body
+    return body["data"]["id"], int(decode_token(token)["sub"])
+
+
+def _race_pay(session_factory, order_id: int, user_id: int) -> list:
+    """两个独立会话同时支付同一单，返回各自的结果（成功字典或业务错误码）。
+
+    两个线程各自拿自己的 Session，不共用一个连接：只有真并发且真在数据库里
+    排队，才能暴露「先判断后扣款」的问题。barrier 保证两边同时进入 pay_order。
+    """
+    barrier = threading.Barrier(2)
+    collected: list = []
+    collected_lock = threading.Lock()
+
+    def worker() -> None:
+        session = session_factory()
+        try:
+            user = session.get(User, user_id)
+            assert user is not None
+            barrier.wait(timeout=30)
+            try:
+                outcome = order_service.pay_order(session, user, order_id)
+            except BusinessError as exc:
+                session.rollback()
+                outcome = exc.code
+            except Exception as exc:  # 线程里的异常不能静默吞掉
+                session.rollback()
+                outcome = exc
+            with collected_lock:
+                collected.append(outcome)
+        finally:
+            session.close()
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    assert not any(thread.is_alive() for thread in threads), "并发支付线程未在超时内结束"
+    return collected
+
+
+@pytest.mark.parametrize("round_index", range(20))
+def test_并发支付同一单只成功一次(client, session_factory, open_session, round_index):
+    """两个请求同时付同一单：恰好一次成功，另一个是 40902（无 500、无双扣）。"""
+    token = login(client)
+    order_id, user_id = _pending_order(client, token)
+
+    results = _race_pay(session_factory, order_id, user_id)
+
+    succeeded = [item for item in results if isinstance(item, dict)]
+    refused = [item for item in results if not isinstance(item, dict)]
+    assert len(succeeded) == 1, f"第 {round_index + 1} 轮出现 {len(succeeded)} 次成功：{results}"
+    assert succeeded[0]["status"] == "queuing"
+    # 第二个请求拿到的必须是「状态已变」，不是靠幂等键抽到的 40905：
+    # 说明行锁把两个请求串行化了，第二个根本没进支付通道
+    assert refused == [40902], f"第 {round_index + 1} 轮：{results}"
+
+
+def test_并发支付只落一条流水且状态只推进一次(client, session_factory, open_session):
+    """并发支付后的账：一条流水、一条状态日志、一条入队通知。"""
+    token = login(client)
+    order_id, user_id = _pending_order(client, token)
+
+    results = _race_pay(session_factory, order_id, user_id)
+    assert len([item for item in results if isinstance(item, dict)]) == 1, results
+
+    session = session_factory()
+    try:
+        payments = list(
+            session.execute(
+                select(PaymentLog).where(PaymentLog.order_id == order_id)
+            ).scalars()
+        )
+        assert len(payments) == 1
+        assert payments[0].amount_cents == 630
+        assert payments[0].idempotency_key == f"pay:{order_id}"
+
+        order = session.get(Order, order_id)
+        assert order.status == "queuing"
+        assert order.paid == 1
+
+        transitions = [
+            (log.from_status, log.to_status)
+            for log in session.execute(
+                select(PrintLog).where(PrintLog.order_id == order_id)
+            ).scalars()
+        ]
+        assert transitions.count(("pending_pay", "queuing")) == 1
+
+        events = list(
+            session.execute(
+                select(Notification.event).where(Notification.order_id == order_id)
+            ).scalars()
+        )
+        assert events.count("order_queuing") == 1
+    finally:
+        session.close()
+
+
+def test_支付流水同一订单同一幂等键唯一(client, session_factory, open_session):
+    """数据库层的防重约束：重复写同一笔支付流水直接被唯一索引拒绝。"""
+    token = login(client)
+    order_id, _ = _pending_order(client, token)
+    paid = client.post(f"/api/order/{order_id}/pay", headers=auth(token)).json()
+    assert paid["code"] == 0, paid
+
+    session = session_factory()
+    try:
+        session.add(
+            PaymentLog(
+                order_id=order_id,
+                amount_cents=630,
+                method="mock",
+                operator="student",
+                idempotency_key=f"pay:{order_id}",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+        assert len(
+            list(
+                session.execute(
+                    select(PaymentLog).where(PaymentLog.order_id == order_id)
+                ).scalars()
+            )
+        ) == 1
+    finally:
+        session.close()
+
+
+def test_已付款订单学生不能自助取消(client, open_session, db_session):
+    """已付款的排队单学生取消要被拒，并给出「找老师退款」的明确提示。"""
     token = login(client)
     order_id = client.post(
         "/api/order/create", json=ORDER_PAYLOAD, headers=auth(token)
     ).json()["data"]["id"]
     client.post(f"/api/order/{order_id}/pay", headers=auth(token))
 
-    canceled = client.post(
+    refused = client.post(
         f"/api/order/{order_id}/cancel", json={"reason": "临时不需要"}, headers=auth(token)
     ).json()
-    assert canceled["code"] == 0
-    assert canceled["data"]["status"] == "cancelled"
 
-    # 另一个订单推进到待取件后不允许取消
-    other_id = client.post(
+    assert refused["code"] == 40905
+    assert "退款" in refused["message"]
+    db_session.expire_all()
+    assert db_session.get(Order, order_id).status == "queuing"
+    assert db_session.get(Order, order_id).cancel_reason is None
+
+
+def test_待支付订单学生仍可自助取消(client, open_session, db_session):
+    """待支付单还没有钱往来，学生取消照旧。"""
+    token = login(client)
+    order_id = client.post(
         "/api/order/create", json=ORDER_PAYLOAD, headers=auth(token)
     ).json()["data"]["id"]
-    client.post(f"/api/order/{other_id}/pay", headers=auth(token))
-    order = db_session.get(Order, other_id)
+
+    canceled = client.post(
+        f"/api/order/{order_id}/cancel", json={"reason": "改主意了"}, headers=auth(token)
+    ).json()
+
+    assert canceled["code"] == 0, canceled
+    assert canceled["data"]["status"] == "cancelled"
+    db_session.expire_all()
+    assert db_session.get(Order, order_id).status == "cancelled"
+
+
+def test_打印完成后不能取消(client, open_session, db_session):
+    """已付款的待取件单：提示联系老师退款；未付款的异常状态单：给状态错误。"""
+    token = login(client)
+    order_id = client.post(
+        "/api/order/create", json=ORDER_PAYLOAD, headers=auth(token)
+    ).json()["data"]["id"]
+    client.post(f"/api/order/{order_id}/pay", headers=auth(token))
+    order = db_session.get(Order, order_id)
     order.status = "ready"
     db_session.commit()
 
-    refused = client.post(f"/api/order/{other_id}/cancel", headers=auth(token)).json()
-    assert refused["code"] == 40901
+    refused = client.post(f"/api/order/{order_id}/cancel", headers=auth(token)).json()
+    assert refused["code"] == 40905  # 已付款判定在前：提示联系老师退款
+    assert "退款" in refused["message"]
+
+    # 没有钱往来的非可取消状态：仍然返回状态错误码，不落成含混的提示
+    unpaid_id = client.post(
+        "/api/order/create", json=ORDER_PAYLOAD, headers=auth(token)
+    ).json()["data"]["id"]
+    unpaid = db_session.get(Order, unpaid_id)
+    unpaid.status = "ready"
+    db_session.commit()
+
+    refused_unpaid = client.post(
+        f"/api/order/{unpaid_id}/cancel", headers=auth(token)
+    ).json()
+    assert refused_unpaid["code"] == 40901
+    assert "不能取消" in refused_unpaid["message"]
 
 
 def test_订单详情与列表包含排队信息(client, open_session):

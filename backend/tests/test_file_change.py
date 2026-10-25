@@ -606,12 +606,25 @@ def test_开始打印会让待确认请求失效(client):
     assert stored["file_change"] is None
 
 
-def test_取消订单会让待确认请求失效(client, db_session):
+def test_关单会让待确认请求失效(client, db_session):
+    """已付款订单学生不能自助取消，关单只能由老师走异常处置，待确认请求同样要失效。"""
     headers = student_headers(client)
+    admin = admin_headers(client)
     order = paid_order(client, headers)
     assert replace_file(client, headers, order["id"], page_count=20)["code"] == 0
 
-    assert client.post(f"/api/order/{order['id']}/cancel", headers=headers).json()["code"] == 0
+    marked = client.post(
+        f"/api/admin/order/{order['id']}/abnormal",
+        json={"reason": "学生不要了"},
+        headers=admin,
+    ).json()
+    assert marked["code"] == 0, marked
+    closed = client.post(
+        f"/api/admin/order/{order['id']}/cancel",
+        json={"reason": "学生不要了"},
+        headers=admin,
+    ).json()
+    assert closed["code"] == 0, closed
     change = db_session.execute(
         select(OrderFileChange).where(OrderFileChange.order_id == order["id"])
     ).scalar_one()
@@ -651,3 +664,75 @@ def test_迁移可重复执行并为老订单回填版本(db_session, engine):
         ).scalars()
     )
     assert len(again) == 1
+
+
+# ---------------------------------------------------------------- 老数据的页数回退语义
+
+
+def test_回退分支不把整单页数当成单文件页数(client, db_session):
+    """老待确认请求缺单文件页数时，用整单页数变化量推，不能拿整单总页数顶替。"""
+    from app.models.order_file import OrderFile
+
+    headers = student_headers(client, "file-change-legacy")
+    admin = admin_headers(client)
+    owner_id = int(decode_token(headers["Authorization"].split(" ", 1)[1])["sub"])
+
+    # 两份文件：5 页 + 10 页 = 整单 15 页
+    items = []
+    for pages, name in ((5, "第一部.pdf"), (10, "第二部.pdf")):
+        key = _file_key(name)
+        register_upload(key, name, owner_id)
+        items.append({"file_key": key, "file_name": name, "page_count": pages})
+    created = client.post(
+        "/api/order/create",
+        json={"files": items, "print_side": 2, "color_mode": 0, "copies": 1, "paper_size": "A4"},
+        headers=headers,
+    ).json()
+    assert created["code"] == 0, created
+    order = created["data"]
+    assert order["page_count"] == 15
+    pay_order(client, headers, order["id"])
+
+    # 换第 2 份：10 页 -> 8 页，整单 15 -> 13
+    payload = _replace_payload(page_count=8, file_name="第二部-修订.pdf")
+    payload["file_index"] = 2
+    register_upload(payload["file_key"], payload["file_name"], owner_id)
+    body = client.post(
+        f"/api/order/{order['id']}/replace-file", json=payload, headers=headers
+    ).json()
+    assert body["code"] == 0, body
+
+    change = db_session.execute(
+        select(OrderFileChange).where(OrderFileChange.order_id == order["id"])
+    ).scalar_one()
+    assert int(change.new_file_page_count) == 8
+    assert int(change.new_page_count) == 13
+
+    # 模拟老数据：这一列是后加的，历史行没有单文件页数
+    change.new_file_page_count = None
+    db_session.commit()
+
+    confirmed = confirm(client, admin, order["id"], approve=True)
+    assert confirmed["code"] == 0, confirmed
+
+    db_session.expire_all()
+    rows = {
+        int(row.file_index): row
+        for row in db_session.execute(
+            select(OrderFile).where(OrderFile.order_id == order["id"])
+        ).scalars()
+    }
+    assert int(rows[2].page_count) == 8  # 单文件页数
+    assert int(rows[2].page_count) != 13  # 不是整单总页数
+    assert int(rows[1].page_count) == 5  # 没换的那份不动
+    assert int(db_session.get(Order, order["id"]).page_count) == 13  # 整单页数
+
+    version = db_session.execute(
+        select(OrderFileVersion)
+        .where(
+            OrderFileVersion.order_id == order["id"],
+            OrderFileVersion.file_index == 2,
+        )
+        .order_by(OrderFileVersion.version_no.desc())
+    ).scalars().first()
+    assert int(version.page_count) == 8

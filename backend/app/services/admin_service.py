@@ -11,6 +11,7 @@ from datetime import date as date_type
 from datetime import datetime, timedelta
 
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import get_order_rules
@@ -350,17 +351,22 @@ def batch_complete(db: Session, order_ids: list[int], operator: str) -> dict:
     return {"succeeded": succeeded, "failed": failed}
 
 
+def _paid_total(db: Session, order_id: int) -> int:
+    """该单已收到的净金额：收款流水与退款流水（负数）求和。"""
+    return int(
+        db.execute(
+            select(func.coalesce(func.sum(PaymentLog.amount_cents), 0)).where(
+                PaymentLog.order_id == order_id
+            )
+        ).scalar_one()
+    )
+
+
 def verify_pickup(db: Session, order: Order, operator: str) -> dict:
     """核销取件：ready -> completed；未付或改价差额在此现场收款。"""
     change_status(db, order, "completed", operator=operator, note="核销取件")
 
-    paid_total = int(
-        db.execute(
-            select(func.coalesce(func.sum(PaymentLog.amount_cents), 0)).where(
-                PaymentLog.order_id == order.id
-            )
-        ).scalar_one()
-    )
+    paid_total = _paid_total(db, order.id)
     owed = max(0, order.amount_cents - paid_total)
     collected = owed > 0
     if collected:
@@ -370,6 +376,7 @@ def verify_pickup(db: Session, order: Order, operator: str) -> dict:
                 amount_cents=owed,
                 method="onsite",
                 operator=operator,
+                idempotency_key=f"onsite:{order.id}",
             )
         )
         record_log(db, order, "note", note=f"取件时现场收款 {owed} 分", operator=operator)
@@ -382,7 +389,11 @@ def verify_pickup(db: Session, order: Order, operator: str) -> dict:
     if order.paid_at is None:
         order.paid_at = datetime.now()  # 服务端时间
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:  # 幂等键撞车：同一单重复现场收款
+        db.rollback()
+        raise BusinessError("该订单已登记过现场收款，请刷新后重试", code=40906) from exc
     db.refresh(order)
     return {
         "order": order_admin_view(db, order),
@@ -465,26 +476,75 @@ def recover_order(db: Session, order: Order, operator: str) -> dict:
     return order_admin_view(db, order)
 
 
-def cancel_abnormal(db: Session, order: Order, reason: str | None, operator: str) -> dict:
-    """老师关闭异常单（异常单的唯一取消入口）。"""
+def cancel_abnormal(db: Session, order: Order, reason: str | None, operator: str,
+                    refund_cents: int | None = None) -> dict:
+    """老师关闭异常单（异常单的唯一取消入口），已收过钱的单同时登记退款。
+
+    退款口径（与前端约定一致）：用一条**负数流水**表示退款，
+    method=refund、幂等键 refund:<订单 id>，不另建退款表，也不改学生的收款行。
+    这样当日收入、收款流水、订单对账全部是同一种算法：把流水加起来。
+    同一单最多退一次，重复调用会被 (order_id, idempotency_key) 唯一索引拦住。
+
+    refund_cents 不传时按订单成交价全额退，但不超过实际已收金额：
+    老师改价上调后学生只付了原价时，退的是真收到的钱，不是账面上的价。
+    """
     if order.status not in ADMIN_CANCELLABLE:
         raise BusinessError(
             f"只有异常订单可以由老师关闭，当前状态为「{status_label(order.status)}」",
             code=40903,
         )
+
+    paid_total = _paid_total(db, order.id)
+    if refund_cents is None:
+        refund = min(paid_total, int(order.amount_cents or 0))
+    else:
+        refund = int(refund_cents)
+        if refund < 0:
+            raise BusinessError("退款金额不能为负数", code=40061)
+        if refund > paid_total:
+            raise BusinessError(
+                f"退款金额不能超过已收的 {paid_total} 分", code=40062
+            )
+
     note = (reason or "").strip() or "老师关闭异常单"
     order.cancel_reason = note
     expire_pending_changes(db, order.id, "异常单已关闭，换文件请求失效", operator)
+    if refund > 0:
+        db.add(
+            PaymentLog(
+                order_id=order.id,
+                amount_cents=-refund,  # 负数行：退款从收入里冲掉
+                method="refund",
+                operator=operator,
+                idempotency_key=f"refund:{order.id}",
+            )
+        )
+        note = f"{note}；退款 {refund} 分（已收 {paid_total} 分）"
+        order.cancel_reason = note
     change_status(db, order, "cancelled", operator=operator, note=note)
+    if refund > 0:
+        record_log(
+            db, order, "refund",
+            note=f"老师关闭订单并登记退款 {refund} 分", operator=operator,
+        )
     # 异常单作废也不再消耗本时段产能，容量要还回去
     release_session_slot(db, order.created_at or datetime.now())
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:  # 幂等键撞车：同一单重复退
+        db.rollback()
+        raise BusinessError("该订单已登记过退款，请勿重复操作", code=40906) from exc
     db.refresh(order)
-    return order_admin_view(db, order)
+    return {**order_admin_view(db, order), "refund_cents": refund,
+            "paid_total_cents": paid_total}
 
 
 def today_summary(db: Session) -> dict:
-    """今日数据：接单数、收款额（分）、待取件数、异常单数。"""
+    """今日数据：接单数、收款额（分）、待取件数、异常单数。
+
+    收款额是当日**流水求和**：正向收款加、退款负数行减，所以已退款的订单
+    自动从当日收入里排除，不需要单独再减一遍。
+    """
     day_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
     order_count = db.execute(

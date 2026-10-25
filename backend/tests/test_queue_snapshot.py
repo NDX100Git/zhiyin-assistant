@@ -233,14 +233,26 @@ def test_支付后快照立即失效(client, queue_reads):
 
 
 def test_取消后快照立即失效(client):
+    """关单出队（已付款的单只能由老师经异常处置关闭）同样要当场作废旧快照。"""
     headers = student_headers(client, "queue-cache-cancel")
+    admin = admin_headers(client)
     head = queued_order(client, headers)
     tail = queued_order(client, headers)
 
     before = list_items(client, headers)
     assert before[tail["id"]]["queue_position"] == 1
 
-    body = client.post(f"/api/order/{head['id']}/cancel", json={}, headers=headers).json()
+    marked = client.post(
+        f"/api/admin/order/{head['id']}/abnormal",
+        json={"reason": "学生不要了"},
+        headers=admin,
+    ).json()
+    assert marked["code"] == 0, marked
+    body = client.post(
+        f"/api/admin/order/{head['id']}/cancel",
+        json={"reason": "学生不要了"},
+        headers=admin,
+    ).json()
     assert body["code"] == 0, body
 
     after = list_items(client, headers)
@@ -568,3 +580,39 @@ def test_并发16下位置与预计等待单调且不出现负数(client, sessio
         assert minutes == sorted(minutes), "预计等待必须随队列单调不减"
         # 一秒/打印页 -> 第 i 单的等待分钟数 = 到它为止的打印页数累计
         assert minutes == list(itertools.accumulate(print_pages))
+
+
+def test_队列位置用数据库计数且与快照一致(client, db_session):
+    """queue_position 改走 COUNT 聚合后，位置与快照、列表接口三处口径一致。"""
+    headers = student_headers(client, "queue-position-count")
+    admin = admin_headers(client)
+
+    first = queued_order(client, headers)
+    second = queued_order(client, headers)
+    third = queued_order(client, headers)
+    # 第一单换文件确认后排到队尾，把「重排队」这一档排序键也覆盖进来
+    replace_file(client, headers, first["id"], 20)
+    confirm_change(client, admin, first["id"])
+
+    db_session.expire_all()
+    orders = list(
+        db_session.execute(
+            select(Order).where(Order.status.in_(("queuing", "printing")))
+        ).scalars()
+    )
+    counted = {order.id: queue_service.queue_position(db_session, order) for order in orders}
+
+    assert counted[second["id"]] == 0
+    assert counted[third["id"]] == 1
+    assert counted[first["id"]] == 2
+
+    # 与共享快照、列表接口的位置完全一致（同一份排序口径）
+    snapshot = queue_service.queue_state(db_session)
+    assert counted == {order_id: snapshot.position_of(order_id) for order_id in counted}
+    from_list = {item_id: item["queue_position"] for item_id, item in list_items(client, headers).items()}
+    assert from_list == counted
+
+    # 不在途的单一律 0，不会去数别人的位置
+    pending = create_order(client, headers)
+    pending_order = db_session.get(Order, pending["id"])
+    assert queue_service.queue_position(db_session, pending_order) == 0

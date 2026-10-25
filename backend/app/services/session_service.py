@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_order_rules
 from app.models.queue_session import QueueSession
+from app.utils.exceptions import BusinessError
 
 
 def _parse_hhmm(value: str) -> time:
@@ -35,14 +36,11 @@ def resolve_session_name(now: datetime) -> str | None:
     return None
 
 
-def get_or_create_session(db: Session, day: date_type, name: str) -> QueueSession:
-    """取当天某时段的设置行，不存在则按默认容量创建（默认开放）。
+def _insert_default_session(db: Session, day: date_type, name: str) -> None:
+    """行不存在时按默认容量建一行（默认开放）。
 
-    每天首批并发下单会同时发现“行不存在”，各自插同一行；(日期, 时段) 唯一键只允许一个
-    成功。用 `INSERT ... ON DUPLICATE KEY UPDATE` 变成幂等写入，没有异常可抛。
-
-    随后的读取必须加 `FOR UPDATE`：MySQL 默认 REPEATABLE READ，本请求早先查用户时已经把
-    读视图定住，普通 SELECT 看不到并发事务刚提交的那一行，会读成空。锁定读走的是最新数据。
+    每天首批并发请求会同时发现“行不存在”并各自插同一行；(日期, 时段) 唯一键只允许
+    一个成功。用 `INSERT ... ON DUPLICATE KEY UPDATE` 变成幂等写入，没有异常可抛。
     """
     default_capacity = int(get_order_rules()["session"].get("default_capacity", 30))
     db.execute(
@@ -53,6 +51,51 @@ def get_or_create_session(db: Session, day: date_type, name: str) -> QueueSessio
         ),
         {"date": day, "session": name, "capacity": default_capacity},
     )
+
+
+def get_session(db: Session, day: date_type, name: str) -> QueueSession | None:
+    """读当天某时段的设置行，**不加锁**，不存在返回 None。
+
+    首页概览、下单响应这类读为主的路径走这里：普通 SELECT 既不排锁、也不把
+    读接口变成写事务，不会与并发下单争同一行锁。
+    """
+    return db.execute(
+        select(QueueSession).where(
+            QueueSession.date == day, QueueSession.session == name
+        )
+    ).scalar_one_or_none()
+
+
+def ensure_session(db: Session, day: date_type, name: str) -> QueueSession:
+    """读优先、缺失才创建；**不持锁**，返回当天的时段行。
+
+    先普通读一次，命中就直接用；未命中才做一次幂等插入，再普通读一次。
+    创建后能读到自己的行：本事务内自己插入的行对自己可见，不需要锁定读
+    （锁定读只有在读别的并发事务刚提交的行时才有意义）。
+    并发首页请求最多各自做一次幂等插入（改一行后马上提交），
+    不会像原先那样在只读路径上执行「插入即更新 + `FOR UPDATE`」参与争锁。
+    """
+    row = get_session(db, day, name)
+    if row is not None:
+        return row
+    _insert_default_session(db, day, name)
+    row = get_session(db, day, name)
+    if row is None:  # 理论上不会发生：插入是幂等的
+        raise BusinessError(f"无法初始化 {day} {name} 时段设置", code=50021)
+    return row
+
+
+def get_or_create_session(db: Session, day: date_type, name: str) -> QueueSession:
+    """取当天某时段的设置行并在事务内锁定它，供**要改这一行**的路径使用。
+
+    行政端开关收单（switch_session）要读改写的行必须加 `FOR UPDATE`，否则两个
+    老师并发开关会丢一次修改。只读/只看 id 的路径一律用 ensure_session，
+    不要把一个行锁带进首页与下单响应的读事务里。
+
+    锁定读走的是最新数据：MySQL 默认 REPEATABLE READ，普通 SELECT 看不到并发
+    事务刚提交的那一行，而行政端本来就靠锁定读拿最新值。
+    """
+    _insert_default_session(db, day, name)
     return db.execute(
         select(QueueSession)
         .where(QueueSession.date == day, QueueSession.session == name)
@@ -107,7 +150,7 @@ def current_session_info(db: Session, now: datetime | None = None) -> dict:
             "hint": rules.get("outside_hint", "当前不在收单时段"),
         }
 
-    row = get_or_create_session(db, now.date(), name)
+    row = ensure_session(db, now.date(), name)
     is_open = bool(row.is_open) and row.used < row.capacity
     session_rules = rules.get(name, {})
     hint = "" if is_open else session_rules.get("closed_hint", "当前时段已截单，订单将排在下一个打印时段")
