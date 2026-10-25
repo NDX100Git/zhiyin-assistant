@@ -3,8 +3,10 @@
  * 页面只通过本文件和适配层访问后端，不直接拼 URL。
  */
 
-import { API_BASE_URL, STORAGE_KEYS } from '@/config'
-import { explainApiCode } from '@/utils/errors'
+// 相对路径导入：单测在 Node 里直接 import 本文件，'@/' 别名只有 uni/vite 构建期能解析
+import { API_BASE_URL, STORAGE_KEYS } from '../config/index.js'
+import { explainApiCode } from '../utils/errors.js'
+import { LLM_KEY_CHECK_PATH, LLM_KEY_HEADER, llmKeyHeader } from './llmKey.js'
 
 export function getToken() {
   return uni.getStorageSync(STORAGE_KEYS.token) || ''
@@ -49,7 +51,31 @@ function buildUploadHeader() {
   if (token) {
     header.Authorization = `Bearer ${token}`
   }
+  // 这里**故意**不带 X-LLM-Api-Key：/api/file/upload、/api/file/page-count 只做文件落盘
+  // 与页数解析，一次模型都不调，没理由让学生密钥经过这条通道。
   return header
+}
+
+/** 所有 AI 接口都在 /api/ai/ 下（体检、校对与任务轮询、打印方案、修复、看图识字、PDF 转 Word）。 */
+const AI_PATH_RE = /^\/api\/ai(\/|$|\?)/
+
+/** 这个路径要不要带学生自己的密钥。按路径判，新加的 AI 接口自动就有，不会漏一个。 */
+export function isAiPath(path) {
+  return AI_PATH_RE.test(String(path || ''))
+}
+
+/**
+ * 给失败对象打上「这次请求带过学生密钥」的标记。
+ *
+ * llmKey.js 的 isLlmKeyFailure() 靠它区分「密钥不行」与「文件解析失败」：
+ * 没带密钥的请求失败，绝不能提示学生去清理密钥。
+ */
+function decorateLlmKeyError(error, sentLlmKey, rejected = false) {
+  if (sentLlmKey) {
+    error.llmKeySent = true
+    if (rejected) error.llmKeyRejected = true
+  }
+  return error
 }
 
 function parseBody(raw) {
@@ -64,14 +90,19 @@ function parseBody(raw) {
 }
 
 export function request(path, options = {}) {
-  const { method = 'GET', data, auth = true, timeout = 90000 } = options
+  const { method = 'GET', data, auth = true, timeout = 90000, llmKey } = options
+
+  // 密钥只进请求头，且只在 AI 接口上带；data 与 URL 都不碰它。
+  // llmKey 显式给了就用给的（「测试连通」要测还没保存的那把），否则用本机存的那把。
+  const keyHeader = isAiPath(path) ? llmKeyHeader(llmKey) : {}
+  const sentLlmKey = Boolean(keyHeader[LLM_KEY_HEADER])
 
   return new Promise((resolve, reject) => {
     uni.request({
       url: `${API_BASE_URL}${path}`,
       method,
       data,
-      header: buildHeader(auth),
+      header: { ...buildHeader(auth), ...keyHeader },
       timeout,
       success(response) {
         const body = parseBody(response.data)
@@ -79,6 +110,8 @@ export function request(path, options = {}) {
           resolve(body.data)
           return
         }
+        // HTTP 401/403：服务端直接拦在鉴权层，只可能是密钥这件事
+        const httpRejected = response.statusCode === 401 || response.statusCode === 403
         if (body && AUTH_EXPIRED_CODES.includes(body.code)) {
           // 本地 token 已经不被服务端认可（过期、换密钥、演示前重建了数据库）。
           // 必须清掉：login() 见到本地有 token 就直接返回，留着它会让之后每个
@@ -90,10 +123,22 @@ export function request(path, options = {}) {
         }
         if (body && typeof body.code !== 'undefined') {
           // 业务码统一在这里译成中文：页面上不需要再认码，也不会漏掉某一屏
-          reject(new Error(explainApiCode(body.code, body.message)))
+          reject(
+            decorateLlmKeyError(
+              new Error(explainApiCode(body.code, body.message)),
+              sentLlmKey,
+              httpRejected
+            )
+          )
           return
         }
-        reject(new Error(`服务返回异常（HTTP ${response.statusCode}）`))
+        reject(
+          decorateLlmKeyError(
+            new Error(`服务返回异常（HTTP ${response.statusCode}）`),
+            sentLlmKey,
+            httpRejected
+          )
+        )
       },
       fail(error) {
         reject(new Error(error.errMsg || '网络连接失败，请检查 API 地址与网络'))
@@ -131,6 +176,18 @@ export function uploadFile(filePath, fileName) {
       },
     })
   })
+}
+
+/**
+ * 测试学生自己的密钥：让服务端拿请求头里那把做一次最小调用。
+ *
+ * 成功返回服务端给的 `data`；失败抛错（中文原因由服务端给）。
+ * 密钥仍然只在请求头里，不进请求体。
+ *
+ * @param {string} [key] 要测的密钥；不传则测本机存着的那把
+ */
+export function checkLlmKey(key) {
+  return request(LLM_KEY_CHECK_PATH, { method: 'POST', llmKey: key })
 }
 
 /**

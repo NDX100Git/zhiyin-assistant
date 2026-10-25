@@ -24,10 +24,13 @@ import {
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
 test('本地存储键名只有一个来源，键值保持历史值不变', () => {
+  // 第十轮 B 单新增 llmKey（学生自己的大模型密钥，只存本机）。
+  // 前三个键是历史值，任何时候都不许改：改了等于把老用户存在本机的登录态丢掉。
   assert.deepEqual(STORAGE_KEYS, {
     token: 'zhiyin_token',
     user: 'zhiyin_user',
     deviceId: 'zhiyin_device_id',
+    llmKey: 'zhiyin_llm_key',
   })
 })
 

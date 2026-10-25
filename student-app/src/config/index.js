@@ -78,4 +78,7 @@ export const STORAGE_KEYS = {
   token: 'zhiyin_token',
   user: 'zhiyin_user',
   deviceId: 'zhiyin_device_id',
+  // 学生自己的大模型密钥：只存本机、只走请求头，服务端不落库
+  // （读写一律走 services/llmKey.js，页面不许直接碰这个键）
+  llmKey: 'zhiyin_llm_key',
 }

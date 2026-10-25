@@ -7,6 +7,16 @@
       </view>
     </view>
 
+    <!--
+      学生自己的密钥不可用：把原因和出口说清楚。
+      不静默退回学校密钥——在学生自己点「清除并改用学校共享」之前，AI 请求仍带这把钥匙。
+    -->
+    <view v-if="keyError" class="card key-error-card">
+      <text class="key-error-title">你的 AI 密钥不可用</text>
+      <text class="key-error-text">{{ keyError }}</text>
+      <text class="key-error-hint">去「我的」→「AI 密钥」可以清除后改用学校共享密钥。</text>
+    </view>
+
     <view class="card">
       <view class="card-head">
         <text class="card-title">1. 选择要打印的文件</text>
@@ -114,6 +124,8 @@
       <text class="ai-entry-desc">
         {{ aiChecked ? '已按体检结果更新打印方案，也可以重新体检。' : '检查结构、参考文献与版式，并可选择生成修复副本。不做体检也能直接下单。' }}
       </text>
+      <!-- 学生要知道自己在用哪把钥匙：学校共享还是自己填的那把 -->
+      <text class="ai-key-line" :class="{ own: keyOwn }">当前使用：{{ keyUsage }}</text>
       <view class="ai-actions">
         <button class="action ghost" :disabled="checking || preparing" @click="runCheck">
           {{ checking ? 'AI 正在体检…' : (aiChecked ? '重新体检' : '开始 AI 体检') }}
@@ -296,9 +308,11 @@
 
 <script setup>
 import { computed, onUnmounted, ref } from 'vue'
+import { onShow } from '@dcloudio/uni-app'
 import { deleteUploadedFile, quoteOrder, request, uploadFile } from '@/services/api'
 import { ensureLogin } from '@/services/auth'
 import { MAX_FILES_PER_PICK, chooseDocuments, chooseImage, loadDemoDocument } from '@/services/filePicker'
+import { isLlmKeyFailure, llmKeyFailureText, llmKeyUsageLabel } from '@/services/llmKey'
 import { PAPER_SIZES } from '@/services/orderFiles'
 import { notify, notifyError } from '@/services/notify'
 import { useUiTheme } from '@/ui/theme'
@@ -352,6 +366,34 @@ const ocrText = ref('')
 
 /** 只有一份文件时才有 AI 体检与修复：多文件的体检口径产品还没定。 */
 const singleFile = computed(() => files.value.length === 1)
+
+/* ---------- 学生自己的密钥：只影响提示，不影响请求（请求头由 services/api.js 统一带） ---------- */
+
+/** 「当前使用：学校共享 / 我的密钥」那一行。 */
+const keyUsage = ref(llmKeyUsageLabel())
+const keyOwn = computed(() => keyUsage.value === '我的密钥')
+/** 密钥不可用的原因：非空时页面顶部给一条横幅，不静默退回学校密钥。 */
+const keyError = ref('')
+
+// 学生可能在「我的」页刚换过钥匙，每次回到本页重读
+onShow(() => {
+  keyUsage.value = llmKeyUsageLabel()
+})
+
+/**
+ * AI 请求失败时的统一出口。
+ *
+ * 密钥不可用就说清楚「你的密钥不可用 + 去哪儿清除」，其余错误照旧提示；
+ * 两种情况都不自动重试、不自动丢密钥（那就是静默回退了）。
+ */
+function reportAiError(error) {
+  if (isLlmKeyFailure(error)) {
+    keyError.value = llmKeyFailureText(error)
+    notify('你的密钥不可用，请到「我的」→「AI 密钥」清除后改用学校共享')
+    return
+  }
+  notifyError(error)
+}
 
 /** 订单总页数：清单里各文件页数之和，下单与计费都按它算。 */
 const totalPages = computed(() =>
@@ -694,9 +736,10 @@ async function pickImage() {
       data: { file_key: uploaded.file_key },
     })
     ocrText.value = ocr.text
+    keyError.value = ''
     notify('识别完成', 'success')
   } catch (error) {
-    notifyError(error)
+    reportAiError(error)
   } finally {
     busy.value = false
   }
@@ -711,6 +754,7 @@ async function runCheck() {
       data: { file_key: primaryFile.value.file_key },
     })
     aiChecked.value = true
+    keyError.value = ''
     const checked = Math.max(1, Number(report.value.page_count) || 1)
     // 体检可能发现实际页数与 page-count 不一致，以体检为准
     primaryFile.value.page_count = checked
@@ -719,7 +763,7 @@ async function runCheck() {
     await loadPlan(true)
     scheduleQuote()
   } catch (error) {
-    notifyError(error)
+    reportAiError(error)
   } finally {
     checking.value = false
   }
@@ -746,12 +790,14 @@ async function loadPlan(useAi = false) {
       data: { file_key: primaryFile.value.file_key, options },
     })
     planUsesAi.value = useAi
+    // 方案拿到了 = 这把密钥这次没被拒，之前那条失效横幅已经过期
+    keyError.value = ''
     printSide.value = plan.value.recommend.print_side
     colorMode.value = plan.value.recommend.color_mode
     layout.value = plan.value.recommend.layout
     stepIndex.value = 2
   } catch (error) {
-    notifyError(error)
+    reportAiError(error)
   } finally {
     preparing.value = false
   }
@@ -829,7 +875,7 @@ async function generateFixed() {
     selectedIssues.value = []
     await runCheck()
   } catch (error) {
-    notifyError(error)
+    reportAiError(error)
   } finally {
     busy.value = false
   }
@@ -990,6 +1036,46 @@ onUnmounted(() => {
 }
 .ai-entry {
   border: 2rpx dashed var(--zi-line-strong);
+}
+/* 「当前使用：学校共享 / 我的密钥」一行小字 */
+.ai-key-line {
+  display: block;
+  margin-top: 10rpx;
+  color: var(--zi-muted);
+  font-size: 22rpx;
+  font-weight: 700;
+  line-height: 1.5;
+  word-break: break-all;
+}
+.ai-key-line.own {
+  color: var(--zi-accent);
+}
+/* 密钥不可用的横幅：说清原因与出口 */
+.key-error-card {
+  border-left: 6rpx solid var(--zi-danger);
+  background: var(--zi-danger-bg);
+}
+.key-error-title {
+  display: block;
+  color: var(--zi-danger);
+  font-size: 26rpx;
+  font-weight: 900;
+  line-height: 1.5;
+}
+.key-error-text {
+  display: block;
+  margin-top: 8rpx;
+  color: var(--zi-danger);
+  font-size: 24rpx;
+  line-height: 1.6;
+  word-break: break-all;
+}
+.key-error-hint {
+  display: block;
+  margin-top: 8rpx;
+  color: var(--zi-ink);
+  font-size: 22rpx;
+  line-height: 1.6;
 }
 .ai-entry-desc {
   display: block;
