@@ -157,8 +157,8 @@
         <text class="tag">{{ severitySummary }}</text>
       </view>
       <text class="summary">{{ report.summary }}</text>
-      <view v-if="report.ai_errors && report.ai_errors.length" class="warn">
-        {{ report.ai_errors.join('；') }}
+      <view v-if="checkError" class="warn">
+        {{ checkError }}
       </view>
       <view class="ai-fix-row">
         <view class="ai-fix-text">
@@ -275,6 +275,13 @@
       </button>
       <text class="plan-reason">{{ singleFile ? 'AI 建议理由' : '方案估算依据' }}：{{ plan.reason }}</text>
       <!--
+        打印方案出错时后端仍返回 success + 基础方案（有意的降级），错误文案在 plan.errors 里。
+        早先只看体检报告的 ai_errors，学生点打印方案时出错就看不到任何提示——
+        「你的密钥不可用，请去清除」就被吞掉了。这里用与体检错误同一个 .warn 样式。
+        正常无错时 planError 是空串，v-if 不显示。
+      -->
+      <view v-if="planError" class="warn">{{ planError }}</view>
+      <!--
         收费按文档页数算，这里只是「预计张数」，不能写成「省多少张」当收费承诺：
         学生把省张数当成该收的钱，实际收费按页数算，对不上就会投诉。
         金额仍只取服务端报价（quoteAmount），页面不乘单价。
@@ -315,6 +322,7 @@ import { MAX_FILES_PER_PICK, chooseDocuments, chooseImage, loadDemoDocument } fr
 import { isLlmKeyFailure, llmKeyFailureText, llmKeyUsageLabel } from '@/services/llmKey'
 import { PAPER_SIZES } from '@/services/orderFiles'
 import { notify, notifyError } from '@/services/notify'
+import { formatAiErrorList } from '@/utils/errors'
 import { useUiTheme } from '@/ui/theme'
 
 const { uiThemeClass, uiSchemeClass } = useUiTheme()
@@ -374,6 +382,17 @@ const keyUsage = ref(llmKeyUsageLabel())
 const keyOwn = computed(() => keyUsage.value === '我的密钥')
 /** 密钥不可用的原因：非空时页面顶部给一条横幅，不静默退回学校密钥。 */
 const keyError = ref('')
+
+/**
+ * AI 降级时模型出错的文案。
+ *
+ * `/api/ai/check` 与 `/api/ai/print-plan` 在 AI 出错时都**返回成功码 + 基础结果**
+ * （有意的降级：学生照样能看报告、能下单），错误文案分别在 `ai_errors` 与 `errors`
+ * 里。两条都要有出口：只看体检那一份，「你的密钥不可用，请去清除」在打印方案
+ * 这一步就又看不到了。两处用同一个 .warn 样式；没有错误时是空串，不显示。
+ */
+const checkError = computed(() => formatAiErrorList(report.value && report.value.ai_errors))
+const planError = computed(() => formatAiErrorList(plan.value && plan.value.errors))
 
 // 学生可能在「我的」页刚换过钥匙，每次回到本页重读
 onShow(() => {

@@ -13,7 +13,9 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import { STORAGE_KEYS } from '../src/config/index.js'
+import { ERROR_MESSAGES } from '../src/utils/errors.js'
 import {
+  LLM_KEY_FAILURE_CODES,
   LLM_KEY_HEADER,
   LLM_KEY_INVALID_TEXT,
   LLM_KEY_NOTICE,
@@ -198,10 +200,39 @@ test('「测试连通」测的是输入框里那把，而不是本机存着的�
   assert.equal(calls[1].header[LLM_KEY_HEADER], KEY)
 })
 
+test('密钥失效按业务码判定：50035 / 50036 / 50037 算，别的码不算', () => {
+  // 真跑：输入码 → 输出是/不是密钥失效。判定不看后端措辞，所以这里只需要码。
+  assert.deepEqual(LLM_KEY_FAILURE_CODES, [50035, 50036, 50037])
+  for (const code of LLM_KEY_FAILURE_CODES) {
+    assert.equal(isLlmKeyFailure({ code, llmKeySent: true }), true, `${code} 没被认成密钥问题`)
+    // 码在前：即使消息是空的 / 不是中文，也一样判对
+    assert.equal(isLlmKeyFailure({ code, message: '' }), true, `${code} 只在有消息时才认`)
+  }
+  // 字符串形式的码（有些代理会把 code 变成字符串）也要认
+  assert.equal(isLlmKeyFailure({ code: '50035', llmKeySent: true }), true)
+
+  // 学校共享密钥自己不可用（50031）不是学生那把钥匙的事，不能引导学生去清
+  assert.equal(isLlmKeyFailure({ code: 50031, llmKeySent: true }), false, '50031 被误判成密钥失效')
+  // 文件/转换/订单类失败更不是
+  for (const code of [50041, 50043, 50046, 40406, 40061]) {
+    assert.equal(isLlmKeyFailure({ code, llmKeySent: true }), false, `${code} 被误判成密钥失效`)
+  }
+})
+
+test('中文措辞不再决定判定：光有「密钥/鉴权/额度」字样但码不对，就不算密钥失效', () => {
+  // 旧实现用 /密钥|unauthor|invalid|鉴权|quota/ 正则去认后端那句话，这条用例会红。
+  const wordy = { message: '鉴权失败：密钥 invalid，quota 用完了', llmKeySent: true }
+  assert.equal(isLlmKeyFailure(wordy), false, '还在按中文措辞认密钥失效')
+  // 码说不是密钥问题，哪怕消息里写满了密钥字样也不改口
+  assert.equal(isLlmKeyFailure({ code: 50043, message: '密钥 invalid', llmKeySent: true }), false)
+})
+
 test('密钥失效能认出来，并给出「清除后改用学校共享」的原话', async () => {
+  // 后端对 50035 的措辞随时可能改，这里故意给一句和码表完全不同的话：
+  // 判定必须仍然命中（按码），学生看到的文案是本端码表译出来的那句。
   const { calls } = installUniStub(() => ({
     statusCode: 200,
-    data: { code: 50051, message: '你提供的密钥无效或已过期', data: null },
+    data: { code: 50035, message: '模型端拒绝了这次调用（后端换了一种说法）', data: null },
   }))
   saveLlmKey(KEY)
 
@@ -212,14 +243,32 @@ test('密钥失效能认出来，并给出「清除后改用学校共享」的�
   assert.ok(error, '密钥失效时请求应当失败，不能静默成功')
   assert.equal(calls[0].header[LLM_KEY_HEADER], KEY)
   assert.equal(error.llmKeySent, true, '失败对象没标上「带过密钥」')
+  assert.equal(error.message, ERROR_MESSAGES[50035], '50035 没被码表译成本端文案')
   assert.equal(isLlmKeyFailure(error), true, '密钥失效没被认出来')
   const text = llmKeyFailureText(error)
   assert.match(text, /你的密钥不可用/)
   assert.match(text, /清除后改用学校共享/)
-  assert.match(text, /密钥无效或已过期/, '没把服务端给的原因带上')
   assert.equal(text.includes(KEY), false, '提示文案里出现了密钥原文')
   // 不静默回退：本地密钥还在，等学生自己决定清不清
   assert.equal(getLlmKey(), KEY)
+})
+
+test('「测试连通」遇到 50036（没填/格式不对）与 50037（学校关了这个功能）也判成密钥问题', async () => {
+  for (const code of [50036, 50037]) {
+    const { calls } = installUniStub(() => ({
+      statusCode: 200,
+      data: { code, message: '后端原文', data: null },
+    }))
+    saveLlmKey(KEY)
+    const error = await checkLlmKey(KEY).then(
+      () => null,
+      (err) => err
+    )
+    assert.equal(calls[0].header[LLM_KEY_HEADER], KEY)
+    assert.equal(error && error.message, ERROR_MESSAGES[code], `${code} 没被译成本端文案`)
+    assert.equal(isLlmKeyFailure(error), true, `${code} 没被认成密钥问题`)
+    assert.equal(llmKeyFailureText(error).includes('清除后改用学校共享'), true)
+  }
 })
 
 test('HTTP 401/403 直接算密钥被拒；没带密钥的失败不算密钥问题', async () => {
@@ -259,5 +308,7 @@ test('面板说明提到「本地存储」「不上传服务器」「换设备�
   assert.match(LLM_KEY_NOTICE, /本地存储/)
   assert.match(LLM_KEY_NOTICE, /不会上传服务器/)
   assert.match(LLM_KEY_NOTICE, /换设备或清理缓存/)
+  // 横幅那句话只有一个出处：errors.js 码表里 50035 的翻译
+  assert.equal(LLM_KEY_INVALID_TEXT, ERROR_MESSAGES[50035])
   assert.match(LLM_KEY_INVALID_TEXT, /清除后改用学校共享/)
 })

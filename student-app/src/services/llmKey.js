@@ -14,6 +14,7 @@
  */
 
 import { STORAGE_KEYS } from '../config/index.js'
+import { ERROR_MESSAGES, LLM_KEY_INVALID_TEXT } from '../utils/errors.js'
 
 /** 服务端约定的密钥请求头。密钥只从这里出去，不进请求体、不进 URL。 */
 export const LLM_KEY_HEADER = 'X-LLM-Api-Key'
@@ -26,8 +27,12 @@ export const LLM_KEY_NOTICE =
   '密钥只保存在这台设备的本地存储里，不会上传服务器；换设备或清理缓存后需要重新填写。' +
   '清除后立刻改用学校共享密钥，下次 AI 请求只带学校那把。'
 
-/** 密钥不可用时的标准提示（页面横幅、测试失败都用这一句打头）。 */
-export const LLM_KEY_INVALID_TEXT = '你的密钥不可用，可在「我的」→「AI 密钥」里清除后改用学校共享'
+/** 密钥不可用时的标准提示（页面横幅、测试失败都用这一句打头）。
+ *
+ * 文案本体在 utils/errors.js 的码表里（就是 50035 的翻译）：一句提示只有一个出处，
+ * 页面横幅、`explainApiCode(50035)` 与这里拿到的必须是同一句话。
+ */
+export { LLM_KEY_INVALID_TEXT }
 
 /** 没有自己的密钥时，状态行显示的文案。 */
 export const SCHOOL_KEY_LABEL = '使用学校共享密钥'
@@ -164,24 +169,49 @@ export function llmKeyHeader(explicitKey) {
 }
 
 /**
- * 服务端说的「密钥不行」大概长什么样。
+ * 「学生自带的密钥不可用」的三个后端业务码（见 backend/app/services/llm.py 与 routers/ai.py）。
  *
- * 密钥检查的失败原因由服务端给（中文），前后端没有共享的码表，只能按措辞认；
- * 另外 api.js 在带密钥的请求上失败时会打 `llmKeySent`，401/403 还会打
- * `llmKeyRejected`，两个标记合起来判断，不会把「文件解析失败」也认成密钥问题。
+ * 50035 = 拿这把钥匙调模型失败（失效 / 额度用完 / 被模型端拒）；
+ * 50036 = 请求头里没有密钥或格式明显不对；
+ * 50037 = 运维关了「学生自带密钥」开关，填了也不生效（也要引导学生去清掉）。
+ * 这三个码只会在学生自己填了钥匙的前提下出现，所以命中就是「你该处理你的钥匙」。
  */
-const KEY_FAILURE_RE = /密钥|api[ _-]?key|unauthor|invalid|鉴权|授权|额度|quota|expired|balance/i
+export const LLM_KEY_FAILURE_CODES = [50035, 50036, 50037]
 
-/** 这次失败是不是「学生的密钥不可用」。 */
+/**
+ * 这三个码对应的文案集合（从码表派生，不是从后端顺手抄来的句子）。
+ *
+ * 它只做刀口的一句用：判断一次失败是不是「密钥不可用」。依据仍然是码——
+ * 句子是本端按码翻译出来的，后端改措辞（或改错别字）不会让这里失灵。
+ */
+const KEY_FAILURE_TEXTS = new Set(LLM_KEY_FAILURE_CODES.map((code) => ERROR_MESSAGES[code]))
+
+/**
+ * 这次失败是不是「学生的密钥不可用」。
+ *
+ * 判定依据是**后端业务码**，不是后端的中文措辞（早先按 /密钥|unauthor|quota/ 之类
+ * 的正则去认消息，后端把「密钥」换成别的说法、或改了错别字，判定就失效了）：
+ * 1. 错误对象上带 `code`（业务码）就只看码；表里已知且不是这三个码 → 直接排除；
+ * 2. HTTP 401/403 由 api.js 打 `llmKeyRejected`，同样是确定的密钥问题；
+ * 3. 没带学生密钥的请求，谈不上「你的密钥不可用」（不能引学生去清一把不存在的钥匙）；
+ * 4. api.js 目前把业务码译成中文后只把文案挂到 Error 上（它不在本单文件边界，
+ *    改不了），所以拿不到码时退一步：用上面那张**由码表生成的文案集合**认领。
+ *    这也是「按码」的：码表变，集合跟着变，后端措辞变，集合不受影响。
+ */
 export function isLlmKeyFailure(error) {
   if (!error) return false
+  const code = Number(error.code ?? error.bizCode)
+  if (Number.isInteger(code) && code !== 0) {
+    if (LLM_KEY_FAILURE_CODES.includes(code)) return true
+    if (Object.prototype.hasOwnProperty.call(ERROR_MESSAGES, code)) return false
+  }
   if (error.llmKeyRejected === true) return true
   // 只有确实把学生密钥带上去了，才谈得上「你的密钥不可用」
   if (error.llmKeySent !== true) return false
-  return KEY_FAILURE_RE.test(String(error.message || ''))
+  return KEY_FAILURE_TEXTS.has(String(error.message || '').trim())
 }
 
-/** 把一次密钥失败翻成一句学生能照做的话（含服务端原话，不静默说「请求失败」）。 */
+/** 把一次密钥失败翻成一句学生能照做的话（码表没覆盖到码时把原文带上，不静默说「请求失败」）。 */
 export function llmKeyFailureText(error) {
   const reason = String((error && error.message) || '').trim()
   if (!reason || reason === LLM_KEY_INVALID_TEXT) return LLM_KEY_INVALID_TEXT

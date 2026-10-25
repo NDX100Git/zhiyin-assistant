@@ -18,6 +18,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { formatAiErrorList } from '../src/utils/errors.js'
+
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const ORDER_PAGE = path.join(APP_ROOT, 'src', 'pages', 'order', 'order.vue')
 const source = fs.readFileSync(ORDER_PAGE, 'utf8')
@@ -93,4 +95,74 @@ test('createOrder 自己也拦一道：已下单时直接返回，不重复请�
   const guardLine = body.split(/\r?\n/).find((line) => line.includes('return')) || ''
   assert.match(guardLine, /created\.value/, 'createOrder 的早退条件里没有 created，连点会出第二张单')
   assert.match(guardLine, /busy\.value/, 'createOrder 的早退条件里没有 busy')
+})
+
+/* ---------- AI 降级错误有没有出口 ---------- */
+
+/**
+ * 模板里所有「AI 降级提示」块的 v-if 表达式、class 与块内插值。
+ *
+ * 这里为什么用源码求值而不是直接真跑：提示块是模板里的 v-if，Node 里 import 不了 .vue，
+ * 也没有 Vue 运行时来渲染这个页面。能抽的那一半已经抽成纯函数了——
+ * 「后端 errors/ai_errors 数组 → 一行提示」就是 utils/errors.js 的 formatAiErrorList，
+ * 它在 errors.test.mjs 里真跑断言；这里只锁页面确实把它的结果挂到了一个提示块上。
+ */
+function aiWarnBlocks() {
+  const blocks = []
+  for (const match of source.matchAll(/<view\b([^>]*)>([\s\S]*?)<\/view>/g)) {
+    const condition = (match[1].match(/v-if="([^"]+)"/) || [])[1]
+    if (!condition || !/Error$/.test(condition)) continue
+    blocks.push({
+      condition,
+      className: (match[1].match(/class="([^"]*)"/) || [])[1] || '',
+      body: match[2],
+    })
+  }
+  return blocks
+}
+
+test('体检与打印方案两条错误文案都有出口，用的是同一套样式', () => {
+  const blocks = aiWarnBlocks()
+  const conditions = blocks.map((block) => block.condition).sort()
+  // keyError 是「密钥不可用的横幅」，体检与打印方案两条降级文案是另两个块
+  assert.deepEqual(
+    conditions,
+    ['checkError', 'keyError', 'planError'],
+    '页面里应当有体检（checkError）、打印方案（planError）与密钥横幅（keyError）三个错误提示块'
+  )
+  // 两条 AI 降级文案用同一套样式（.warn），页面一改这里就红
+  const warnBlocks = blocks.filter((block) => block.condition !== 'keyError')
+  assert.deepEqual(warnBlocks.map((block) => block.className), ['warn', 'warn'])
+  for (const block of warnBlocks) {
+    assert.match(block.body, new RegExp(`\\{\\{\\s*${block.condition}\\s*\\}\\}`), `${block.condition} 没有真的渲染出来`)
+  }
+})
+
+test('打印方案报错时看得到，正常无错时不显示', () => {
+  const planWarn = aiWarnBlocks().find((block) => block.condition === 'planError')
+  assert.ok(planWarn, 'order.vue 里找不到渲染 planError 的提示块')
+  const guard = compileGuard(planWarn.condition)
+
+  // 正常出方案：后端 errors 是空数组 → formatAiErrorList 真跑得到空串 → 提示块不显示
+  // （页面写的是 formatAiErrorList(plan.value && plan.value.errors)，这里照抄同样的输入）
+  assert.equal(guard({ planError: formatAiErrorList([]) }), false)
+  // 还没出方案 / 老版本后端没给 errors 字段：同样是空串，不显示
+  assert.equal(guard({ planError: formatAiErrorList(null) }), false)
+  assert.equal(guard({ planError: formatAiErrorList(undefined) }), false)
+
+  // 降级返回（密钥失效）：文案非空 → 提示块显示，学生看得到「去清除」
+  const warning = formatAiErrorList([
+    '打印方案：你填写的 AI 密钥不可用（HTTP 401）：请在设置里清除它后改用学校共享密钥再试',
+  ])
+  assert.match(warning, /密钥不可用/)
+  assert.match(warning, /清除/)
+  assert.equal(guard({ planError: warning }), true)
+})
+
+test('体检降级回来的 ai_errors 也走同一个出口', () => {
+  const checkWarn = aiWarnBlocks().find((block) => block.condition === 'checkError')
+  assert.ok(checkWarn, 'order.vue 里找不到渲染 checkError 的提示块')
+  const guard = compileGuard(checkWarn.condition)
+  assert.equal(guard({ checkError: formatAiErrorList([]) }), false)
+  assert.equal(guard({ checkError: formatAiErrorList(['格式合规校验：密钥不可用']) }), true)
 })

@@ -94,7 +94,9 @@ npm.cmd run dev:h5
 
 ## 4. 关键决策（都有原因，不要轻易推翻）
 
-1. **Python 用 3.14.7**：用户明确指定用本机版本，不额外装 3.11。代码保持 3.11 兼容写法（`from __future__ import annotations`、标准库类型）。
+1. **Python 用 3.14.7**：用户明确指定用本机版本，不额外装 3.11。代码按 3.12+ 写（下界不许退回 3.11）：
+   `app/schemas/common.py` 的 `class ApiResponse[T](BaseModel)` 是 3.12 才支持的 PEP 695 泛型语法，
+   3.11 下 import 就 SyntaxError；`backend/requirements.txt` 注释与 `backend/Dockerfile` 同样是 3.12 下界。
 2. **数据库建表双轨**：启动时 `create_all`（`AUTO_CREATE_TABLES=true`）+ 可执行 `schema.sql`，不引入 Alembic（V1 轻量）。
 3. **统一响应约定**：业务错误与参数校验错误返回 **HTTP 200 + 非 0 code**；未预期异常返回 HTTP 500 但响应体仍是 `{code,message,data}`。前端只解析 code。
 4. **金额一律「分」整数**：单价读 `config/pricing.json`；打印方案里模型只给推荐与理由，**纸张数/金额由服务端算**，不让模型算钱。
