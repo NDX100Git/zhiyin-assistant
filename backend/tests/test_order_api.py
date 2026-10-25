@@ -518,11 +518,17 @@ def test_首页在截单时仍可下单并给出取件提示(client, closed_sess
 
 def test_上传超过宽限期下单被拒(client, open_session, monkeypatch) -> None:
     """订单引用的文件过期后不该还能下单，否则打印时才发现文件没了。"""
-    from datetime import datetime, timedelta
+    from datetime import timedelta
 
+    from app.services import order_service
     from app.services.storage.minio_store import MinioStorage
 
-    stale = datetime.now() - timedelta(hours=settings.order_file_grace_hours + 1)
+    # 宽限期按业务侧的「现在」算：下单校验读的是 `datetime.now()`（应用时钟）。
+    # 用例若自己另取一个时钟造 stale，两边一有偏差就会算成「还没过期」：
+    # 例如把应用时钟拨到 18:43 时，真实墙钟造的 stale 只「过期」了不到 48 小时。
+    stale = order_service.datetime.now() - timedelta(
+        hours=settings.order_file_grace_hours + 1
+    )
     monkeypatch.setattr(MinioStorage, "stat_modified", lambda self, key: stale)
 
     token = login(client)

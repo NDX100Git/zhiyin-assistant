@@ -367,6 +367,75 @@ def test_老师确认后替换文件_按确认价落库并排到队尾(client, d
     assert "order_file_change_approved" in set(events)
 
 
+class _SlowClock:
+    """应用进程时钟的替身：比真实墙钟慢 `behind`。
+
+    换文件服务里的 `datetime` 只被当作「取现在」的一个入口，所以提供 now() 即可。
+    写成模块级的小类而不是 fixture：用例要把它直接塞到业务模块的 `datetime` 名字上，
+    模拟「应用机时钟落后于数据库」。
+    """
+
+    def __init__(self, behind: timedelta):
+        self._behind = behind
+
+    def now(self, tz=None):
+        return datetime.now(tz) - self._behind
+
+
+def test_应用时钟慢于数据库_换文件后仍排到队尾(client, db_session, monkeypatch):
+    """应用时钟与数据库时钟不一致时，换完文件的单必须仍排在队尾。
+
+    怎么造出这种不一致：三张单的 created_at 由数据库 `CURRENT_TIMESTAMP` 落库，
+    走的是数据库时钟；这里把换文件服务取「现在」的那一处换成慢 3 小时的替身，
+    走的是应用时钟——正是「应用机比数据库慢」的现场。
+    若重排队时间取应用时钟，requeue_at 会早于三张单的 created_at，
+    队列（COALESCE(requeue_at, created_at) 升序）会把刚换完文件的单排到队首。
+    """
+    headers = student_headers(client, "file-change-clock-skew")
+    admin = admin_headers(client)
+
+    first = paid_order(client, headers, page_count=10)
+    second = paid_order(client, headers, page_count=8)
+    third = paid_order(client, headers, page_count=6)
+
+    from app.services import file_change_service
+
+    monkeypatch.setattr(
+        file_change_service, "datetime", _SlowClock(timedelta(hours=3))
+    )
+
+    assert replace_file(client, headers, first["id"], page_count=30)["code"] == 0
+    body = confirm(client, admin, first["id"], approve=True)
+    assert body["code"] == 0, body
+    order_view = body["data"]["order"]
+    assert order_view["requeue_at"] is not None
+    assert order_view["queue_position"] == 2
+
+    db_session.expire_all()
+    stored = {
+        order.id: order
+        for order in db_session.execute(
+            select(Order).where(
+                Order.id.in_([first["id"], second["id"], third["id"]])
+            )
+        ).scalars()
+    }
+    requeued = stored[first["id"]]
+    # 重排队时间与 created_at 同源（都用数据库时钟）：既不早于自己的下单时间，
+    # 也不早于另外两张单，所以排序上只能落在队尾
+    assert requeued.requeue_at >= requeued.created_at
+    assert requeued.requeue_at >= stored[second["id"]].created_at
+    assert requeued.requeue_at >= stored[third["id"]].created_at
+
+    queue = client.get(
+        "/api/admin/queue", params={"status": "queuing"}, headers=admin
+    ).json()["data"]
+    assert [row["id"] for row in queue["items"]][-1] == first["id"]
+    assert {row["id"] for row in queue["items"]} == {
+        first["id"], second["id"], third["id"]
+    }
+
+
 def test_重新排队后预计等待按新页数重算(client, db_session):
     headers = student_headers(client)
     admin = admin_headers(client)
