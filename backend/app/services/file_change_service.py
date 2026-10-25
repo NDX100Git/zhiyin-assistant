@@ -49,6 +49,7 @@ from app.services.order_state import (
     record_log,
     status_label,
 )
+from app.services.pricing import ensure_amount_allowed
 from app.utils.exceptions import BusinessError
 
 logger = logging.getLogger(__name__)
@@ -606,11 +607,12 @@ def _approve_change(
             f"订单当前状态为「{status_label(order.status)}」，不能确认换文件", code=40912
         )
 
-    final_amount = (
-        int(change.new_amount_cents) if amount_cents is None else int(amount_cents)
+    # 换文件后的新金额同样要过护栏：只挡负数时把 30 元敲成 300 元会直接落库，
+    # 学生换完文件当场多付十倍
+    final_amount = ensure_amount_allowed(
+        int(change.new_amount_cents) if amount_cents is None else int(amount_cents),
+        int(change.new_amount_cents or 0) if amount_cents is not None else 0,
     )
-    if final_amount < 0:
-        raise BusinessError("金额不能为负数", code=40061)
 
     rows, target = resolve_file_row(db, order, change.file_index)
     new_file_pages = int(change.new_file_page_count or change.new_page_count)

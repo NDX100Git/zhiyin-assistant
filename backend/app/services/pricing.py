@@ -10,11 +10,23 @@ from app.utils.exceptions import BusinessError
 
 
 def unit_price_cents(print_side: int, color_mode: int) -> int:
-    """按单双面与黑白彩色取单价（分/页）。"""
+    """按单双面与黑白彩色取单价（分/页）。
+
+    取值必须显式校验：早期实现用 `== 1` / `== 2` 判断，脏值（"双面" 被 int 成
+    别的数、前端传 5）会静默落到 bw_single 这个最低价，学生就少付钱。
+    """
+    try:
+        side = int(print_side)
+        color = int(color_mode)
+    except (TypeError, ValueError) as exc:
+        raise BusinessError("打印参数不合法：单双面与颜色必须是整数", code=40041) from exc
+    if side not in (1, 2):
+        raise BusinessError(f"单双面取值不合法：{print_side}（1=单面，2=双面）", code=40041)
+    if color not in (0, 1):
+        raise BusinessError(f"颜色模式取值不合法：{color_mode}（0=黑白，1=彩色）", code=40041)
+
     config = get_pricing_config()
-    key = ("color" if int(color_mode) == 1 else "bw") + (
-        "_duplex" if int(print_side) == 2 else "_single"
-    )
+    key = ("color" if color == 1 else "bw") + ("_duplex" if side == 2 else "_single")
     price = config.get(key)
     if not isinstance(price, int) or price < 0:
         raise BusinessError(f"计费配置有误：{key} 必须是「分」为单位的整数", code=50010)
@@ -28,3 +40,35 @@ def calc_amount_cents(page_count: int, print_side: int, color_mode: int, copies:
     if pages < 0 or count < 1:
         raise BusinessError("页数与份数不合法", code=40040)
     return unit_price_cents(print_side, color_mode) * pages * count
+
+
+# 老师改价的护栏。只挡负数等于没挡：把 300 敲成 3000 元照样落库并现场收款，
+# 学生当场扫码就多付十倍；偏离系统价太多时一律要求重新核对。
+MAX_ORDER_AMOUNT_CENTS = 100_000  # 单笔绝对上限 1000 元
+MAX_AMOUNT_RATIO = 10             # 相对系统价最多 10 倍
+MIN_ALLOWANCE_CENTS = 2_000       # 但至少给到 20 元的浮动空间
+
+
+def ensure_amount_allowed(amount_cents: int, system_amount_cents: int = 0) -> int:
+    """校验改价/成交价：非负、有绝对上限、相对系统价有倍数上限。返回校验后的金额。
+
+    倍数上限取「系统价 × 10」与「20 元」的较大者：1 页黑白单系统价只有 15 分，
+    只用倍数会把「老师让价到 2 元」也拦掉，那不是护栏而是故障。
+    """
+    amount = int(amount_cents)
+    if amount < 0:
+        raise BusinessError("金额不能为负数", code=40061)
+    if amount > MAX_ORDER_AMOUNT_CENTS:
+        raise BusinessError(
+            f"金额 {amount} 分超出单笔上限 {MAX_ORDER_AMOUNT_CENTS} 分，请核对后重新输入",
+            code=40062,
+        )
+    if system_amount_cents > 0:
+        ceiling = max(system_amount_cents * MAX_AMOUNT_RATIO, MIN_ALLOWANCE_CENTS)
+        if amount > ceiling:
+            raise BusinessError(
+                f"金额 {amount} 分明显高于系统计价 {system_amount_cents} 分"
+                f"（上限 {ceiling} 分），请核对后重新输入",
+                code=40062,
+            )
+    return amount

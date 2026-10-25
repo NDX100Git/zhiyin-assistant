@@ -41,7 +41,9 @@ TRANSITIONS: dict[str, set[str]] = {
     STATUS_QUEUING: {STATUS_PRINTING, STATUS_CANCELLED, STATUS_ABNORMAL},
     STATUS_PRINTING: {STATUS_READY, STATUS_ABNORMAL},
     STATUS_READY: {STATUS_COMPLETED, STATUS_ABNORMAL},
-    STATUS_ABNORMAL: {STATUS_QUEUING, STATUS_CANCELLED},
+    # 异常单可以直接恢复到待取件：已出纸的单只差最后一步，
+    # 回队列会让它被重新打印一遍
+    STATUS_ABNORMAL: {STATUS_QUEUING, STATUS_READY, STATUS_CANCELLED},
     STATUS_COMPLETED: set(),
     STATUS_CANCELLED: set(),
 }
@@ -111,7 +113,9 @@ def change_status(
 
     now = datetime.now()  # 服务端时间
     values: dict = {"status": to_status}
-    if to_status == STATUS_READY:
+    # printed_at 只在第一次进 ready 时写：异常单恢复回 ready 时保留原始打印时间，
+    # 否则耗时统计与「这一单到底什么时候打的」全部失真
+    if to_status == STATUS_READY and order.printed_at is None:
         values["printed_at"] = now
     elif to_status == STATUS_COMPLETED:
         values["picked_at"] = now

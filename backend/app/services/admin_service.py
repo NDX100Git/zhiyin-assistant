@@ -40,6 +40,7 @@ from app.services.order_state import (
     record_log,
     status_label,
 )
+from app.services.pricing import ensure_amount_allowed
 from app.services.printer import get_printer_provider
 from app.services.queue_service import batch_wait_info, order_wait_info, queue_order_by
 from app.services.session_service import get_or_create_session, release_session_slot
@@ -119,6 +120,11 @@ def order_admin_view(db: Session, order: Order, wait: dict | None = None,
     }
 
 
+def _escape_like(raw: str) -> str:
+    """转义 LIKE 通配符。关键字里的 _ 与 % 不是通配需求，不转义会退化成全表匹配。"""
+    return raw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def queue_list(db: Session, status: str | None = None, keyword: str | None = None,
                page: int = 1, page_size: int = 50) -> dict:
     """接单队列：按订单号排序，支持状态筛选与关键字搜索。"""
@@ -126,9 +132,13 @@ def queue_list(db: Session, status: str | None = None, keyword: str | None = Non
     if status:
         condition.append(Order.status == status)
     if keyword:
-        like = f"%{keyword.strip()}%"
+        like = f"%{_escape_like(keyword.strip())}%"
         condition.append(
-            or_(Order.order_no.like(like), Order.pickup_code.like(like), Order.file_name.like(like))
+            or_(
+                Order.order_no.like(like, escape="\\"),
+                Order.pickup_code.like(like, escape="\\"),
+                Order.file_name.like(like, escape="\\"),
+            )
         )
 
     total = db.execute(select(func.count()).select_from(Order).where(*condition)).scalar_one()
@@ -247,8 +257,11 @@ def complete_print(db: Session, order: Order, operator: str,
     system_amount = system_total_cents(db, order)
     current_amount = int(order.amount_cents or 0)
     final_amount = (current_amount or system_amount) if amount_cents is None else int(amount_cents)
-    if final_amount < 0:
-        raise BusinessError("金额不能为负数", code=40061)
+    # 显式改价过完整护栏（含相对系统价的倍数上限）；沿用已有成交价只查绝对上限，
+    # 那是既成事实，不该反过来卡住完成流程
+    final_amount = ensure_amount_allowed(
+        final_amount, system_amount if amount_cents is not None else 0
+    )
 
     if amount_cents is None:
         if final_amount == system_amount:
@@ -285,10 +298,15 @@ def complete_print(db: Session, order: Order, operator: str,
 
 
 def batch_complete(db: Session, order_ids: list[int], operator: str) -> dict:
-    """批量标记完成：逐单处理，返回成功与失败明细。"""
+    """批量标记完成：逐单处理，返回成功与失败明细。
+
+    单笔失败不能拖垮整批：只捕 BusinessError 时，一次 DB 断连或锁超时就会
+    冒泡成 500，前面成功的单已提交、后面的单没处理，调用方还拿不到明细。
+    """
     succeeded: list[dict] = []
     failed: list[dict] = []
-    for order_id in order_ids:
+    # 去重：同一单传两次会被处理两遍，第二次撞状态机报错，明细里出现假失败
+    for order_id in dict.fromkeys(order_ids):
         try:
             order = get_order(db, order_id)
             # 显式沿用当前成交价：不传就会走系统价，把换文件确认价和改价抹掉
@@ -300,6 +318,10 @@ def batch_complete(db: Session, order_ids: list[int], operator: str) -> dict:
         except BusinessError as exc:
             db.rollback()
             failed.append({"order_id": order_id, "message": exc.message})
+        except Exception:  # 非业务异常（断连/锁超时）只记这一单，不中断整批
+            db.rollback()
+            logger.exception("批量完成订单 %s 失败", order_id)
+            failed.append({"order_id": order_id, "message": "处理失败，请稍后重试该单"})
     return {"succeeded": succeeded, "failed": failed}
 
 
@@ -330,7 +352,10 @@ def verify_pickup(db: Session, order: Order, operator: str) -> dict:
     order.paid = 1
     order.pay_method = "onsite" if collected else order.pay_method
     order.pay_channel = order.pay_method
-    order.paid_at = datetime.now()  # 服务端时间
+    # 只在首次支付时记录时间。线上已付过的单被老师核销时若无条件覆盖，
+    # 支付时间会变成核销时间，对账口径与客诉追溯全部错位。
+    if order.paid_at is None:
+        order.paid_at = datetime.now()  # 服务端时间
 
     db.commit()
     db.refresh(order)
@@ -391,8 +416,21 @@ def mark_abnormal(db: Session, order: Order, reason: str | None, operator: str) 
 
 
 def recover_order(db: Session, order: Order, operator: str) -> dict:
-    """异常处理完成，恢复排队。"""
-    change_status(db, order, STATUS_QUEUING, operator=operator, note="异常处理完成，恢复排队")
+    """异常处理完成：已打印过的单回到待取件，未打印的回到排队。
+
+    两者都回 queuing 会形成 ready→abnormal→queuing→printing→ready 的回路：
+    已经出纸的订单重新进入打印队列，老师再点一次「开始打印」就白打一遍，
+    printed_at 也会被覆盖，对账与耗时统计全失真。
+    """
+    if order.printed_at is not None:
+        change_status(
+            db, order, STATUS_READY, operator=operator,
+            note="异常处理完成，文件已打印，恢复待取件",
+        )
+    else:
+        change_status(
+            db, order, STATUS_QUEUING, operator=operator, note="异常处理完成，恢复排队"
+        )
     db.commit()
     db.refresh(order)
     return order_admin_view(db, order)
