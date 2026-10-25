@@ -174,6 +174,23 @@ def test_下单页数与实际文件不一致被拒(client, open_session, monkey
     assert "实际为 7 页" in body["message"]
 
 
+def test_报价同样校验页数不一致(client, open_session, monkeypatch):
+    """报价与下单必须用同一份真实页数。
+
+    校验只在 create_order 里做时，客户端把 page_count 改小可以先拿到偏低的
+    估价，与随后实际扣款分叉，违背「报价即实付」。
+    """
+    token = login(client)
+    monkeypatch.setattr(
+        "app.services.order_service._actual_page_count",
+        lambda db, file_key: 7,
+    )
+
+    body = client.post("/api/order/quote", json=ORDER_PAYLOAD, headers=auth(token)).json()
+    assert body["code"] == 40054
+    assert "实际为 7 页" in body["message"]
+
+
 def test_截单后仍可下单并提示排到下一个时段(client, closed_session):
     token = login(client)
     body = client.post("/api/order/create", json=ORDER_PAYLOAD, headers=auth(token)).json()

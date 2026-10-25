@@ -99,8 +99,16 @@ def client(db_session):
     app.dependency_overrides.clear()
 
 
+def pytest_configure(config):
+    """注册自定义标记，避免 pytest 报 unknown marker。"""
+    config.addinivalue_line(
+        "markers",
+        "real_page_count: 使用真实的页数校验实现，跳过 autouse 对 _actual_page_count 的打桩",
+    )
+
+
 @pytest.fixture(autouse=True)
-def _fresh_upload_time(monkeypatch):
+def _fresh_upload_time(request, monkeypatch):
     """下单会校验文件新旧；单测里的 file_key 是假的，统一按「刚上传」处理。
 
     要验证过期与文件缺失的用例在用例内部再 monkeypatch 覆盖即可。
@@ -111,7 +119,11 @@ def _fresh_upload_time(monkeypatch):
     from app.services.storage.minio_store import MinioStorage
 
     monkeypatch.setattr(MinioStorage, "stat_modified", lambda self, key: datetime.now())
-    # 大多数接口用例使用假的 file_key，不进入真实文档解析；页数校验用例会覆盖这里。
+    # 默认把页数校验当作「跳过」：绝大多数接口用例用的是假 file_key，不该为了它们
+    # 去 mock 整条文档解析链。需要验证真实实现（解析失败、页数为 0、返回脏值）的
+    # 用例打上 @pytest.mark.real_page_count，这个桩就不生效。
+    if request.node.get_closest_marker("real_page_count"):
+        return
     monkeypatch.setattr(order_service, "_actual_page_count", lambda db, key: None)
 
 

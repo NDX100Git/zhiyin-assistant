@@ -193,13 +193,15 @@ def _prepare_items(db: Session, user: User, payload) -> list[dict]:
     _validate_file_owner(db, user, items)
     for item in items:
         _validate_file_freshness(item["file_key"])
+    # 页数校验放在这条共用路径上：只在 create_order 里做时，客户端把 page_count
+    # 改小可以先拿到偏低的报价，与随后实际扣款分叉，违背「报价即实付」
+    validate_declared_page_counts(db, items)
     return items
 
 
 def create_order(db: Session, user: User, payload) -> Order:
     """下单：支持单文件旧写法与文件清单新写法，状态置 pending_pay。"""
     items = _prepare_items(db, user, payload)
-    validate_declared_page_counts(db, items)
 
     # 截单不拒绝下单：仅把订单排到下一个打印时段（首页会给出提示）
     session_info = current_session_info(db)
