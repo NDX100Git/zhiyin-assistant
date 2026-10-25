@@ -22,14 +22,12 @@ import functools
 import logging
 from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, TypeVar
+from typing import Any
 
 from app.config import settings
 from app.utils.exceptions import BusinessError
 
 logger = logging.getLogger(__name__)
-
-T = TypeVar("T")
 
 _executor: ThreadPoolExecutor | None = None
 _executor_size: int = 0
@@ -90,7 +88,7 @@ async def ai_slot() -> AsyncIterator[None]:
             semaphore.release()
 
 
-async def run_ai_job(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+async def run_ai_job[T](func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     """把阻塞的 AI 任务丢到专用线程池执行，等待过程不占线程。
 
     线程池本身有固定大小，超出的任务在池子的队列里等，等待同样不占线程。

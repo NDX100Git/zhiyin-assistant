@@ -9,8 +9,7 @@ line-length = 100
 select = ["E", "F", "W", "I", "UP", "B", "RUF"]
 # B008：FastAPI 的 Depends/File 必须写在参数默认值里，属框架固定写法
 # RUF001/002/003：本项目注释与提示语使用中文全角标点，属正常写法
-# UP046/UP047：PEP 695 泛型语法（class C[T] / def f[T]()）要 3.12 起才可用，
-#   切到 py312 后这两条规则才开始报 app/schemas/common.py 与 app/services/ai_pool.py。
-#   改写它两处属于代码改动，不在本单的文件边界内，先显式挂起；
-#   待排期时一并改，不要在目标版本上退回 3.11 来绕开。
-ignore = ["E501", "B008", "RUF001", "RUF002", "RUF003", "UP046", "UP047"]
+# UP046/UP047（PEP 695 泛型语法）不再挂起：本单把 app/schemas/common.py 的
+#   ApiResponse 与 app/services/ai_pool.py 的 run_ai_job 改成了 `class C[T]` /
+#   `def f[T]()`，既然 target-version 是 py312，就按 3.12 的写法写，不再往 3.11 退。
+ignore = ["E501", "B008", "RUF001", "RUF002", "RUF003"]
