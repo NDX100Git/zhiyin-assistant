@@ -5,6 +5,13 @@
 
 AI 是可选能力：请求不传 use_ai 时按关闭处理，只用规则方案，不会静默调用模型花钱。
 报告同时给出「总页数 / 单面张数 / 双面张数」的可读换算。
+
+关于缩放（scale）：早期的对外契约里有这个选项，校验完却不参与任何计算，等于给了
+一个摆着看的旋钮。它之所以没被接进算法，是因为缩放本来就是**打印机端**的设置：
+把一页内容缩小到 80% 打印，打印页数（impression）与纸张数都不会变，纸张数与金额
+跟缩放无关。硬让 scale 参与算钱就是编一个不存在的关系，学生会照着错误的省钱预期下单。
+所以这里的结论是从契约里移除它：推荐方案只保留真的影响纸张数的三项（单双面、
+颜色、讲义版式）。config/ai_rules.json 里的 allowed_scales 一并停止使用。
 """
 
 from __future__ import annotations
@@ -59,7 +66,6 @@ def _messages(features: dict, options: dict) -> list[dict[str, Any]]:
             "print_side": 2,
             "color_mode": 0,
             "layout": "handout_2in1",
-            "scale": 100,
         },
         "reason": "该文档为 PPT，采用双面讲义 2 合 1 可显著减少纸张。",
     }
@@ -69,7 +75,6 @@ def _messages(features: dict, options: dict) -> list[dict[str, Any]]:
         f"可用方案：单双面(print_side:1 单面/2 双面)、"
         f"讲义模式(layout:{'/'.join(allowed['allowed_layouts'])}，"
         f"handout_2in1 表示一页纸排 2 页文档)、"
-        f"缩放(scale:{'/'.join(str(item) for item in allowed['allowed_scales'])})、"
         "黑白/彩色(color_mode:0 黑白/1 彩色)\n\n"
         f"只输出 JSON（纸张数与金额由系统计算，你不用给）：\n"
         f"{json.dumps(schema, ensure_ascii=False)}"
@@ -90,7 +95,6 @@ def fallback_recommend(features: dict) -> dict:
         "print_side": 2,
         "color_mode": 1 if features["has_color"] else 0,
         "layout": layout,
-        "scale": 100,
     }
 
 
@@ -126,11 +130,8 @@ def sanitize_recommend(recommend: dict | None, features: dict) -> dict:
     if layout not in allowed["allowed_layouts"]:
         layout = base["layout"]
 
-    scale = _safe_int(recommend.get("scale"), base["scale"])
-    if scale not in allowed["allowed_scales"]:
-        scale = base["scale"]
-
-    return {"print_side": print_side, "color_mode": color_mode, "layout": layout, "scale": scale}
+    # 模型仍可能自己塞一个 scale 进来：不校验也不透传，直接丢掉（见模块开头的说明）
+    return {"print_side": print_side, "color_mode": color_mode, "layout": layout}
 
 
 def calc_numbers(features: dict, recommend: dict, copies: int) -> dict:

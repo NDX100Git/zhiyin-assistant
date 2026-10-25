@@ -95,10 +95,35 @@ async def run_ai_job(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
 
     线程池本身有固定大小，超出的任务在池子的队列里等，等待同样不占线程。
     并发名额由 ai_slot 依赖负责，这里不再重复限制。
+
+    任务跑在线程里，但用的仍是**请求级数据库会话**（调用方把它当第一个参数传进来）。
+    客户端断开（关页面、网关超时）时，Starlette 会取消这个请求的协程，请求随即结束，
+    get_db 的 finally 会把会话关掉——而线程里的任务还在用它，接下来每一句 SQL 都会抛
+    "This session is closed"。任务的结果没人收，日志里只剩一堆看不出原因的报错。
+
+    所以这里屏蔽取消：客户端断开只是「不再需要这个响应」，不意味着活该不干完。
+    协程会一直等到线程任务真正结束才向后传取消信号，会话关闭必然发生在任务结束之后。
+    代价是一个已经断开连接的请求仍会占满它的 AI 名额直到任务结束，这是故意的：
+    提前放弃会留下一个跑到一半的任务和一个已被关闭的会话，比多占几秒名额严重得多。
     """
     loop = asyncio.get_running_loop()
     call = functools.partial(func, *args, **kwargs)
-    return await loop.run_in_executor(get_executor(), call)
+    task = loop.run_in_executor(get_executor(), call)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # 断开后仍要等任务跑完：等不到就会话已关，线程里的任务只能报错退出。
+        # 重复取消（网关重试、层层收尾）会再抛 CancelledError，所以用循环兜住，
+        # 直到任务真的结束才把取消信号向外传。
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:  # 任务自己失败：结果已无人接收，只需保证会话不被提前关
+                break
+        logger.info("客户端已断开，AI 任务跑完后才结束请求，会话不会被提前关闭")
+        raise
 
 
 def shutdown_ai_pool() -> None:

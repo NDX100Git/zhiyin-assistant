@@ -185,3 +185,94 @@ def test_转换失败后归还槽位(monkeypatch, gate, tmp_path):
     # 名额已归还：同一个上限下还能立刻拿到槽位
     with doc_parser.conversion_slot():
         pass
+
+
+# ---------------------------------------------------------------- 表格渲染的重试次数
+def _make_sheet(path):
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet["A1"] = "汇总表"
+    sheet["A2"] = "项目"
+    sheet["B2"] = 12
+    workbook.save(str(path))
+    return path
+
+
+def _fake_convert(sleep_seconds: float, calls: list[Path]):
+    """替身转换器：产出一份 PDF，可指定每次耗时，累加调用次数。"""
+
+    def convert(prepared: Path, out_dir: Path) -> Path:
+        calls.append(prepared)
+        time.sleep(sleep_seconds)
+        target = out_dir / "rendered.pdf"
+        target.write_bytes(b"%PDF-1.4\n")
+        return target
+
+    return convert
+
+
+def test_表格字号够大时只转换一次(monkeypatch, tmp_path):
+    from app.services import spreadsheet
+
+    source = _make_sheet(tmp_path / "表格.xlsx")
+    calls: list[Path] = []
+    monkeypatch.setattr(spreadsheet, "_print_font_percentile", lambda path: 12.0)
+
+    spreadsheet.render_pdf(source, tmp_path / "work", _fake_convert(0.0, calls))
+
+    assert len(calls) == 1, "字号够大就不该放宽重试"
+
+
+def test_表格字号一直偏小时不超过配置的页数上限(monkeypatch, tmp_path):
+    """放宽重试的次数受配置里的 max_width_pages 约束，不是想试几次试几次。"""
+    from app.services import spreadsheet
+
+    max_width = int(spreadsheet.get_spreadsheet_rules()["max_width_pages"])
+    source = _make_sheet(tmp_path / "表格.xlsx")
+    calls: list[Path] = []
+    monkeypatch.setattr(spreadsheet, "_print_font_percentile", lambda path: 5.0)
+    monkeypatch.setattr(settings, "spreadsheet_render_budget_seconds", 600.0)
+
+    pdf = spreadsheet.render_pdf(source, tmp_path / "work", _fake_convert(0.0, calls))
+
+    assert pdf.exists()
+    assert len(calls) == max_width
+    assert len(calls) <= 4, "一条表格请求最多四次转换"
+
+
+def test_表格渲染超出耗时预算就停止重试(monkeypatch, tmp_path):
+    """真正吃容量的是时间：超预算后不再重新转换，直接按当前结果出纸。
+
+    单次转换最长 soffice_timeout_seconds（默认 180 秒）。没有预算时最差四次串行
+    就是十几分钟一直占住一个 AI 并发名额，排在后面的人只会看到超时。
+    """
+    from app.services import spreadsheet
+
+    source = _make_sheet(tmp_path / "表格.xlsx")
+    calls: list[Path] = []
+    monkeypatch.setattr(spreadsheet, "_print_font_percentile", lambda path: 5.0)
+    monkeypatch.setattr(settings, "spreadsheet_render_budget_seconds", 0.12)
+
+    started = time.monotonic()
+    pdf = spreadsheet.render_pdf(source, tmp_path / "work", _fake_convert(0.07, calls))
+    elapsed = time.monotonic() - started
+
+    assert pdf.exists()
+    assert len(calls) == 2, "第一次跑满 0.07 秒后还没超预算，第二次跑完就该停"
+    assert elapsed < 0.4, "预算生效时不该继续往下试"
+
+
+def test_预算为零也要交出第一份结果(monkeypatch, tmp_path):
+    from app.services import spreadsheet
+
+    source = _make_sheet(tmp_path / "表格.xlsx")
+    calls: list[Path] = []
+    monkeypatch.setattr(spreadsheet, "_print_font_percentile", lambda path: 5.0)
+    monkeypatch.setattr(settings, "spreadsheet_render_budget_seconds", 0.0)
+
+    pdf = spreadsheet.render_pdf(source, tmp_path / "work", _fake_convert(0.0, calls))
+
+    assert pdf.exists()
+    assert len(calls) == 1

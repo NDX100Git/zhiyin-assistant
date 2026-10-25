@@ -11,14 +11,38 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 logger = logging.getLogger(__name__)
 
+# 表名与列名要拼进 ALTER 语句（标识符无法用参数绑定），拼之前必须过白名单。
+# 当前取值全部是模块常量，属加固：将来若有人把库名/表名改成从配置或请求里读，
+# 这一道检查能拦住整条注入口子。
+IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+
+
+class UnsafeIdentifierError(ValueError):
+    """表名或列名不是合法标识符（可能被拿来拼注入语句）。"""
+
+
+def quote_identifier(name: str) -> str:
+    """校验并引用一个 SQL 标识符（表名 / 列名），非法时直接报错。"""
+    if not isinstance(name, str) or not IDENTIFIER_PATTERN.match(name):
+        raise UnsafeIdentifierError(
+            f"非法的 SQL 标识符：{name!r}（只允许字母、数字、下划线，且不以数字开头）"
+        )
+    return f"`{name}`"
+
 # 需要补的列：表 -> 列 -> 列定义
 MIGRATION_COLUMNS: dict[str, dict[str, str]] = {
+    "ai_reports": {
+        # 体检报告缓存改成按「账号 + 文件」存一份（产品口径：各账号互不共用）。
+        # 老库里的历史行无法判断归属，留 NULL，由读取时就地认领。
+        "user_id": "BIGINT NULL COMMENT '报告归属账号；为空表示迁移前的老行'",
+    },
     "orders": {
         "requeue_at": "DATETIME NULL COMMENT '换文件后重新排队时间，为空时按创建时间排队'",
         "file_changed_at": "DATETIME NULL COMMENT '当前文件最近一次被替换的时间'",
@@ -51,6 +75,11 @@ MIGRATION_COLUMNS: dict[str, dict[str, str]] = {
 
 # 需要补的索引：表 -> 索引名 -> 建索引语句
 MIGRATION_INDEXES: dict[str, dict[str, str]] = {
+    "ai_reports": {
+        "idx_report_owner": (
+            "ALTER TABLE `ai_reports` ADD KEY `idx_report_owner` (`user_id`, `file_key`)"
+        ),
+    },
     "order_file_changes": {
         "uq_file_change_pending": (
             "ALTER TABLE `order_file_changes` "
@@ -195,7 +224,12 @@ def run_migrations(engine: Engine) -> list[str]:
             for column, ddl in columns.items():
                 if _column_exists(conn, table, column):
                     continue
-                conn.execute(text(f"ALTER TABLE `{table}` ADD COLUMN `{column}` {ddl}"))
+                conn.execute(
+                    text(
+                        f"ALTER TABLE {quote_identifier(table)} "
+                        f"ADD COLUMN {quote_identifier(column)} {ddl}"
+                    )
+                )
                 applied.append(f"{table}.{column}")
                 logger.info("迁移：已为 %s 增加列 %s", table, column)
 
@@ -205,6 +239,8 @@ def run_migrations(engine: Engine) -> list[str]:
             for index, ddl in indexes.items():
                 if _index_exists(conn, table, index):
                     continue
+                # 建索引的语句本身是模块常量，这里只再过一道标识符检查
+                quote_identifier(index)
                 conn.execute(text(ddl))
                 applied.append(f"{table}.{index}")
                 logger.info("迁移：已为 %s 增加索引 %s", table, index)

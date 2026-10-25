@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 import pymupdf
@@ -28,10 +29,24 @@ from openpyxl.worksheet.page import PageMargins
 from openpyxl.worksheet.pagebreak import ColBreak, RowBreak
 from openpyxl.worksheet.properties import PageSetupProperties
 
-from app.config import get_spreadsheet_rules
+from app.config import get_spreadsheet_rules, settings
 from app.utils.exceptions import BusinessError
 
 logger = logging.getLogger(__name__)
+
+# 一条表格请求总共允许多久花在「归一版式 + 转换」上（见 settings 里的同名配置）。
+# 每放宽一次横向页数，就要重跑一轮转换，一次最长 SOFFICE_TIMEOUT_SECONDS（默认 180 秒），
+# 期间全程占住一个 AI 并发名额。按配置里的 max_width_pages（默认 4）逐页试，
+# 最差是四次串行＝十几分钟独占一个名额，排在他后面的人只会看到超时。
+#
+# 收敛方式取**总耗时预算**，而不是拍一个固定次数：
+# - 真正吃容量的是时间，不是次数。小表放宽一页只要几秒，多试一次很便宜；
+#   大表一次就上百秒，第二次开始就是拿全站容量赌。
+# - 固定次数会让「小表只试两次」和「大表仍旧跑满」两件事同时发生：该省的地方
+#   省不下多少，该停的地方也没停。
+# 所以每次起转换之前先看已经花了多久：超预算就按当前这份出纸，并在体检报告里
+# 提示「列太多、打印后字偏小」，让用户自己拆表 —— 不拿全站容量去碰运气。
+RENDER_BUDGET_SECONDS_FALLBACK = 240.0
 
 
 def _is_blank(value: object) -> bool:
@@ -187,10 +202,21 @@ def render_pdf(source: Path, work_dir: Path, convert, stats: dict | None = None)
     rules = get_spreadsheet_rules()
     min_pt = float(rules.get("min_readable_font_pt", 8.0))
     max_width = max(1, int(rules.get("max_width_pages", 4)))
+    budget = max(0.0, float(getattr(settings, "spreadsheet_render_budget_seconds", RENDER_BUDGET_SECONDS_FALLBACK)))
+    started = time.monotonic()
 
     pdf_path: Path | None = None
     attempt_stats: dict = {}
     for width_pages in range(1, max_width + 1):
+        # 第一轮总要跑（否则连一份 PDF 都拿不出来）；之后每一轮先看预算
+        if width_pages > 1 and time.monotonic() - started >= budget:
+            logger.warning(
+                "表格渲染已用掉 %.0f 秒预算（上限 %.0f 秒），不再放宽横向页数：%s",
+                time.monotonic() - started,
+                budget,
+                source.name,
+            )
+            break
         attempt_dir = work_dir / f"fit{width_pages}"
         attempt_dir.mkdir(parents=True, exist_ok=True)
         attempt_stats = {}

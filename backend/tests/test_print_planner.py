@@ -35,7 +35,7 @@ def test_PPT采用双面讲义2合1时省纸省钱正确():
 
     numbers = calc_numbers(
         features,
-        {"print_side": 2, "color_mode": 0, "layout": "handout_2in1", "scale": 100},
+        {"print_side": 2, "color_mode": 0, "layout": "handout_2in1"},
         copies=1,
     )
     assert numbers["impressions"] == 21
@@ -55,7 +55,7 @@ def test_彩色文档与多份计算():
 
     numbers = calc_numbers(
         features,
-        {"print_side": 2, "color_mode": 1, "layout": "single", "scale": 100},
+        {"print_side": 2, "color_mode": 1, "layout": "single"},
         copies=2,
     )
     # impressions 是含份数的总打印页数：单页版式 10 页 × 2 份 = 20
@@ -72,9 +72,30 @@ def test_非法方案取值回退():
     assert fixed["print_side"] == 2
     assert fixed["color_mode"] == 0
     assert fixed["layout"] == "single"
-    assert fixed["scale"] == 100
+    # 缩放不参与算纸算钱，已从对外契约移除：模型塞进来的 scale 一律不透传
+    assert "scale" not in fixed
 
     assert sanitize_recommend(None, features)["print_side"] == 2
+    assert "scale" not in sanitize_recommend(None, features)
+
+
+def test_缩放不再出现在推荐方案与提示词里(monkeypatch):
+    """scale 是个无效旋钮：校验完不参与任何计算，留着只会误导学生。
+
+    这里同时钉住三件事：模型返回的 scale 被丢弃、兜底方案没有 scale、
+    提示词里不再告诉模型「可以选缩放」。
+    """
+    features = extract_features(_parsed(30), "pdf", {})
+    recommended = sanitize_recommend(
+        {"print_side": 2, "color_mode": 0, "layout": "single", "scale": 85}, features
+    )
+    assert recommended == {"print_side": 2, "color_mode": 0, "layout": "single"}
+
+    from app.services.print_planner import _messages
+
+    prompt = " ".join(message["content"] for message in _messages(features, {}))
+    assert "scale" not in prompt
+    assert "缩放" not in prompt
 
 
 def test_无彩色图片时强制黑白且模型失败可兜底(db_session, monkeypatch):
@@ -99,7 +120,7 @@ def test_方案写入缓存且带用户偏好(db_session, monkeypatch):
     monkeypatch.setattr(
         "app.services.print_planner.chat_json",
         lambda messages: {
-            "recommend": {"print_side": 2, "color_mode": 0, "layout": "handout_4in1", "scale": 85},
+            "recommend": {"print_side": 2, "color_mode": 0, "layout": "handout_4in1"},
             "reason": "PPT 采用 4 合 1 更省纸",
         },
     )
@@ -121,7 +142,7 @@ def test_用户手动选择单双面颜色与版式(db_session, monkeypatch):
     monkeypatch.setattr(
         "app.services.print_planner.chat_json",
         lambda messages: {
-            "recommend": {"print_side": 2, "color_mode": 0, "layout": "handout_2in1", "scale": 100},
+            "recommend": {"print_side": 2, "color_mode": 0, "layout": "handout_2in1"},
             "reason": "默认推荐双面讲义",
         },
     )

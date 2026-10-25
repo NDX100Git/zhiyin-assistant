@@ -181,6 +181,9 @@ def test_取消执行中的请求会归还名额(monkeypatch) -> None:
         task = asyncio.create_task(job())
         await asyncio.sleep(0.1)  # 名额已到手，线程卡在慢活里
         task.cancel()
+        # 取消之后协程会先等线程里的慢活跑完（见 run_ai_job 的说明），
+        # 所以这里要放开慢活，否则要等满 wait 的 5 秒
+        release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
         async with slot():
@@ -190,3 +193,84 @@ def test_取消执行中的请求会归还名额(monkeypatch) -> None:
         asyncio.run(scenario())
     finally:
         release.set()  # 放开线程，别把慢活留到别的用例里
+
+
+# ---------------------------------------------------------------- 断开连接后的会话生命周期
+class _FakeSession:
+    """模拟请求级数据库会话：请求结束后被关闭，关闭后再用就报错。
+
+    真实场景就是 SQLAlchemy 的那句 "This session is closed"：会话关闭后任何一句
+    SQL 都会抛这个异常，线程里的任务当场失败，结果没人收。
+    """
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.used_after_close = 0
+
+    def write(self, value: str) -> str:
+        if self.closed:
+            self.used_after_close += 1
+            raise RuntimeError("This session is closed")
+        return value
+
+
+def test_客户端断开后任务跑完才关会话(monkeypatch) -> None:
+    """客户端取消后，线程里的任务必须继续跑完，且会话在任务结束之后才关闭。"""
+    monkeypatch.setattr(settings, "ai_max_workers", 1)
+    session = _FakeSession()
+    wrote: list[str] = []
+    finished = threading.Event()
+
+    def slow_job(db: _FakeSession) -> str:
+        # 慢活：真实任务是解析文档、调模型、写报告缓存
+        time.sleep(0.15)
+        wrote.append(db.write("报告已写入缓存"))
+        finished.set()
+        return "done"
+
+    async def endpoint() -> str:
+        """模仿路由：拿到请求级会话，把它交给 AI 线程池。"""
+        try:
+            return await ai_pool.run_ai_job(slow_job, session)
+        finally:
+            session.closed = True  # get_db 的 finally：请求结束就关会话
+
+    async def scenario() -> None:
+        task = asyncio.create_task(endpoint())
+        await asyncio.sleep(0.05)  # 线程已经在跑
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert session.closed, "请求结束后会话必须已经关闭"
+        assert finished.is_set(), "取消之后线程里的任务必须跑完，不能半途丢下会话"
+        assert wrote == ["报告已写入缓存"]
+        assert session.used_after_close == 0, "任务用会话时它不能已经被关闭"
+
+    asyncio.run(scenario())
+
+
+def test_断开后任务报错也不会让请求卡死(monkeypatch) -> None:
+    """任务自己失败时同样要收尾：请求结束、会话关闭，异常不向外冒成未处理错误。"""
+    monkeypatch.setattr(settings, "ai_max_workers", 1)
+    session = _FakeSession()
+
+    def failing_job(db: _FakeSession) -> None:
+        time.sleep(0.1)
+        raise RuntimeError("模拟 AI 任务失败")
+
+    async def endpoint() -> None:
+        try:
+            await ai_pool.run_ai_job(failing_job, session)
+        finally:
+            session.closed = True
+
+    async def scenario() -> None:
+        task = asyncio.create_task(endpoint())
+        await asyncio.sleep(0.03)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert session.closed
+
+    asyncio.run(scenario())
