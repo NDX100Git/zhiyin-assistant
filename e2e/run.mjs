@@ -3760,6 +3760,23 @@ const KEY_PANEL_MISSING =
   '依赖未合入：「我的」页 AI 密钥面板不在本分支（另一路负责界面），步骤已跳过'
 const KEY_PANEL_TEXT_RE = 'AI\\s*密钥|自带密钥|我的密钥'
 
+/**
+ * 密钥面板的容器与面板内可点元素。
+ *
+ * 面板兼容三种类名（`.key-panel` / `.ai-key-panel` / `.key-sheet`）。
+ * 点击一律按面板限定选择器：「我的」页顶上还有一个昵称的「保存」按钮，
+ * 全局按文字找会点到它，把「保存密钥」变成「保存昵称」。
+ */
+const KEY_PANEL_SELECTOR = '.key-panel, .ai-key-panel, .key-sheet'
+const KEY_PANEL_INPUT = '.key-panel input, .ai-key-panel input, .key-sheet input'
+const KEY_PANEL_CLICKABLE = ['button', 'uni-button', '.key-btn']
+  .flatMap((kind) => ['.key-panel', '.ai-key-panel', '.key-sheet'].map((panel) => `${panel} ${kind}`))
+  .join(', ')
+/** 与 student-app/src/services/llmKey.js 的 LLM_KEY_HEADER 一致；请求头名按小写比对。 */
+const KEY_HEADER = 'x-llm-api-key'
+/** 「测试连通」打的接口：拿请求头里那把做一次最小调用，响应里不回显密钥。 */
+const KEY_CHECK_PATH = '/api/ai/key-check'
+
 /** 在「我的」页里找 AI 密钥面板的入口（找不到说明那一版界面还没合入）。 */
 async function findKeyPanelEntry(page) {
   return page.evaluate((pattern) => {
@@ -3795,7 +3812,18 @@ async function fillFirstInput(page, selector, value) {
 }
 
 async function runStudentKeyPhase({ student, step }) {
-  const result = { skipped: false, reason: '', panelEntry: '', testReason: '', headerOnly: null }
+  const result = {
+    skipped: false,
+    reason: '',
+    panelEntry: '',
+    testReason: '',
+    headerOnly: null,
+    keyCheckPath: KEY_CHECK_PATH,
+    headerName: '',
+    testMessage: '',
+    storedLocally: false,
+    clearedToShared: false,
+  }
 
   await step('密钥：「我的」页打开 AI 密钥面板，无效密钥给出可读原因，清除后回到学校共享', async () => {
     await gotoFresh(student, `${STUDENT_URL}/#/pages/mine/mine`, {
@@ -3811,11 +3839,11 @@ async function runStudentKeyPhase({ student, step }) {
       return
     }
     await clickByText(student, result.panelEntry)
-    await waitVisible(student, '.key-panel, .ai-key-panel, .key-sheet', 20000)
+    await waitVisible(student, KEY_PANEL_SELECTOR, 20000)
 
     // 1) 填一个必然无效的密钥，点「测试连通」：必须给出能读的原因，不能只说“失败”
-    await fillFirstInput(student, '.key-panel input, .ai-key-panel input, .key-sheet input', 'sk-e2e-invalid-key')
-    await clickByText(student, '测试连通')
+    await fillFirstInput(student, KEY_PANEL_INPUT, 'sk-e2e-invalid-key')
+    await clickByText(student, '测试连通', KEY_PANEL_CLICKABLE)
     await student.waitForFunction(
       () => /失败|无效|不可用|错误|超时/.test(document.body.innerText || ''),
       { timeout: 30000, polling: 300 },
@@ -3827,7 +3855,7 @@ async function runStudentKeyPhase({ student, step }) {
     result.testReason = failureText.slice(0, 300)
 
     // 2) 清除后必须回到「学校共享」
-    await clickByText(student, '清除')
+    await clickByText(student, '清除', KEY_PANEL_CLICKABLE)
     await waitBody(student, '学校共享', 30000)
     result.clearedToShared = true
   })
@@ -3840,17 +3868,30 @@ async function runStudentKeyPhase({ student, step }) {
       return
     }
     const key = 'sk-e2e-header-probe-0123456789'
+
+    // 这一步必须真的发出一次 AI 请求：面板上的「保存」只写本机存储、一个请求都不发
+    // （services/llmKey.js saveLlmKey），光保存永远抓不到请求头。
+    //
+    // 顺序是「先保存 → 再点测试连通」：保存后输入框会被清空，这时点「测试连通」
+    // 只能取本机存着的那把（llmKey.js getLlmKey），于是这条断言证的是「刚保存的
+    // 密钥已经生效」，而不是「输入框里的值被顺手带出去了」。
+    // 「测试连通」打 POST /api/ai/key-check，密钥经 api.js 的 llmKeyHeader() 只进请求头。
     const seen = []
     const collect = (request) => {
       const headers = request.headers() || {}
       seen.push({
         url: request.url(),
+        method: request.method(),
         postData: request.postData() || '',
-        headerKeys: Object.entries(headers)
+        headerNames: Object.entries(headers)
           .filter(([, value]) => String(value).includes(key))
-          .map(([name]) => name),
+          .map(([name]) => name.toLowerCase()),
       })
     }
+
+    // waitForRequest 必须在点击之前登记，否则可能错过这一拍
+    let keyCheckPending = null
+    let keyCheck = null
     student.on('request', collect)
     try {
       await gotoFresh(student, `${STUDENT_URL}/#/pages/mine/mine`, {
@@ -3859,28 +3900,67 @@ async function runStudentKeyPhase({ student, step }) {
       })
       await waitBody(student, '全部', 60000)
       await clickByText(student, result.panelEntry)
-      await waitVisible(student, '.key-panel, .ai-key-panel, .key-sheet', 20000)
-      await fillFirstInput(student, '.key-panel input, .ai-key-panel input, .key-sheet input', key)
-      await clickByText(student, '保存')
-      // 保存后会走一次真实 AI 请求，这里不要求它成功，只看密钥去哪了
-      await sleep(3000)
+      await waitVisible(student, KEY_PANEL_SELECTOR, 20000)
+
+      // 1) 保存进本机存储（这一步本身不发任何请求）
+      await fillFirstInput(student, KEY_PANEL_INPUT, key)
+      await clickByText(student, '保存', KEY_PANEL_CLICKABLE)
+      await waitKeyPanelText(student, '已保存到本机', 30000)
+      result.storedLocally = (await storedLocalText(student)).includes(key)
+      if (!result.storedLocally) {
+        throw new Error('点「保存」后本机存储里没有这把密钥，保存没有真的生效')
+      }
+
+      // 2) 真发一次 AI 请求，全程拦截请求看密钥去哪了
+      keyCheckPending = student.waitForRequest(
+        (request) => request.url().includes(KEY_CHECK_PATH),
+        { timeout: 60000 },
+      )
+      // 点按钮本身抛错时 Promise 不会被 await，先挂一个空 catch 防空告警
+      keyCheckPending.catch(() => {})
+      await clickByText(student, '测试连通', KEY_PANEL_CLICKABLE)
+      keyCheck = await keyCheckPending.catch(() => null)
+      await waitGone(student, '正在用这把密钥做一次最小调用…', 90000)
     } finally {
       student.off('request', collect)
     }
 
-    const withKey = seen.filter((item) => item.headerKeys.length)
+    if (!keyCheck) {
+      throw new Error(
+        `点「测试连通」后没有发出 ${KEY_CHECK_PATH} 请求，无法确认密钥真的生效（本步只看到 ${seen.length} 个请求）`,
+      )
+    }
+    const keyCheckHeaders = Object.fromEntries(
+      Object.entries(keyCheck.headers() || {}).map(([name, value]) => [name.toLowerCase(), String(value)]),
+    )
+    const sentKey = keyCheckHeaders[KEY_HEADER] || ''
+    if (sentKey !== key) {
+      throw new Error(
+        `${KEY_CHECK_PATH} 的请求头里没带上刚保存的密钥（${KEY_HEADER} ${sentKey ? '的值不对' : '为空'}）`,
+      )
+    }
+    if (keyCheck.url().includes(key)) {
+      throw new Error(`密钥出现在请求地址里：${keyCheck.url().replace(key, '<密钥>')}`)
+    }
+    if ((keyCheck.postData() || '').includes(key)) {
+      throw new Error(`密钥出现在请求体里：${keyCheck.url().replace(key, '<密钥>')}`)
+    }
+
+    // 3) 本步里所有请求：密钥只在请求头，不进 URL 参数、不进请求体
+    const withKeyHeader = seen.filter((item) => item.headerNames.length)
     const inUrl = seen.filter((item) => item.url.includes(key))
     const inBody = seen.filter((item) => item.postData.includes(key))
-    const panelText = await visibleKeyPanelText(student)
-    const pageUrl = await student.evaluate(() => window.location.href)
+    const extraHeader = withKeyHeader.find((item) =>
+      item.headerNames.some((name) => name !== KEY_HEADER),
+    )
+    result.headerName = withKeyHeader.length ? withKeyHeader[0].headerNames.join(',') : ''
     result.headerOnly = {
       requests: seen.length,
-      withKeyHeader: withKey.length,
+      withKeyHeader: withKeyHeader.length,
       inUrl: inUrl.length,
       inBody: inBody.length,
-    }
-    if (!withKey.length) {
-      throw new Error('保存密钥后没有任何请求把密钥带在请求头里，无法确认密钥真的生效')
+      keyCheckPath: new URL(keyCheck.url()).pathname,
+      keyCheckMethod: keyCheck.method(),
     }
     if (inUrl.length) {
       throw new Error(`密钥出现在请求地址里：${inUrl[0].url.replace(key, '<密钥>')}`)
@@ -3888,12 +3968,31 @@ async function runStudentKeyPhase({ student, step }) {
     if (inBody.length) {
       throw new Error(`密钥出现在请求体里：${inBody.map((item) => item.url).join(',')}`)
     }
+    if (extraHeader) {
+      throw new Error(`密钥还出现在别的请求头上（不止 ${KEY_HEADER}）：${extraHeader.headerNames.join(',')}`)
+    }
+
+    // 4) 页面地址与页面可见文本里都不能有明文（面板里只允许显示后四位）
+    const pageUrl = await student.evaluate(() => window.location.href)
     if (pageUrl.includes(key)) {
       throw new Error('密钥出现在页面地址里')
     }
-    if (panelText.includes(key)) {
+    const pageText = await student.evaluate(() => document.body.innerText || '')
+    if (pageText.includes(key)) {
       throw new Error('密钥以明文整串显示在页面上（应只显示后四位）')
     }
+    result.testMessage = (await visibleKeyPanelText(student)).slice(0, 200)
+
+    // 5) 收尾：清掉密钥，后面还有步骤，别让它们带着学生密钥跑
+    await clickByText(student, '清除并改用学校共享', KEY_PANEL_CLICKABLE)
+    await waitKeyPanelText(student, '学校共享', 30000)
+    if ((await storedLocalText(student)).includes(key)) {
+      throw new Error('点「清除并改用学校共享」后本机存储里还留着这把密钥')
+    }
+    if ((await student.evaluate(() => document.body.innerText || '')).includes(key)) {
+      throw new Error('清除后页面上仍然出现了密钥明文')
+    }
+    result.clearedToShared = true
   })
 
   return result
@@ -3901,12 +4000,44 @@ async function runStudentKeyPhase({ student, step }) {
 
 /** 密钥面板的正文（面板没渲染就是空串）。 */
 async function visibleKeyPanelText(page) {
-  return page.evaluate(() => {
-    const panels = [
-      ...document.querySelectorAll('.key-panel, .ai-key-panel, .key-sheet'),
-    ].filter((node) => node.getClientRects().length > 0)
+  return page.evaluate((selector) => {
+    const panels = [...document.querySelectorAll(selector)].filter(
+      (node) => node.getClientRects().length > 0,
+    )
     const panel = panels[panels.length - 1]
     return panel ? panel.innerText || panel.textContent || '' : ''
+  }, KEY_PANEL_SELECTOR)
+}
+
+/** 等密钥面板的正文里出现某句话（面板没渲染就一直等到超时）。 */
+async function waitKeyPanelText(page, text, timeout = 30000) {
+  await page.waitForFunction(
+    ({ selector, text }) => {
+      const panels = [...document.querySelectorAll(selector)].filter(
+        (node) => node.getClientRects().length > 0,
+      )
+      const panel = panels[panels.length - 1]
+      return Boolean(panel) && (panel.innerText || panel.textContent || '').includes(text)
+    },
+    { timeout, polling: 200 },
+    { selector: KEY_PANEL_SELECTOR, text },
+  )
+}
+
+/**
+ * 本机存储（uni H5 落在 localStorage）里所有键值拼成一段文本。
+ *
+ * 只用来回答「密钥到底有没有写到本机」与「清掉之后还在不在」，
+ * 不依赖 uni 把键名改写成什么，只扫值。
+ */
+async function storedLocalText(page) {
+  return page.evaluate(() => {
+    const parts = []
+    for (let index = 0; index < window.localStorage.length; index += 1) {
+      const name = window.localStorage.key(index)
+      parts.push(`${name}=${window.localStorage.getItem(name) || ''}`)
+    }
+    return parts.join('\n')
   })
 }
 
