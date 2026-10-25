@@ -157,9 +157,9 @@
           <view class="ai-toggle-knob"></view>
         </view>
       </view>
-      <view v-if="report.issues.length === 0" class="empty">未发现明确问题，太棒了。</view>
+      <view v-if="reportIssues.length === 0" class="empty">未发现明确问题，太棒了。</view>
       <view
-        v-for="issue in report.issues"
+        v-for="issue in reportIssues"
         :key="issue.id"
         class="issue"
         :class="[issue.severity, { selected: selectedIssues.includes(issue.id) }]"
@@ -436,8 +436,15 @@ async function refreshQuote(retry = 0) {
     quoteError.value = ''
     return
   }
-  // 页数还没读到就报不了价（page_count 必须 ≥ 1）
-  if (files.value.some((item) => !(Number(item.page_count) >= 1))) return
+  // 页数还没读到就报不了价（page_count 必须 ≥ 1）。这里不能静默 return：
+  // 按钮会一直是灰的，用户完全不知道在等什么。也要补一句后端还会按真实页数核对，
+  // 前端这个 1 页兜底不会真的少付钱。
+  if (files.value.some((item) => !(Number(item.page_count) >= 1))) {
+    quote.value = null
+    quoteError.value = '正在读取文件页数，请稍候；长时间没有结果请删掉该文件重新上传'
+    quoting.value = false
+    return
+  }
   const seq = ++quoteSeq
   quoting.value = true
   try {
@@ -466,8 +473,13 @@ const severitySummary = computed(() => {
   const counts = (report.value && report.value.by_severity) || {}
   return `高 ${counts['高'] || 0} · 中 ${counts['中'] || 0} · 低 ${counts['低'] || 0}`
 })
+/** AI 降级或超时返回的 report 可能没有 issues 字段，模板直接取 .length 会整页渲染失败。 */
+const reportIssues = computed(() => {
+  const issues = report.value && report.value.issues
+  return Array.isArray(issues) ? issues : []
+})
 const highIssueIds = computed(() =>
-  report.value ? report.value.issues.filter((issue) => issue.severity === 'high').map((issue) => issue.id) : []
+  reportIssues.value.filter((issue) => issue.severity === 'high').map((issue) => issue.id)
 )
 
 function severityLabel(severity) {
@@ -540,7 +552,11 @@ async function fillPageCounts() {
         method: 'POST',
         data: { file_key: item.file_key },
       })
-      item.page_count = Math.max(1, Number(result.page_count) || 1)
+      const pages = Number(result.page_count)
+      // 不用「1 页」兜底：解析失败时假装 1 页，报价就按 1 页算，
+      // 学生以为很便宜、下单后被后端按真实页数驳回。留 0 让报价停在
+      // 「正在读取页数」的提示上，用户能看出是文件的问题
+      item.page_count = pages >= 1 ? Math.floor(pages) : 0
     } catch (error) {
       notifyError(error)
     }

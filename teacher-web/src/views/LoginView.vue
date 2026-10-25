@@ -48,6 +48,9 @@ async function submit() {
     localStorage.setItem('zhiyin_admin_user', JSON.stringify(data.admin || {}))
     ElMessage.success('登录成功')
     router.replace('/dashboard')
+  } catch {
+    // 错误提示由 http 拦截器统一弹出；这里只负责把 loading 收回来，
+    // 否则 finally 之外再抛一次未捕获 rejection，控制台一片红
   } finally {
     loading.value = false
   }
