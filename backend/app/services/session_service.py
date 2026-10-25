@@ -20,8 +20,9 @@ from app.utils.exceptions import BusinessError
 
 # `orders.slot_taken`：这一单下单时是否占到本时段名额。
 #
-# 这一列只由 migrations.py 补（本轮文件边界不含 models/ 与 schema.sql，模型里没有映射），
-# 所以读写都走原生 SQL，集中在这里，别处不要再拼。
+# 模型（app/models/order.py）与两份 schema.sql 里都有这一列，新库由 create_all /
+# 建表脚本直接建出来，老库由 migrations.py 补；这里读写走原生 SQL（UPDATE 立即生效，
+# 不依赖会话 flush 时机），集中在本文件，别处不要再拼。
 SLOT_TAKEN_SELECT_SQL = text("SELECT `slot_taken` FROM `orders` WHERE id = :order_id")
 SLOT_TAKEN_MARK_SQL = text("UPDATE `orders` SET `slot_taken` = 1 WHERE id = :order_id")
 SLOT_TAKEN_CLEAR_SQL = text("UPDATE `orders` SET `slot_taken` = 0 WHERE id = :order_id")

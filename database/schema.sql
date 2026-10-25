@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS `orders` (
   `pay_channel`    VARCHAR(16)  DEFAULT NULL COMMENT '预留：mock/wechat/card',
   `external_pay_id` VARCHAR(64) DEFAULT NULL COMMENT '预留：第三方支付流水号',
   `printer_id`     INT          DEFAULT NULL COMMENT '预留：指定打印机',
+  `slot_taken`     TINYINT      NOT NULL DEFAULT 0 COMMENT '下单时是否占到本时段名额：1=占到，取消时才归还容量',
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_orders_order_no` (`order_no`),
   KEY `idx_status_created` (`status`, `created_at`),

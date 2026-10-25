@@ -7,6 +7,13 @@
 1. 老库缺列缺索引时，跑一遍迁移补齐、第二遍无事可做（幂等）；
 2. 唯一约束真的在库里生效（不是只往 information_schema 里写了名字）；
 3. 两份 schema.sql 与迁移配置不漂移（新库建表也带这一列）。
+
+另外两组用例锁住本轮合入后才发现的两件事：
+
+- 老文件归属回填 SQL 曾经靠库的默认排序规则统一 UNION 两个分支，库/表排序规则
+  一旦混搭就报 1271；现在用「排序规则故意混搭」的独立小库把这条钉死；
+- `orders.slot_taken` 原来只写在迁移里，模型与两份 schema.sql 都没有，现在三处必须
+  同口径（新库 create_all / 建表脚本 / 迁移补列）。
 """
 
 from __future__ import annotations
@@ -14,10 +21,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 
 from app.migrations import MIGRATION_COLUMNS, MIGRATION_INDEXES, run_migrations
+from app.models.base import Base
+from app.models.order import Order
 from app.models.payment_log import PaymentLog
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -334,3 +344,201 @@ def test_老库文件没有归属行时迁移按订单补出来(
             select(UploadedFile).where(UploadedFile.file_key == file_key)
         ).scalars().all()
     ) == 1
+
+
+# ---------------------------------------------------------------- 排序规则混搭的库
+
+# 回填 SQL 里 UNION ALL 的两个分支分别来自 orders 与 order_files。MySQL 要求两个
+# 分支的同名列能统一到同一个排序规则；以前靠库的默认值隐式决定，于是「老表是
+# schema.sql 的 unicode_ci、新表是 create_all 跟着库默认建的 0900_ai_ci」这种库里
+# 直接报 1271 Illegal mix of collations for operation 'UNION'（开发库能过、测试库全红）。
+# 这里按同样的混搭建一个独立小库，要求回填照样跑通。
+MIX_DB_SUFFIX = "_collmix"
+
+
+def _mixed_collation_engine(engine):
+    """建一个「库默认 0900_ai_ci + 三张表三种排序规则」的小库，用完即删。"""
+    url = make_url(engine.url)
+    name = f"{url.database}{MIX_DB_SUFFIX}"
+    assert len(name) <= 64, f"库名超过 MySQL 上限：{name}"
+
+    root = create_engine(url.set(database=None), pool_pre_ping=True)
+    try:
+        with root.begin() as conn:
+            conn.execute(text(f"DROP DATABASE IF EXISTS `{name}`"))
+            conn.execute(
+                text(
+                    f"CREATE DATABASE `{name}` DEFAULT CHARACTER SET utf8mb4 "
+                    "COLLATE utf8mb4_0900_ai_ci"
+                )
+            )
+    finally:
+        root.dispose()
+
+    scratch = create_engine(url.set(database=name), pool_pre_ping=True)
+    try:
+        # create_all 不给表指定字符集，表就跟着库默认走 0900_ai_ci
+        Base.metadata.create_all(scratch)
+        with scratch.begin() as conn:
+            # 再把两张源表与写入目标改成各不相同的排序规则，凑出真实的混搭状态
+            conn.execute(
+                text(
+                    "ALTER TABLE `orders` CONVERT TO CHARACTER SET utf8mb4 "
+                    "COLLATE utf8mb4_unicode_ci"
+                )
+            )
+            conn.execute(
+                text(
+                    "ALTER TABLE `uploaded_files` CONVERT TO CHARACTER SET utf8mb4 "
+                    "COLLATE utf8mb4_general_ci"
+                )
+            )
+        yield scratch
+    finally:
+        scratch.dispose()
+        root = create_engine(url.set(database=None), pool_pre_ping=True)
+        try:
+            with root.begin() as conn:
+                conn.execute(text(f"DROP DATABASE IF EXISTS `{name}`"))
+        finally:
+            root.dispose()
+
+
+@pytest.fixture
+def mixed_collation_engine(engine):
+    yield from _mixed_collation_engine(engine)
+
+
+def _file_key_collations(conn, database: str) -> dict[str, str]:
+    rows = conn.execute(
+        text(
+            "SELECT TABLE_NAME, COLLATION_NAME FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = :db AND COLUMN_NAME = 'file_key'"
+        ),
+        {"db": database},
+    ).all()
+    return {table: collation for table, collation in rows}
+
+
+def test_排序规则混搭的库上文件归属回填照样跑通(mixed_collation_engine):
+    """orders / order_files / uploaded_files 三张表排序规则各不相同，回填也不能报错。
+
+    这段老数据在真实故障里表现为「全量单测 185 errors，全是 1271」：同一条 SQL 在
+    开发库能手工执行成功，在测试库直接炸。所以用例先断言前置条件（排序规则确实不同），
+    免得哪天库被我改成统一排序规则后这条用例悄悄变成空转。
+    """
+    scratch = mixed_collation_engine
+    database = make_url(scratch.url).database
+
+    with scratch.begin() as conn:
+        collations = _file_key_collations(conn, database)
+        assert set(collations) >= {"orders", "order_files", "uploaded_files"}, collations
+        assert collations["orders"] != collations["order_files"], (
+            f"前置条件：两张源表的排序规则必须不同，实际都是 {collations['orders']}"
+        )
+        # 同一文件被两张订单引用：早的那张是 11 号用户，晚的是 22 号
+        conn.execute(
+            text(
+                "INSERT INTO `orders` "
+                "(order_no, pickup_code, user_id, status, file_key, file_name, created_at) "
+                "VALUES ('0900-001', '0900-01-A', 11, 'completed', 'collmix/shared.pdf', "
+                "'老论文.pdf', '2026-10-01 10:00:00'), "
+                "       ('0900-002', '0900-02-A', 22, 'completed', 'collmix/shared.pdf', "
+                "'老论文.pdf', '2026-10-02 10:00:00'), "
+                "       ('0900-003', '0900-03-A', 33, 'completed', NULL, NULL, "
+                "'2026-10-03 10:00:00')"
+            )
+        )
+        # 另一份文件只出现在文件清单里（多文件订单）
+        conn.execute(
+            text(
+                "INSERT INTO `order_files` (order_id, file_index, file_key, file_name, "
+                "page_count, amount_cents) "
+                "SELECT id, 1, 'collmix/only-in-lists.pdf', '第二份.pdf', 2, 30 "
+                "FROM `orders` WHERE order_no = '0900-003'"
+            )
+        )
+
+    # 整条迁移在这套混搭排序规则上必须跑得完，不抛 1271
+    applied = run_migrations(scratch)
+    assert "uploaded_files.backfill:2" in applied, applied
+
+    with scratch.connect() as conn:
+        owners = dict(
+            conn.execute(
+                text("SELECT file_key, user_id FROM `uploaded_files`")
+            ).all()
+        )
+    assert owners == {
+        "collmix/shared.pdf": 11,
+        "collmix/only-in-lists.pdf": 33,
+    }, owners
+
+    # 重复执行：INSERT IGNORE 改 0 行，既不重复插入也不改写归属
+    again = run_migrations(scratch)
+    assert not [action for action in again if action.startswith("uploaded_files.")], again
+    with scratch.connect() as conn:
+        count = conn.execute(text("SELECT COUNT(*) FROM `uploaded_files`")).scalar_one()
+        owners_again = dict(
+            conn.execute(text("SELECT file_key, user_id FROM `uploaded_files`")).all()
+        )
+    assert count == 2, "重复执行不能重复插入归属行"
+    assert owners_again == owners, "重复执行不能改写已有归属"
+
+
+# ---------------------------------------------------------------- 名额标记列不漂移
+
+SLOT_TABLE = "orders"
+SLOT_COLUMN = "slot_taken"
+
+
+def _orders_block(path: Path) -> str:
+    text_sql = path.read_text(encoding="utf-8")
+    start = text_sql.find(f"CREATE TABLE IF NOT EXISTS `{SLOT_TABLE}`")
+    assert start >= 0, f"{path} 里找不到 {SLOT_TABLE} 建表语句"
+    return text_sql[start : text_sql.find(";", start)]
+
+
+def test_名额标记列在模型里且与迁移同口径():
+    """模型侧必须有这一列，否则原生 SQL 读写的列在模型里查不到、create_all 也不建。"""
+    column = Order.__table__.columns.get(SLOT_COLUMN)
+    assert column is not None, f"Order 模型缺 {SLOT_COLUMN} 列"
+    assert column.nullable is False, "名额标记不能为空（老数据一律按「没占到」处理）"
+    assert str(column.server_default.arg) == "0", column.server_default
+
+    ddl = MIGRATION_COLUMNS[SLOT_TABLE][SLOT_COLUMN].upper()
+    assert "TINYINT" in ddl, ddl
+    assert "NOT NULL" in ddl, ddl
+    assert "DEFAULT 0" in ddl, ddl
+
+
+@pytest.mark.parametrize("path", SCHEMA_FILES, ids=lambda p: p.name)
+def test_两份schema_sql都带名额标记列(path: Path):
+    """新库按 schema.sql 建表也要带这一列，不能只靠迁移兜底。"""
+    block = _orders_block(path)
+    assert f"`{SLOT_COLUMN}`" in block, f"{path} 的 {SLOT_TABLE} 缺 {SLOT_COLUMN} 列"
+    line = next(
+        row for row in block.splitlines() if f"`{SLOT_COLUMN}`" in row
+    )
+    assert "TINYINT" in line.upper(), line
+    assert "NOT NULL" in line.upper(), line
+    assert "DEFAULT 0" in line.upper(), line
+
+
+def test_新库create_all建出来的名额标记列与迁移一致(mixed_collation_engine):
+    """用 create_all 建出来的新库（干净小库）与迁移补出来的列定义一致。"""
+    scratch = mixed_collation_engine
+    with scratch.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT "
+                "FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t AND COLUMN_NAME = :c"
+            ),
+            {"t": SLOT_TABLE, "c": SLOT_COLUMN},
+        ).one_or_none()
+    assert row is not None, "create_all 建出来的 orders 缺名额标记列"
+    column_type, is_nullable, default = row
+    assert column_type.lower() == "tinyint", column_type
+    assert is_nullable == "NO", is_nullable
+    assert default == "0", default

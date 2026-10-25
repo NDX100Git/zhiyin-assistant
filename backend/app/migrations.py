@@ -55,8 +55,8 @@ MIGRATION_COLUMNS: dict[str, dict[str, str]] = {
         # （截单或满员时不加容量，取消也就不能减）。
         # 历史订单无法事后判断当时是否占到名额（截单与满员都不加容量，库里没有痕迹），
         # 默认取 0 即「不归还」：宁肯让老师手动重开时段，也不能再误还别人的名额造成超卖。
-        # 注意：本轮文件边界不含 models/ 与 schema.sql，所以这一列只在迁移里补，
-        # 模型侧没有映射，业务代码用原生 SQL 读写（见 session_service 里的常量）。
+        # 模型（app/models/order.py）与两份 schema.sql 里都有这一列；三处必须同口径，
+        # 迁移只负责给老库补上，新库由 create_all / schema.sql 直接建出来。
         "slot_taken": (
             "TINYINT NOT NULL DEFAULT 0 "
             "COMMENT '下单时是否占到本时段名额：1=占到，取消时才归还容量'"
@@ -231,6 +231,17 @@ MIGRATION_INDEX_PREP: dict[str, dict[str, str]] = {
 #   - 同一文件被多张订单引用时取**最早订单**的用户，与「一个文件只属于一个用户」
 #     的唯一索引 uq_uploaded_file_key 一致；
 #   - 用 INSERT IGNORE 借唯一索引幂等，已有归属行（包括别人已认领的）绝不被改写。
+#
+# 两个来源要用 UNION ALL 拼成一个集合才能算「同一文件的最早订单」，但 UNION 要求
+# 每个文本列在各分支上能统一到同一个排序规则，而这件事以前是**靠库的默认排序规则
+# 隐式决定**的：orders 与 order_files 若一个来自 schema.sql（utf8mb4_unicode_ci）、
+# 另一个来自 create_all（跟着库默认，可能是 utf8mb4_0900_ai_ci），MySQL 报
+# 1271「Illegal mix of collations for operation 'UNION'」，整条迁移连同全量单测全红。
+# 同一份代码在开发库能过、在测试库炸，就是因为它依赖了这种库级状态。
+# 所以每个进入 UNION 的文本列都显式写死：先 CONVERT 成 utf8mb4（连 utf8mb3 / latin1
+# 的老列也一并兜住，避免「COLLATION ... is not valid for CHARACTER SET」），再指定
+# COLLATE utf8mb4_unicode_ci。这样任何字符集 / 排序规则组合的库上，结果都只由这句
+# 话决定，不再看库的默认值。新增文本列进这条 SELECT 时必须照抄这两段。
 BACKFILL_UPLOADED_FILES_SQL = """
 INSERT IGNORE INTO `uploaded_files`
   (`user_id`, `file_key`, `file_name`, `size`, `content_type`, `created_at`)
@@ -241,12 +252,17 @@ FROM (
            PARTITION BY refs.file_key ORDER BY refs.created_at, refs.order_id
          ) AS rn
   FROM (
-    SELECT o.user_id AS user_id, o.id AS order_id, o.file_key AS file_key,
-           o.file_name AS file_name, o.created_at AS created_at
+    SELECT o.user_id AS user_id, o.id AS order_id,
+           CONVERT(o.file_key USING utf8mb4) COLLATE utf8mb4_unicode_ci AS file_key,
+           CONVERT(o.file_name USING utf8mb4) COLLATE utf8mb4_unicode_ci AS file_name,
+           o.created_at AS created_at
     FROM `orders` o
     WHERE o.file_key IS NOT NULL AND o.file_key <> ''
     UNION ALL
-    SELECT o.user_id, o.id, f.file_key, f.file_name, o.created_at
+    SELECT o.user_id, o.id,
+           CONVERT(f.file_key USING utf8mb4) COLLATE utf8mb4_unicode_ci,
+           CONVERT(f.file_name USING utf8mb4) COLLATE utf8mb4_unicode_ci,
+           o.created_at
     FROM `order_files` f JOIN `orders` o ON o.id = f.order_id
     WHERE f.file_key IS NOT NULL AND f.file_key <> ''
   ) refs
