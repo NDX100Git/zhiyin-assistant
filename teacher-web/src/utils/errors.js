@@ -5,11 +5,11 @@
  * 这里把**本轮新增/新暴露的码**统一译成柜台能照做的中文；表里没有的码保留后端原文
  * （后端文案本来就是中文，硬翻成第二种说法只会让人以为出了别的问题）。
  *
- * 一个已知限制，写在这里免得下一轮重新踩：
- * 本轮文件边界不含 src/api/http.js，那里的响应拦截器只把后端 message 抛出来，
- * 业务 code 到不了调用方。所以除了「直接拿到 code」这条正常路径，还留了一条
- * `codeFromMessage()` 的兜底：按后端原文认出这几个码。http.js 一旦能把 code
- * 带出来（`error.code = body.code`），删掉兜底那一支即可，码表与调用方都不用动。
+ * 错误对象上的 `code` 由 `src/api/http.js` 的响应拦截器负责带上（`error.code =
+ * body.code`）。上一轮 http.js 不在文件边界内，业务码到不了调用方，只能留一条
+ * 「按后端原文反查」的 `codeFromMessage()` 兜底；本轮 http.js 已经能带码，那条兜底
+ * 连同它的 `MESSAGE_CODES` 表一起删掉了——按文案反查只要后端改一个字就失效，
+ * 而按码翻译是确定的。**调用方只需要解释 `error.code`，不要再对着 message 猜。**
  *
  * 学生端有一份同样的表（student-app/src/utils/errors.js），两个应用分开构建，
  * 没有共享模块的通道，改动时两边一起改，`npm test` 各有一条用例锁住码表。
@@ -32,26 +32,6 @@ export const ERROR_MESSAGES = {
 }
 
 /**
- * 后端原文 → 业务码。只在拿不到 code 时使用（原因见文件头）。
- *
- * 匹配的是后端 raise 时写的固定文案片段，不是整句：后端加点上下文（金额、页数）
- * 不会让这里的匹配失效。改后端文案时同步看一眼这张表。
- */
-const MESSAGE_CODES = [
-  [/文件已过期清理/, 40406],
-  [/退款金额不能为负数|金额不能为负数/, 40061],
-  [/退款金额不能超过已收|明显高于系统计价/, 40062],
-  [/已支付，不能自助取消|已支付，请勿重复提交/, 40905],
-  [/已登记过退款|已登记过现场收款/, 40906],
-  // 50046（排队满）要排在 50041（超时）前面：排队文案里也带“转换…秒”这类字
-  [/文档转换排队已满|仍没有空位/, 50046],
-  // 后端 converter.py 的「PDF 转 Word 超时」是 50043，不是 50041，别合并
-  [/PDF 转 Word 超时/, 50043],
-  [/文档转换超时/, 50041],
-  [/文档转换失败|PDF 转 Word 失败|表格文件打不开/, 50043],
-]
-
-/**
  * 把业务码译成中文。
  *
  * @param {number|string} code 后端业务码
@@ -66,21 +46,11 @@ export function explainApiCode(code, backendMessage) {
   return raw || '请求失败，请稍后重试'
 }
 
-/** 从后端原文里认出本轮这些码；认不出返回 0。 */
-export function codeFromMessage(message) {
-  const text = typeof message === 'string' ? message : ''
-  if (!text) return 0
-  for (const [pattern, code] of MESSAGE_CODES) {
-    if (pattern.test(text)) return code
-  }
-  return 0
-}
-
 /**
  * 把请求层抛出来的错误换成「可读中文」的新错误。
  *
- * - 错误对象上有 code：按码译；
- * - 只有后端原文：先用原文认出码，再译；认不出就保留原文；
+ * - 错误对象上有业务码（http.js 已经带上）：按码译；
+ * - 没有码：后端原文原样保留（它本来就是中文），不猜码；
  * - 完全没有信息：给一句兜底，不留空 message（界面上会变成空的红色提示）。
  *
  * @param {Error & {code?: number|string}} error
@@ -89,7 +59,7 @@ export function codeFromMessage(message) {
 export function explainError(error) {
   const message = (error && error.message) || ''
   const fromCode = Number(error && error.code)
-  const code = Number.isFinite(fromCode) && fromCode ? fromCode : codeFromMessage(message)
+  const code = Number.isFinite(fromCode) && fromCode ? fromCode : 0
   const explained = new Error(explainApiCode(code, message))
   if (code) explained.code = code
   return explained

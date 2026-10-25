@@ -50,14 +50,19 @@
       <div class="table-head">
         <div>
           接单队列 <span class="muted">（每 5 秒自动刷新第一屏 {{ QUEUE_PAGE_SIZE_POLL }} 条；统计每 15 秒刷一次；超过第一屏请用搜索定位，确认换文件后该单排到队尾）</span>
-          <!-- 队列只拉一屏，超过时必须让老师知道“下面还有单”，不能默默截断 -->
-          <div v-if="queueHiddenCount > 0" class="queue-more-note">
+          <!-- 队列只拉一屏，超过时必须让老师知道“下面还有单”，不能默默截断。
+               封顶 200 条之后再说「点加载更多」就是骗人：按钮已经拉不出来，要说清楚
+               现在看到的是前 200 单，剩下的只能用搜索精确定位。 -->
+          <div v-if="queueAtCap" class="queue-more-note">
+            已显示前 {{ QUEUE_PAGE_SIZE_MAX }} 单，请用搜索精确定位；还有 {{ queueHiddenCount }} 单未显示
+          </div>
+          <div v-else-if="queueHiddenCount > 0" class="queue-more-note">
             共 {{ queueTotal }} 单，还有 {{ queueHiddenCount }} 单未显示，请用搜索定位或点右侧「加载更多」
           </div>
         </div>
         <div>
           <el-button
-            v-if="queueHiddenCount > 0"
+            v-if="queueHiddenCount > 0 && !queueAtCap"
             type="primary"
             plain
             :loading="loading"
@@ -687,6 +692,15 @@ const queueTotal = ref(0)
 const queueExtra = ref(0)
 
 const queueHiddenCount = computed(() => Math.max(queueTotal.value - orders.value.length, 0))
+/**
+ * 已经拉到后端单页上限（200）但库里还有单没显示。
+ *
+ * 这种情况不能再说“点加载更多”：page_size 已经顶到上限，再点也拉不到新单，
+ * 老师会以为按钮坏了或者已经没有更多的单。要说清楚「已显示前 200 单，请用搜索精确定位」。
+ */
+const queueAtCap = computed(
+  () => orders.value.length >= QUEUE_PAGE_SIZE_MAX && queueHiddenCount.value > 0,
+)
 
 const completeDialog = reactive({
   visible: false,

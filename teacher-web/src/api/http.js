@@ -15,8 +15,92 @@ import { ElMessage } from 'element-plus'
 const TOKEN_KEY = 'zhiyin_admin_token'
 const USER_KEY = 'zhiyin_admin_user'
 
+/** 登录已失效：清掉本地凭证并回登录页（四个码都是这一个动作）。 */
+const AUTH_LOST_CODES = [40100, 40101, 40102, 40300]
+
+/** 默认提示器：交给 Element Plus 弹出红条。 */
+function defaultNotify(message) {
+  ElMessage.error(message)
+}
+
+/**
+ * 后端会把业务码告诉调用方：抛出去的 Error 上带 `code`（业务码，数字）。
+ *
+ * 以前这里只 `new Error(message)` 把后端文案抛出去，业务码在拦截器里就丢了，
+ * 调用方只能按文案反查是哪个码（后端改一个字就认不出来）。现在按
+ * `utils/errors.js` 约定的契约直接带上 `error.code = body.code`，那里的按码翻译表
+ * 就能生效。
+ *
+ * 注意 axios 自己的 Error 上 `code` 是传输层错误码（`ECONNABORTED`、`ERR_NETWORK`
+ * 这类字符串）。两者同名但含义不同：只有后端明确给了非 0 的业务码时才覆盖它。
+ */
+function apiError(message, code, response) {
+  const error = new Error(message)
+  const numeric = Number(code)
+  if (Number.isFinite(numeric) && numeric !== 0) {
+    error.code = numeric
+  }
+  if (response) {
+    error.response = response
+  }
+  return error
+}
+
+/**
+ * 造一对响应拦截器处理函数。
+ *
+ * 提示器做成参数（默认就是 ElMessage），不只是为了方便单测：传输层不该直接绑死
+ * 某个 UI 组件的渲染方式，换成别的提示样式时只换一个参数。`npm test` 就是这样
+ * 驱动真实判断逻辑（带码、登录失效清凭证）而不必拉起 Vue 渲染。
+ *
+ * @param {{notify?: (message: string) => void}} [options]
+ */
+export function createResponseHandlers({ notify = defaultNotify } = {}) {
+  return {
+    /** HTTP 200 + 业务码：0 成功交 data，非 0 一律 reject 一个带 code 的错误。 */
+    onFulfilled(response) {
+      const body = response.data
+      if (body && body.code === 0) {
+        return body.data
+      }
+      const message = (body && body.message) || '请求失败'
+      const error = apiError(message, body && body.code, response)
+      if (body && AUTH_LOST_CODES.includes(body.code)) {
+        localStorage.removeItem(TOKEN_KEY)
+        localStorage.removeItem(USER_KEY)
+        notify(message)
+        window.location.hash = '#/login'
+      } else {
+        notify(message)
+      }
+      return Promise.reject(error)
+    },
+
+    /**
+     * 传输层失败（超时、断网、网关 5xx）。后端在非 2xx 响应体里也会带 code/message，
+     * 这时把业务码接到同一个错误对象上，交给 `utils/errors.js` 按码翻译。
+     * 不换掉 axios 那个错误对象：它的 config / request / 传输层 code 还在，
+     * 以后要区分「超时」和「业务拒绝」还用得上。
+     */
+    onRejected(error) {
+      const body = error && error.response && error.response.data
+      const bizCode = Number(body && body.code)
+      const message = (body && body.message) || error.message || '网络错误'
+      if (Number.isFinite(bizCode) && bizCode !== 0) {
+        error.code = bizCode
+      }
+      if (body && body.message) {
+        error.message = message
+      }
+      notify(message)
+      return Promise.reject(error)
+    },
+  }
+}
+
 const http = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000',
+  // 单测在 Node 里 import 本模块时没有 Vite 注入的 import.meta.env，用可选链兜住
+  baseURL: import.meta.env?.VITE_API_BASE_URL || 'http://127.0.0.1:8000',
   timeout: 120000,
 })
 
@@ -28,31 +112,7 @@ http.interceptors.request.use((config) => {
   return config
 })
 
-http.interceptors.response.use(
-  (response) => {
-    const body = response.data
-    if (body && body.code === 0) {
-      return body.data
-    }
-    const message = (body && body.message) || '请求失败'
-    if (body && [40100, 40101, 40102, 40300].includes(body.code)) {
-      localStorage.removeItem(TOKEN_KEY)
-      localStorage.removeItem(USER_KEY)
-      ElMessage.error(message)
-      window.location.hash = '#/login'
-    } else {
-      ElMessage.error(message)
-    }
-    return Promise.reject(new Error(message))
-  },
-  (error) => {
-    const message =
-      (error.response && error.response.data && error.response.data.message) ||
-      error.message ||
-      '网络错误'
-    ElMessage.error(message)
-    return Promise.reject(new Error(message))
-  },
-)
+const handlers = createResponseHandlers()
+http.interceptors.response.use(handlers.onFulfilled, handlers.onRejected)
 
 export default http
