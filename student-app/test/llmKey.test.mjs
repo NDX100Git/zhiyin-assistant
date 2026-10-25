@@ -243,6 +243,7 @@ test('密钥失效能认出来，并给出「清除后改用学校共享」的�
   assert.ok(error, '密钥失效时请求应当失败，不能静默成功')
   assert.equal(calls[0].header[LLM_KEY_HEADER], KEY)
   assert.equal(error.llmKeySent, true, '失败对象没标上「带过密钥」')
+  assert.equal(error.code, 50035, '业务码没挂到错误对象上：上层只能退回按文案判断')
   assert.equal(error.message, ERROR_MESSAGES[50035], '50035 没被码表译成本端文案')
   assert.equal(isLlmKeyFailure(error), true, '密钥失效没被认出来')
   const text = llmKeyFailureText(error)
@@ -269,6 +270,55 @@ test('「测试连通」遇到 50036（没填/格式不对）与 50037（学校�
     assert.equal(isLlmKeyFailure(error), true, `${code} 没被认成密钥问题`)
     assert.equal(llmKeyFailureText(error).includes('清除后改用学校共享'), true)
   }
+})
+
+test('业务码挂在错误对象上：普通请求与文件上传两条通道都带 code', async () => {
+  // 通道一：普通请求。后端换了一种措辞，判定也必须是按码而不是按句子。
+  const normal = installUniStub(() => ({
+    statusCode: 200,
+    data: { code: 50035, message: '模型端拒绝了这次调用', data: null },
+  }))
+  saveLlmKey(KEY)
+  const requestError = await request('/api/ai/check', { method: 'POST' }).then(
+    () => null,
+    (err) => err
+  )
+  assert.ok(requestError, '50035 时请求应当失败')
+  assert.equal(normal.calls.length, 1)
+  assert.equal(requestError.code, 50035, '普通请求没把业务码挂到错误对象上')
+  assert.equal(requestError.message, ERROR_MESSAGES[50035], '文案该是本端码表译出来的那句')
+  assert.equal(isLlmKeyFailure(requestError), true, '拿到码之后反而认不出密钥失效了')
+
+  // 字符串形式的码（有些代理会把它变成字符串）落到错误对象上必须是数字
+  const stringCode = installUniStub(() => ({
+    statusCode: 200,
+    data: { code: '50037', message: '后端原文', data: null },
+  }))
+  saveLlmKey(KEY)
+  const stringError = await request('/api/ai/check', { method: 'POST' }).then(
+    () => null,
+    (err) => err
+  )
+  assert.equal(stringCode.calls.length, 1)
+  assert.equal(stringError.code, 50037, '字符串码没被归一成数字 50037')
+
+  // 通道二：文件上传（不走 request()，转换类错误都从这里出）
+  installUniStub()
+  globalThis.uni.uploadFile = (options) => {
+    options.success({
+      statusCode: 200,
+      data: JSON.stringify({ code: 50043, message: '文档转换失败（后端原文）', data: null }),
+    })
+  }
+  const uploadError = await uploadFile('/tmp/a.pdf', 'a.pdf').then(
+    () => null,
+    (err) => err
+  )
+  assert.ok(uploadError, '上传失败时应当抛错')
+  assert.equal(uploadError.code, 50043, '文件上传通道没把业务码挂到错误对象上')
+  assert.equal(uploadError.message, ERROR_MESSAGES[50043], '上传通道的文案该是本端码表译出来的那句')
+  // 上传通道不带密钥，所以谈不上「你的密钥不可用」
+  assert.equal(isLlmKeyFailure(uploadError), false)
 })
 
 test('HTTP 401/403 直接算密钥被拒；没带密钥的失败不算密钥问题', async () => {
