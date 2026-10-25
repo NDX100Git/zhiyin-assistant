@@ -15,22 +15,33 @@
 - 微信公众平台的小程序**测试号** AppID（登录 `mp.weixin.qq.com` 后在测试号页面可查）；
 - 已注册小程序的 AppID（用开发版 / 体验版调试）。
 
-本仓库不存任何身份码，也不要自己编一个填进去：appid 为空时产物是**游客身份包**，不能真机预览、不能上传代码。
-拿到之后只记这一个值，下一步填它。
+**身份码不进版本库**：`student-app/src/manifest.json` 里 `mp-weixin.appid` 现在是空字符串，
+身份码在构建时由构建参数注入（见下一步）。拿到之后只在本机配一处，不要提交。
+空着构建不会报错，但产物是**游客身份包**，不能真机预览、不能上传代码，控制台会点名告警。
 
-## 2. 填在哪一行
+## 2. 填在哪一处
 
-- 文件：`student-app/src/manifest.json`
-- 第 75 行 `"appid" : ""`（在 `mp-weixin` 段里）。把空字符串换成测试身份码，**全项目只填这一处**。
-- 同一文件第 4 行 `mpWeixinAppidNote` 就是这句说明：正式身份码由业务方提供，真机调试先填测试身份码。
-- 填法：
+- 文件：`student-app/src/manifest.json` 里 `mp-weixin.appid` **保持空字符串，谁也不要改它**。
+  以前这里硬编码过一个测试身份码，等于谁拉代码谁拿到了业务方的小程序身份，已经清掉。
+- 身份码改成构建时注入，二选一：
 
-```json
-    "mp-weixin" : {
-        "appid" : "填业务方给的测试身份码",
+```bash
+# 方式一：命令行给构建参数（推荐，一次一用，不落盘）
+cd student-app
+UNI_MP_WEIXIN_APPID=<测试身份码> npm run dev:mp-weixin
+UNI_MP_WEIXIN_APPID=<测试身份码> npm run build:mp-weixin
 ```
 
-- 自查：`cd student-app && npm run dev:mp-weixin`，控制台不再出现「微信小程序 appid 为空，产物会以游客身份生成」。
+```ini
+# 方式二：本机未入库配置（长期用某台机器调试时最省事）
+# 文件：student-app/.env.local（已被 .gitignore 忽略，不会提交）
+VITE_MP_WEIXIN_APPID=<测试身份码>
+```
+
+- 注入效果：小程序的 `project.config.json` 里 `appid` 变成注入的值；
+  缺省（两处都没配）时是 `touristappid`，构建日志里会有「appid 为空，产物会以游客身份生成」一条告警。
+- 自查：`cd student-app && npm run build:mp-weixin`，再打开 `dist/build/mp-weixin/project.config.json`
+  看 `appid` 是不是你注入的那个值（不是 `touristappid` 就对了）。
 
 ## 3. 后端怎么允许局域网访问
 
@@ -62,7 +73,7 @@ VITE_API_BASE_URL=http://<局域网IP>:8208 npm run dev:mp-weixin
 
 1. 打开微信开发者工具 → 导入项目。
 2. 目录选 `student-app/dist/dev/mp-weixin`（**不是** `src`）。
-3. AppID 填第 2 步那个测试身份码。
+3. AppID 填第 2 步注入的那个测试身份码（与 `project.config.json` 里的一致）。
 4. 右上角「详情」→「本地设置」→ 勾上 **「不校验合法域名、web-view（业务域名）、TLS 版本以及 HTTPS 证书」**。
 5. 工具栏点「预览」生成二维码，手机微信扫码（手机与电脑同一 Wi-Fi）。
 
@@ -86,7 +97,7 @@ VITE_API_BASE_URL=http://<局域网IP>:8208 npm run dev:mp-weixin
 | `request:fail timeout` / 界面「网络异常」 | 接口地址写成 127.0.0.1、手机与电脑不同网段、防火墙没放行 8208 | 用第 4 步的命令传 `<局域网IP>`；手机与电脑连同一个 Wi-Fi；按第 3 步放行端口 |
 | 上传报 `uploadFile:fail` | 同上，或文件超限 | 先按第 3 步验证 9000 端口；再看 `backend/config/upload_rules.json` 的大小上限 |
 | 老师端/手机打开下载链接 403 或一直转圈 | `MINIO_ENDPOINT` 是 127.0.0.1，签名链接指回手机自己 | 见第 3 步最后一条：改成 `<局域网IP>:9000` 并重启后端 |
-| 开发者工具提示游客身份 / 无法预览 | `mp-weixin.appid` 还是空字符串 | 回第 2 步填测试身份码 |
+| 开发者工具提示游客身份 / 无法预览 | 构建时没注入身份码，`project.config.json` 的 `appid` 是 `touristappid` | 回第 2 步：命令里带 `UNI_MP_WEIXIN_APPID=<测试身份码>`，或在 `.env.local` 写 `VITE_MP_WEIXIN_APPID`，重新构建 |
 | 扫码后一直转圈打不开 | 手机没连 Wi-Fi、或扫码的微信号没有该小程序权限 | 换同一个局域网，改用管理员/开发者微信号扫码 |
 | 页面白屏 | 编译报错或改完没编完 | 看 `npm run dev:mp-weixin` 控制台报错；等编译结束再点「预览」 |
 

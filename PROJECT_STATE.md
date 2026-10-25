@@ -43,7 +43,7 @@
 
 | 组件 | 位置 / 版本 | 说明 |
 |---|---|---|
-| Python | Python 3.11+（本机验证 3.14.7） | 用系统 Python 创建 `backend/.venv`，路径因机器而异 |
+| Python | Python 3.12+（本机验证 3.14.7） | 用系统 Python 创建 `backend/.venv`，路径因机器而异 |
 | 后端 venv | `backend/.venv` | 依赖版本见 `backend/requirements.txt`（已锁定） |
 | MySQL | `backend/.tools/mysql8`（可用 `ZHIYIN_MYSQL_ROOT` 覆盖） | 免安装版；数据目录在 `mysql8\data`；密码见 `backend/.env` |
 | MinIO | `backend/.tools/minio/minio.exe`（可用 `ZHIYIN_MINIO_EXE` 覆盖） | 数据目录 `backend/.data/minio`；9000 API / 9001 控制台 |

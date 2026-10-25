@@ -15,3 +15,9 @@ ruff==0.17.1
 python-pptx==1.0.2
 pillow==13.0.0
 xlsxwriter==3.2.9
+
+# 对象存储的本地替身：CI 用 `moto_server` 顶掉 MinIO（见 .github/workflows/ci.yml）。
+# 必须写成 `moto[server]`：裸 `moto` 只有 Python API，不带 `moto_server` 命令，
+# 以前这行只写在流水线配置里，本地按本文档装完跑不了那条路径。
+# 版本与流水线里写的一致，改一处要同步另一处。
+moto[server]==5.2.4

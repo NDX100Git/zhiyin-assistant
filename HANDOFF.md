@@ -31,7 +31,7 @@
 
 | 部分 | 技术 | 说明 |
 |---|---|---|
-| 后端框架 | Python 3.11+ / FastAPI | 同步 SQLAlchemy，接口统一返回 `{code,message,data}` |
+| 后端框架 | Python 3.12+ / FastAPI | 同步 SQLAlchemy，接口统一返回 `{code,message,data}` |
 | 数据库 | MySQL 8 + SQLAlchemy 2.x | 8 张表；启动时可自动建表 |
 | 对象存储 | MinIO（本地私有桶） | 业务只依赖 `FileStorage` 抽象，可换云存储 |
 | AI | DeepSeek（OpenAI 兼容 SDK，model=`deepseek-flash`） | 文本 + 多模态 OCR；统一封装在 `services/llm.py` |
@@ -105,7 +105,7 @@ zhiyin-handoff/
 
 | 组件 | 版本 | 安装方式 | 验证命令 |
 |---|---|---|---|
-| Python | 3.11+（本机验证 3.14.7） | 官网安装包，勾选 Add to PATH：https://www.python.org/downloads/windows/ | `python --version` |
+| Python | 3.12+（本机验证 3.14.7） | 官网安装包，勾选 Add to PATH：https://www.python.org/downloads/windows/ | `python --version` |
 | Node.js | 18+（本机用 24） | 官网 LTS：https://nodejs.org/ | `node -v`、`npm.cmd -v` |
 | MySQL | 8.0/8.x | 二选一：① 官方 ZIP 免安装；② 官方 Installer；ZIP 解压到 `backend\.tools\mysql8` | 目录下存在 `bin\mysqld.exe` |
 | MinIO | 任意可用版本 | 官方已停发二进制，可用 GitHub 最后版本：`https://github.com/minio/minio/releases/download/RELEASE.2025-09-07T16-13-09Z/minio.windows-amd64.RELEASE.2025-09-07T16-13-09Z.exe`，下载后重命名为 `minio.exe` 放到 `backend\.tools\minio\minio.exe` | 运行 `minio.exe --version` |

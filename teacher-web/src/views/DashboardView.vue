@@ -49,7 +49,7 @@
     <div class="page-card table-card">
       <div class="table-head">
         <div>
-          接单队列 <span class="muted">（每 5 秒自动刷新第一屏 {{ QUEUE_PAGE_SIZE_POLL }} 条；统计每 15 秒刷一次；超过第一屏请用搜索定位，确认换文件后该单排到队尾）</span>
+          接单队列 <span class="muted">（每 5 秒自动刷新第一屏 {{ QUEUE_PAGE_SIZE_POLL }} 条；统计每 15 秒刷一次；超过第一屏请用搜索定位，确认换文件后该单排到队尾；点「加载更多」多显示的部分只到下一次自动刷新，之后回到第一屏）</span>
           <!-- 队列只拉一屏，超过时必须让老师知道“下面还有单”，不能默默截断。
                封顶 200 条之后再说「点加载更多」就是骗人：按钮已经拉不出来，要说清楚
                现在看到的是前 200 单，剩下的只能用搜索精确定位。 -->
@@ -623,7 +623,10 @@ const orders = ref([])
  * - 页面隐藏时不轮询（原有行为不变）。
  *
  * 只拉一屏就必须把“没拉完”说出去：队列末尾写上总条数，多出的部分用
- * 「加载更多」分次拉（每次 +60，上限 200——后端 page_size 的上限）。
+ * 「加载更多」分次拉（每次 +60，上限 200——后端 page_size 的上限），
+ * 但**增量只归这一次展示**：queueExtra 在轮询与手点查询/刷新时清零，
+ * 下一拍轮询重新只拉第一屏 60 条。不这样做的话，点过一次「加载更多」之后
+ * 每 5 秒都按放大后的条数（120/180/200）拉，页头文案却还写着「第一屏 60 条」。
  */
 const QUEUE_PAGE_SIZE_POLL = 60
 const QUEUE_PAGE_SIZE_FULL = 200
@@ -809,15 +812,26 @@ async function loadSummary() {
 }
 
 /**
- * 本次该拉多少条。
+ * 本次该拉多少条（只给「加载更多」用）。
  *
- * 轮询拉第一屏（60），手点查询/刷新拉满一页（200），「加载更多」在对应基数上
- * 每次加 60，封顶后端上限 200。
+ * 「加载更多」在各自基数上每次 +60，封顶后端上限 200；轮询与手点查询/刷新
+ * 不走这个函数（见 pollQueueSize），否则增量会粘住不放。
  */
 function queuePageSize() {
   const hasFilter = Boolean(filters.status || filters.keyword.trim())
   const base = hasFilter ? QUEUE_PAGE_SIZE_FULL : QUEUE_PAGE_SIZE_POLL
   return Math.min(base + queueExtra.value, QUEUE_PAGE_SIZE_MAX)
+}
+
+/**
+ * 轮询该拉多少条：永远只拉第一屏（有筛选/关键词时才拉满一页）。
+ *
+ * 页头文案写的是「每 5 秒自动刷新第一屏 60 条」，轮询就必须只拉 60 条：
+ * 「加载更多」多要的部分只影响当次展示，下一拍回到第一屏，文案与行为才一致。
+ */
+function pollQueueSize() {
+  const hasFilter = Boolean(filters.status || filters.keyword.trim())
+  return hasFilter ? QUEUE_PAGE_SIZE_FULL : QUEUE_PAGE_SIZE_POLL
 }
 
 async function loadQueue(pageSize = QUEUE_PAGE_SIZE_FULL) {
@@ -859,8 +873,12 @@ function startPolling() {
   timer = setInterval(() => {
     if (document.hidden) return
     pollTicks += 1
+    // 轮询回到第一屏：先把「加载更多」的增量复位，再按第一屏条数拉。
+    // 不复位的话，点过一次「加载更多」就每 5 秒都按放大后的条数拉，页面越跑越重；
+    // 复位的代价是下一拍显示条数从 120 退回 60，这正是页头写的「刷新第一屏 60 条」。
+    queueExtra.value = 0
     // 有筛选/关键词时轮询也用全量：搜索结果被截断比多拉几条更难解释
-    loadQueue(queuePageSize())
+    loadQueue(pollQueueSize())
     if (pollTicks % SUMMARY_POLL_TICKS === 0) loadSummary()
   }, POLL_INTERVAL_MS)
 }

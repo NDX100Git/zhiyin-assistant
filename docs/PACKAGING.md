@@ -39,9 +39,13 @@ VITE_API_BASE_URL=http://电脑局域网IP:8000
 | 权限 | 网络、相机、读写存储、相册 | 已按最小必要配置 |
 | 图标 | `src/static/app-icon.png` | 1024×1024；HBuilderX 图标配置里可直接选它 |
 
-**appid 必须换掉**：当前是占位值 `__UNI__ZHIYIN01`。
-在 HBuilderX 里打开 `manifest.json` →「基础配置」→ 点击「重新获取」/ 选择你账号下的 uni-app 应用，
-把 appid 换成 DCloud 分配的真实值，否则云打包会失败。
+**DCloud 应用 appid 必须换掉**：当前是 `__UNI__A9689FA`（`manifest.json` 第 3 行的 `appid`），
+是别人账号下的值。在 HBuilderX 里打开 `manifest.json` →「基础配置」→ 点击「重新获取」/ 选择你账号下的
+uni-app 应用，把 appid 换成 DCloud 分配给你的真实值，否则云打包会失败。
+
+> 别跟**微信小程序身份码**搞混：那是另一个值（`mp-weixin.appid`），**不写在 manifest 里**，
+> 构建时由 `UNI_MP_WEIXIN_APPID` / `student-app/.env.local` 注入，见第 5 节。
+> 这里是云打包用的 DCloud 应用 appid，与小程序无关。
 
 ---
 
@@ -105,7 +109,17 @@ npm.cmd run build:mp-weixin
 产物在 `student-app/dist/build/mp-weixin/`。
 
 1. 打开微信开发者工具 → 导入项目 → 选择该目录。
-2. 在 `src/manifest.json` 的 `mp-weixin.appid` 填入小程序 appid（当前为空）。
+2. 小程序身份码（`project.config.json` 里的 `appid`）来自**构建时注入**，`src/manifest.json` 的
+   `mp-weixin.appid` 保持空字符串（身份码不进版本库）：
+
+```powershell
+cd student-app
+$env:UNI_MP_WEIXIN_APPID="<小程序 appid>"
+npm.cmd run build:mp-weixin
+```
+
+   长期在同一台机器出包，就把 `VITE_MP_WEIXIN_APPID=<小程序 appid>` 写进 `student-app/.env.local`
+   （已 gitignore）。两处都没配时产物是游客身份包（`appid` = `touristappid`），构建日志会点名告警。
 3. 开发者工具中勾选「不校验合法域名」（开发期），生产环境需在微信后台配置 request/uploadFile 合法域名。
 
 小程序端 `uni.chooseFile` 可用；App 端走 `plus.io.chooseFile`，失败时使用「载入示例论文」。

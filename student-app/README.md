@@ -49,6 +49,27 @@ netsh advfirewall firewall add rule name="ZhiYin API 8000" dir=in action=allow p
 
 手机与电脑需在同一局域网，手机浏览器先访问 `http://电脑IP:8000/api/health` 确认可达。
 
+## 微信小程序身份码（构建时注入，不进版本库）
+
+`src/manifest.json` 里 `mp-weixin.appid` **永远保持空字符串**。身份码是部署参数，不是源码：
+写进仓库等于谁拉代码谁就拿到了业务方的小程序身份。构建时按下面两处注入（前者优先）：
+
+```powershell
+# 方式一：命令行构建参数
+$env:UNI_MP_WEIXIN_APPID="wx..."
+npm.cmd run build:mp-weixin      # 或 dev:mp-weixin
+```
+
+```ini
+# 方式二：本机未入库配置（长期调试最省事，已被 .gitignore 忽略）
+# 文件：student-app/.env.local
+VITE_MP_WEIXIN_APPID=wx...
+```
+
+两处都没配时：构建照常完成，但产物是**游客身份包**（`dist/build/mp-weixin/project.config.json`
+里的 `appid` 是 `touristappid`，不能真机预览与上传），构建日志会点名告警。
+自查：看 `project.config.json` 的 `appid` 是不是注入的那个值。
+
 ## 选文件的三个平台分支（重点）
 
 页面里**不直接调用** `uni.chooseFile` / `uni.chooseImage`，统一走 `src/services/filePicker.js`：
