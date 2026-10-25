@@ -489,6 +489,83 @@ async function readQueueNote(page) {
   })
 }
 
+/** 页面上真的列出来多少单：桌面是表格行，手机是一单一张卡。 */
+const QUEUE_ROW_SELECTOR = '.order-card, .el-table__row'
+/** 后端 /api/admin/queue 的 page_size 上限（DashboardView.vue 的 QUEUE_PAGE_SIZE_MAX）。 */
+const QUEUE_PAGE_SIZE_MAX = 200
+
+/**
+ * 同一帧里读全「页面列出来多少单」与「页面对隐藏了多少单的说法」。
+ *
+ * 必须一次 evaluate 读完：队列每 5 秒轮询一次，条数会在手点查询的 200 条与轮询的
+ * 60 条之间来回切，分两次读会读到两个不同状态，算出一笔对不上的差额。
+ */
+async function readQueueSnapshot(page) {
+  return page.evaluate((rowSelector) => {
+    const visible = (element) => element.getClientRects().length > 0
+    const rows = [...document.querySelectorAll(rowSelector)].filter(visible)
+    const note = [...document.querySelectorAll('.queue-more-note')].filter(visible)[0]
+    const loadMore = [...document.querySelectorAll('.queue-load-more')].filter(visible)[0]
+    return {
+      rows: rows.length,
+      note: note ? (note.innerText || note.textContent || '').trim() : '',
+      hasLoadMore: Boolean(loadMore),
+    }
+  }, QUEUE_ROW_SELECTOR)
+}
+
+/**
+ * 比对「接口 total − 页面列出来的条数」与「页面自己写的隐藏数」，返回 null 表示自洽。
+ *
+ * 提示里的隐藏数是页面拿 total 减去当前列表条数算出来的，而列表条数取决于页面这次
+ * 请求的 page_size（轮询 60、手点查询/刷新 200、「加载更多」+60）。回归写死 60 去算
+ * 预期，会算出一个页面根本不会显示的差额：库里只剩 163 单时，页面拉满 200 条已经
+ * 全部显示，60 条口径却报「还有 103 单没显示」，把正确的空提示判成失败。
+ * 所以只核对页面自己的账：它说隐藏了多少单，就得和它实际列出来的条数对得上。
+ *
+ * 产品文案见 DashboardView.vue 的 queue-more-note 与 queueAtCap：
+ * - 没隐藏：不出提示，也不给「加载更多」；
+ * - 隐藏了但没顶到后端单页上限：写「共 N 单，还有 M 单未显示…」并给「加载更多」；
+ * - 已经拉满 200 单却还有单：只能写「已显示前 200 单…还有 M 单未显示」，不再给按钮。
+ */
+function queueNoteProblem(snapshot, total) {
+  const hidden = Math.max(total - snapshot.rows, 0)
+  if (hidden === 0) {
+    if (snapshot.note) {
+      return `接口 total ${total}、页面列出 ${snapshot.rows} 单，已经全部显示，却出现提示：「${snapshot.note}」`
+    }
+    if (snapshot.hasLoadMore) {
+      return `接口 total ${total}、页面列出 ${snapshot.rows} 单，已经全部显示，却给了「加载更多」`
+    }
+    return null
+  }
+  if (!snapshot.note.includes(`还有 ${hidden} 单未显示`)) {
+    return `接口 total ${total}、页面列出 ${snapshot.rows} 单，还差 ${hidden} 单没显示，提示却是：「${snapshot.note}」`
+  }
+  if (snapshot.rows >= QUEUE_PAGE_SIZE_MAX) {
+    if (!snapshot.note.includes(`已显示前 ${QUEUE_PAGE_SIZE_MAX} 单`)) {
+      return (
+        `页面已拉满 ${QUEUE_PAGE_SIZE_MAX} 单、还有 ${hidden} 单没显示，` +
+        `提示该说「已显示前 ${QUEUE_PAGE_SIZE_MAX} 单」，实际：「${snapshot.note}」`
+      )
+    }
+    if (snapshot.hasLoadMore) {
+      return (
+        `页面已拉满 ${QUEUE_PAGE_SIZE_MAX} 单、还有 ${hidden} 单没显示，` +
+        `不该再给「加载更多」：「${snapshot.note}」`
+      )
+    }
+    return null
+  }
+  if (!snapshot.note.includes(`共 ${total} 单`)) {
+    return `提示里没写总条数（应写「共 ${total} 单」）：「${snapshot.note}」`
+  }
+  if (!snapshot.hasLoadMore) {
+    return `还有 ${hidden} 单没显示，却没给「加载更多」：「${snapshot.note}」`
+  }
+  return null
+}
+
 // ---------------------------------------------------------------- 多文件场景
 /**
  * 切页并强制重建页面实例。
@@ -2471,19 +2548,65 @@ async function runPriceAndRefundPhase({ student, teacher, viewport, step }) {
 
   // ---- 6. 队列只拉一屏时，必须说清“还有多少单没显示”
   await step('队列：只拉一屏时提示还有多少单未显示，并能加载更多', async () => {
-    await searchQueue(teacher, '')
-    await sleep(1000)
-    const real = await fetchQueueFromPage(teacher, 60)
-    const hidden = Math.max(Number(real.total) - (real.items || []).length, 0)
-    const note = await readQueueNote(teacher)
-    if (hidden === 0) {
-      if (note) throw new Error(`队列已经全部显示，却出现了提示：「${note}」`)
-    } else if (!note.includes(`还有 ${hidden} 单未显示`)) {
-      throw new Error(`队列还有 ${hidden} 单没显示，提示却是：「${note}」`)
+    // 页面列出来多少单，取决于它这次请求的 page_size：轮询 60、手点查询/刷新 200、
+    // 「加载更多」+60。把页面真实请求的 page_size 记下来，失败时能一眼看出按哪个口径算的。
+    const seenPageSizes = []
+    const onQueueResponse = (response) => {
+      const url = response.url()
+      if (!url.includes('/api/admin/queue')) return
+      if (response.request().method() !== 'GET') return
+      const size = Number(new URL(url).searchParams.get('page_size')) || 0
+      if (!seenPageSizes.includes(size)) seenPageSizes.push(size)
     }
-    result.realHidden = hidden
+    teacher.on('response', onQueueResponse)
+    try {
+      await searchQueue(teacher, '')
+      // 手点「查询」按后端一页上限 200 条拉，不是轮询的第一屏 60 条
+      let waited = 0
+      while (!seenPageSizes.includes(QUEUE_PAGE_SIZE_MAX) && waited < 30000) {
+        await sleep(200)
+        waited += 200
+      }
+      if (!seenPageSizes.includes(QUEUE_PAGE_SIZE_MAX)) {
+        throw new Error(
+          `点「查询」后没有按一页 ${QUEUE_PAGE_SIZE_MAX} 条拉队列，` +
+            `实际请求 page_size：${seenPageSizes.join(',') || '无'}`,
+        )
+      }
 
-    // 造一个必然超量的返回：total 抬高 34 单，items 仍是真实数据
+      // 轮询每 5 秒把条数切回 60 条，两种状态都必须自洽，谁先对上算谁
+      const deadline = Date.now() + 30000
+      let snapshot = await readQueueSnapshot(teacher)
+      let total = Number((await fetchQueueFromPage(teacher, 60)).total) || 0
+      let problem = queueNoteProblem(snapshot, total)
+      while (problem && Date.now() < deadline) {
+        await sleep(700)
+        snapshot = await readQueueSnapshot(teacher)
+        total = Number((await fetchQueueFromPage(teacher, 60)).total) || 0
+        problem = queueNoteProblem(snapshot, total)
+      }
+      if (problem) {
+        throw new Error(
+          `${problem}（页面请求过的 page_size：${seenPageSizes.join(',') || '无'}）`,
+        )
+      }
+      result.listedRows = snapshot.rows
+      result.realTotal = total
+      result.realHidden = Math.max(total - snapshot.rows, 0)
+      result.realNote = snapshot.note
+      result.queuePageSizes = seenPageSizes.slice()
+      console.log(
+        `      队列：页面列出 ${snapshot.rows} 单 / 接口 total ${total} / ` +
+          `隐藏 ${result.realHidden} / 页面请求过 page_size ${seenPageSizes.join(',')} / ` +
+          `提示「${snapshot.note || '无'}」`,
+      )
+    } finally {
+      teacher.off('response', onQueueResponse)
+    }
+
+    // 造一个必然超量的返回：total 抬高 34 单，items 仍是真实数据。
+    // 这一单得在开拦截之前拿：开了拦截之后页面里的 fetch 也会被拦到假数据上。
+    const real = await fetchQueueFromPage(teacher, 60)
     const faked = {
       ...real,
       total: (real.items || []).length + 34,
@@ -2522,13 +2645,20 @@ async function runPriceAndRefundPhase({ student, teacher, viewport, step }) {
       }
       result.fakedNote = fakedNote
 
+      // 先清空：上面「查询」自己就会发一个 200 条的请求，留着会让「加载更多」白捡一个
+      requests.length = 0
       await clickByText(teacher, '加载更多')
       await sleep(1500)
       const loaded = requests.filter((size) => size >= 120)
       if (loaded.length === 0) {
-        throw new Error(`「加载更多」没有按更大条数重拉队列，实际请求 page_size：${requests.join(',')}`)
+        throw new Error(
+          `「加载更多」没有按更大条数重拉队列，点击后实际请求 page_size：${requests.join(',') || '无'}`,
+        )
       }
       result.loadMorePageSizes = requests.slice()
+      console.log(
+        `      队列（假 total ${faked.total}）：点击后请求 page_size ${requests.join(',') || '无'}`,
+      )
     } finally {
       teacher.off('request', handler)
       await teacher.setRequestInterception(false)
