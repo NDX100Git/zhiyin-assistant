@@ -59,7 +59,10 @@
       </view>
       <view class="order-actions" @click.stop>
         <button v-if="order.status === 'pending_pay'" class="mini primary" @click="pay(order)">模拟支付</button>
-        <button v-if="order.status === 'pending_pay' || order.status === 'queuing'" class="mini" @click="cancel(order)">取消</button>
+        <button v-if="canSelfCancel(order)" class="mini" @click="cancel(order)">取消</button>
+        <text v-else-if="teacherCancelOnly(order)" class="cancel-hint">
+          已支付订单如需取消请联系文印室老师
+        </text>
         <button class="mini ghost" @click="openDetail(order.id)">详情</button>
       </view>
     </view>
@@ -237,6 +240,22 @@ async function pay(order) {
   } catch (error) {
     notifyError(error)
   }
+}
+
+/**
+ * 学生能自助取消的只有「还没付钱」的订单。
+ *
+ * 已支付的排队单后端会直接回 40905（钱已经收了，只能老师在后台关单并登记退款），
+ * 前端再给一个“点了必然失败”的按钮，只会让学生以为系统坏了。
+ */
+function canSelfCancel(order) {
+  if (order.status === 'pending_pay') return true
+  return order.status === 'queuing' && !order.paid
+}
+
+/** 已付款且还在排队：按钮换成一句“找老师”的提示，而不是留一个点不动的取消。 */
+function teacherCancelOnly(order) {
+  return order.status === 'queuing' && Boolean(order.paid)
 }
 
 function cancel(order) {
@@ -627,6 +646,16 @@ function openDetail(id) {
   border-color: var(--zi-line-strong);
   background: transparent;
   color: var(--zi-muted);
+}
+
+/* 已付款排队单不给取消按钮，换成一句“找老师”的提示（字号对齐小按钮） */
+.cancel-hint {
+  flex: 1;
+  margin-left: 12rpx;
+  color: var(--zi-muted);
+  font-size: 22rpx;
+  line-height: 1.4;
+  text-align: right;
 }
 
 /* 旧蓝白皮肤：齿轮与面板恢复轻量圆角 */

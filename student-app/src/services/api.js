@@ -4,6 +4,7 @@
  */
 
 import { API_BASE_URL, STORAGE_KEYS } from '@/config'
+import { explainApiCode } from '@/utils/errors'
 
 export function getToken() {
   return uni.getStorageSync(STORAGE_KEYS.token) || ''
@@ -88,7 +89,8 @@ export function request(path, options = {}) {
           return
         }
         if (body && typeof body.code !== 'undefined') {
-          reject(new Error(body.message || '请求失败'))
+          // 业务码统一在这里译成中文：页面上不需要再认码，也不会漏掉某一屏
+          reject(new Error(explainApiCode(body.code, body.message)))
           return
         }
         reject(new Error(`服务返回异常（HTTP ${response.statusCode}）`))
@@ -116,7 +118,13 @@ export function uploadFile(filePath, fileName) {
           resolve(body.data)
           return
         }
-        reject(new Error((body && body.message) || '上传失败'))
+        // 转换类错误（50041 / 50043 / 50046）多数在解析上传文件时就发生，
+        // 走的是这条上传通道而不是 request()，映射必须两边都做。
+        if (body && typeof body.code !== 'undefined') {
+          reject(new Error(explainApiCode(body.code, body.message)))
+          return
+        }
+        reject(new Error('上传失败'))
       },
       fail(error) {
         reject(new Error(error.errMsg || '上传失败'))
