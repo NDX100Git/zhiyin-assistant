@@ -1,6 +1,8 @@
 # 智印助手 · 项目状态（给未来的接手者）
 
-> 最后更新：2026-10-17
+> 最后更新：2026-10-25
+> 本轮（2026-10-25）的 22 项缺陷修复与完整实测记录见 [HANDOFF-2026-10-25.md](HANDOFF-2026-10-25.md)，
+> 本文件只保留"现在到哪了"的状态摘要。
 > 阅读顺序建议：先看本文件了解"现在到哪了"，再看 [ARCHITECTURE.md](ARCHITECTURE.md) 了解"代码怎么组织"，
 > 最后按需查阅 [docs/ORIGINAL_SPEC.md](docs/ORIGINAL_SPEC.md)（原始需求规格，唯一需求来源）。
 
@@ -11,7 +13,8 @@
 1. 读本文件第 1-4 节，知道现在做到哪、哪些决策不能随便改。
 2. 按第 2 节启动 MySQL、MinIO、后端、学生端 H5。
 3. 打开 <http://127.0.0.1:8000/docs> 看接口，打开 <http://127.0.0.1:5173> 看学生端。
-4. 跑 `cd backend && .venv\Scripts\python.exe -m pytest -q`，确认 85 条测试全绿。
+4. 跑 `cd backend && python -m pytest -q`，确认 **271 passed / 2 skipped**（跳过的是需要
+   LibreOffice 与 Docker 的两条 Office 转换用例；其余全绿）。
 5. 要改哪个模块，先查 [ARCHITECTURE.md](ARCHITECTURE.md) 第 6 节的"关键文件职责"。
 6. 改完一个阶段：更新本文件 + 跑测试 + `git commit`（message 写清楚阶段和内容）。
 
@@ -24,16 +27,15 @@
 
 **当前阶段：V1 核心闭环已跑通（后端全部业务 + 学生端 H5 四个页面），阶段 7 收尾中，阶段 8/9 未开始。**
 
-最近一次验证（2026-10-17）：
+最近一次验证（2026-10-25，本轮实测）：
 
-- 后端 `pytest -q`：**89 passed**
-- 后端 `ruff check`：全绿
-- 学生端 `npm run build:h5`：构建成功
-- 学生端 Edge 真浏览器冒烟：首页 / 下单 / 上传真实 PPT / AI 体检报告 / 打印方案 / 我的，**0 控制台错误**
-- 老师端 Edge 真浏览器 E2E：登录 → 完成打印并改价 → 核销 → 流水/设置，**0 控制台错误**
-- 学生端构建：H5 / 微信小程序 / App 资源均构建成功
-- DeepSeek 连通性（`backend/test_llm.py`）：普通对话 / JSON 模式 / 思考模式全部通过
-- 多模态 OCR：真实识别中文图片成功（确认 `deepseek-flash` 支持图片输入）
+- 后端 `pytest -q`：**271 passed / 2 skipped**（跳过 2 条需 LibreOffice/Docker 的 Office 转换用例）
+- 后端 `ruff check .`：All checks passed
+- 学生端 `npm run build:h5`：构建成功（23 秒）
+- 老师端 `npm run build`：构建成功（12 秒，主 chunk 1.06 MB，有 chunk 体积警告）
+- 浏览器端到端（`cd e2e && node run.mjs --start`）：**41 步 × 2 视口（390/1440）全部通过**，
+  覆盖单文件/多文件/四文件闭环、换文件确认、打印前拦截、两套皮肤、深色模式对比度抽查
+- 唯一未覆盖：Office 文档 → PDF 转换（本机无 LibreOffice / Docker）
 
 ---
 
@@ -117,9 +119,19 @@ npm.cmd run dev:h5
 
 | 日期 | 问题 | 原因 | 修复 |
 |---|---|---|---|
+| 2026-10-25 | 老师改价只挡负数，30 元误输成 300 元照样落库 | 只判断 `< 0` | `pricing.ensure_amount_allowed()`：单笔上限 1000 元 + 相对系统价 10 倍，且至少给 20 元浮动空间（小额单不至于被拦）；`complete_print` 与换文件确认价都接上，错误码 `40062` |
+| 2026-10-25 | 核销覆盖线上支付时间，对账口径错位 | `verify_pickup` 无条件写 `paid_at` | 只在 `paid_at` 为空时写入；补款金额照旧记 `PaymentLog` |
+| 2026-10-25 | 已打印的异常单恢复后被重新打印一遍 | `ready→abnormal→queuing` 回路，`recover_order` 无业务校验 | 已打印过的异常单恢复到 `ready`（状态机补 `ABNORMAL→READY`）；`printed_at` 改为只在首次进 `ready` 时写 |
+| 2026-10-25 | 报价不校验真实页数，改小 `page_count` 可拿低价估价 | 校验只在 `create_order` 里 | `validate_declared_page_counts` 移入下单/报价共用的 `_prepare_items` |
+| 2026-10-25 | 清理任务中途崩溃留下「对象已删、记录还在」的僵尸行 | 整轮只在末尾 `commit()` | 保持「先删对象、后删记录」，但改为**逐条提交**，窗口压到单条记录 |
+| 2026-10-25 | soffice 超时只杀父进程，孙进程锁住 profile 目录 | `proc.kill()` 不杀进程组 | Windows `taskkill /F /T`、POSIX `killpg`（`Popen` 加 `start_new_session=True`），kill 后 `wait` 确认 |
+| 2026-10-25 | 模型返回 `"双面"` 这类脏值直接 500 | `int()` 在异常捕获之外 | `_safe_int()` 统一按默认方案降级 |
+| 2026-10-25 | 老师端手工写个 localStorage 就能进后台 | 守卫只判断 token 是否存在 | 校验三段式 JWT 且 `exp` 未过期；真正的鉴权仍由后端 401 兜底 |
 | 2026-10-17 | H5 上传报"参数校验失败：file 字段要求" | `uni.uploadFile` 被强行带上 `Content-Type: application/json`，浏览器无法生成 multipart boundary | 上传专用请求头只带 Authorization，交给运行时设置 Content-Type；`api.js` 已加注释警示 |
 | 2026-10-17 | PPT 体检误报"缺摘要/缺参考文献" | 所有文档都套用了论文结构规则 | 新增 paper/slide/sheet 口径；PPT 只检查版式（图片越界、空白页） |
 | 2026-10-17 | 用户不想体检也要等 AI | 上传后自动触发体检 | 新增页数接口 + 基础方案；体检与修复都改为用户主动开启 |
+
+完整清单（22 项）见 [HANDOFF-2026-10-25.md](HANDOFF-2026-10-25.md) 第三节。
 
 ---
 
@@ -140,15 +152,32 @@ npm.cmd run dev:h5
 | 长任务进度是单进程内存 | 多进程/重启后任务进度丢失 | V1 单机演示可接受；V2 换 Redis 实现（接口不变） |
 | LLM 调用有成本 | 演示时反复体检会消耗额度 | 解析/体检/方案均有缓存；`force=true` 才会重算 |
 | 学生端只验证了 H5 | App/小程序端未实测 | H5 已用 Edge 冒烟（0 错误）；App 需 HBuilderX 真机运行 |
+| 后端容器已降权到 uid 10001，运行时目录改为命名卷 | 只做了配置层验证（YAML 可解析、卷名与挂载点一致） | **需在有 Docker 的机器上 `docker compose up -d --build` 实测一次**，确认容器能写 `/app/runtime/tmp` |
+| Office 文档 → PDF 转换未实测 | 本机无 LibreOffice、无 Docker，2 条用例被 skip | 上传 PDF 的链路是通测的；有 LibreOffice 的机器上跑 `pytest -k 转换` 补齐 |
+| 已支付订单学生仍可一键取消（无退款、无反向流水） | `STUDENT_CANCELLABLE` 含 `queuing` | **待产品口径**：收紧为「付了不能自取消」，或允许取消但走退款 + 反向流水 |
+| 并发支付时真实扣款在状态保护之外 | mock 支付看不出 | **待产品口径**：`SELECT ... FOR UPDATE` 行锁 或 客户端幂等键 |
+| `ai_reports` 缓存没有 `user_id` 维度 | 路由层 `ensure_files_owned_by` 已拦住跨用户路径 | 属纵深防御；改动面约 8 个文件（加列 + 幂等迁移 + 5 个 service 签名） |
+| `layout` 版式参数不进 `Order` 也不参与计费 | 前端会展示「省 21 张纸」，但付款按页数算 | **答辩易被追问**；改动要动计费模型，属口径问题 |
 
 ---
 
 ## 6. 下一步计划
 
-1. **阶段 9 打包交付**：按 `docs/PACKAGING.md` 在 HBuilderX 云打包 APK（需替换 appid、选择 `src/static/app-icon.png`、配置签名证书）；部署按 `docs/DEPLOYMENT.md`，评委安装看 `docs/INSTALL.md`。
-2. **真机验证**：V1 只验证了 H5；拿到 Android 手机后验证 `plus.io.chooseFile`，失败则继续用"载入示例论文"兜底。
-3. 收集用户试用反馈，调整文案/交互/演示数据。
-4. 可选优化：扫描件自动检测、报告 7 天清理定时任务、MinIO 对象生命周期。
+**先定口径（不定就别动手）**
+
+1. **已支付订单能否取消**：A 收紧为「付了就不能自己取消」／B 允许取消但走退款 + 反向流水。
+2. **支付并发**：A `SELECT ... FOR UPDATE` 行锁／B 客户端幂等键。
+3. **`layout` 要不要参与计费**：现在展示「省纸」但按页数收款，两者口径不一致。
+
+**可以直接做**
+
+4. **补跑 Office 转换的 2 条用例**（本机缺 LibreOffice/Docker 被 skip）。
+5. **把 `e2e/` 接进 CI**：2449 行全链路回归，目前完全不在 CI 里跑。
+6. **CI 补 lint**：两个前端 `package.json` 都没有 `lint`/`test` script，后端也没在 CI 里跑 ruff。
+7. **Docker 实测**：容器降权 + 命名卷需真机验证一次。
+8. **阶段 9 打包交付**：按 `docs/PACKAGING.md` 在 HBuilderX 云打包 APK（需替换 appid、选择 `src/static/app-icon.png`、配置签名证书）；部署按 `docs/DEPLOYMENT.md`，评委安装看 `docs/INSTALL.md`。
+9. **真机验证**：拿到 Android 手机后验证 `plus.io.chooseFile`，失败则继续用"载入示例论文"兜底。
+10. 收集用户试用反馈，调整文案/交互/演示数据。
 
 **更新规则**：每完成一个阶段，更新本文件的「已完成模块 / 已知问题 / 下一步」，并做一次 git commit。
 
@@ -157,10 +186,10 @@ npm.cmd run dev:h5
 ## 7. 常用验证命令
 
 ```powershell
-# 后端测试 + 静态检查
+# 后端测试 + 静态检查（用虚拟环境里的 python；直接跑系统 python 也一样）
 cd backend
-.venv\Scripts\python.exe -m pytest -q
-.venv\Scripts\python.exe -m ruff check .
+.venv\Scripts\python.exe -m pytest -q      # 期望 271 passed, 2 skipped
+.venv\Scripts\python.exe -m ruff check .   # 期望 All checks passed
 
 # 模型连通性
 .venv\Scripts\python.exe test_llm.py
