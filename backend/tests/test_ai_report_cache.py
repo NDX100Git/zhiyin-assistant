@@ -360,3 +360,61 @@ def test_没带发起人的校对任务缓存行为与改造前一致(
     rows = _report_rows(db_session, key, "proofread")
     assert len(rows) == 1
     assert rows[0].user_id is None
+
+
+# ---------------------------------------------------------------- 解析缓存（无账号链路）
+def _count_parses(monkeypatch) -> list[int]:
+    """记录真解析次数：缓存命中时不该再进解析。"""
+    from app.services import doc_parser as doc_parser_module
+
+    real = doc_parser_module.parse_pdf
+    calls: list[int] = []
+
+    def wrapper(pdf_path):
+        calls.append(1)
+        return real(pdf_path)
+
+    monkeypatch.setattr(doc_parser_module, "parse_pdf", wrapper)
+    return calls
+
+
+def test_页数读取与体检共用一条解析缓存(db_session, test_storage, tmp_path, monkeypatch):
+    from app.services.doc_parser import parse_document
+
+    pdf = _make_pdf(tmp_path / "page-first.pdf")
+    key = build_object_key("page-first.pdf")
+    test_storage.upload(key, io.BytesIO(pdf), len(pdf), PDF_MIME)
+    _install_model(monkeypatch)
+    parses = _count_parses(monkeypatch)
+
+    # 页数读取：路由不绑账号（routers/file.py 的 /page-count、下单、打印方案）
+    parse_document(db_session, key)
+    assert len(_report_rows(db_session, key, "parse")) == 1
+
+    # 体检：带账号上下文
+    bind_report_owner(db_session, 11)
+    check_format(db_session, key)
+
+    assert len(_report_rows(db_session, key, "parse")) == 1, "同一文件只能留一行解析缓存"
+    assert len(parses) == 1, "体检链路该复用页数链路已经解析好的结果"
+
+
+def test_体检之后再走页数读取不再新写解析缓存行(db_session, test_storage, tmp_path, monkeypatch):
+    from app.services.doc_parser import REPORT_OWNER_KEY, parse_document
+
+    pdf = _make_pdf(tmp_path / "check-first.pdf")
+    key = build_object_key("check-first.pdf")
+    test_storage.upload(key, io.BytesIO(pdf), len(pdf), PDF_MIME)
+    _install_model(monkeypatch)
+    parses = _count_parses(monkeypatch)
+
+    bind_report_owner(db_session, 11)
+    check_format(db_session, key)
+    assert len(_report_rows(db_session, key, "parse")) == 1
+
+    # 下单/页数读取用的是没有账号上下文的会话
+    db_session.info.pop(REPORT_OWNER_KEY, None)
+    parse_document(db_session, key)
+
+    assert len(_report_rows(db_session, key, "parse")) == 1, "无账号链路不该另写一行"
+    assert len(parses) == 1, "无账号链路该复用已有解析结果"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import shutil
+import time
 import zipfile
 from pathlib import Path
 
@@ -22,6 +23,8 @@ from app.services.doc_parser import (
     quick_page_count,
 )
 from app.services.storage import build_object_key
+from app.utils.exceptions import BusinessError
+from app.utils.filetype import MIME_BY_EXT
 
 
 def _write_text(page: fitz.Page, point: tuple[float, float], text: str, size: int = 12) -> None:
@@ -312,3 +315,84 @@ def test_启动转换进程时传的是白名单环境(monkeypatch, tmp_path):
     assert "DB_PASSWORD" not in captured["env"]
     assert "should-not-leak-db" not in " ".join(captured["env"].values())
     assert captured["env"]["TMP"] == captured["env"]["TEMP"]
+
+
+# ---------------------------------------------------------------- 转换的等待额度
+def test_单次转换的等待时间受表格渲染预算约束(monkeypatch, tmp_path):
+    """表格放宽横向页数会重跑多轮转换，每轮都占着同一个 AI 并发名额。
+
+    只在 spreadsheet.render_pdf 里数次数挡不住：一轮转换自己就能等满
+    soffice_timeout_seconds（默认 180 秒），两轮就是 260 秒以上。额度必须传到
+    真正等 soffice 的这一层。
+    """
+    from app.services import doc_parser, spreadsheet
+
+    monkeypatch.setattr(settings, "soffice_timeout_seconds", 180)
+    assert doc_parser.conversion_timeout_seconds() == 180.0, "不在表格渲染里就按配置等"
+
+    captured: dict = {}
+
+    class _FakeProc:
+        pid = 4242
+
+        def wait(self, timeout=None):
+            captured["timeout"] = timeout
+            return 0
+
+    monkeypatch.setattr(doc_parser.subprocess, "Popen", lambda cmd, **kwargs: _FakeProc())
+    out_dir = tmp_path / "w"
+    out_dir.mkdir()
+
+    with spreadsheet.render_deadline(1.5):
+        doc_parser._run_soffice(["true"], out_dir, out_dir / "o.log", out_dir / "e.log")
+
+    assert captured["timeout"] is not None
+    assert captured["timeout"] <= 1.5, "额度只剩 1.5 秒时不该再按 180 秒等"
+
+
+# ---------------------------------------------------------------- 表格降级到返回体
+def test_表格渲染超时的降级说明出现在解析结果里(db_session, test_storage, tmp_path, monkeypatch):
+    """体检返回体里的 spreadsheet 事实要写清「因超时按前一次结果出纸」。
+
+    学生看到页面数没按预期放宽，得知道是服务端主动截住了耗时，而不是漏了。
+    """
+    from openpyxl import Workbook
+
+    from app.services import doc_parser
+
+    workbook = Workbook()
+    sheet = workbook.active
+    for row in range(1, 6):
+        for col in range(1, 8):
+            sheet.cell(row=row, column=col, value=f"R{row}C{col}")
+    xlsx_path = tmp_path / "慢表.xlsx"
+    workbook.save(xlsx_path)
+
+    key = build_object_key("慢表.xlsx")
+    data = xlsx_path.read_bytes()
+    test_storage.upload(key, io.BytesIO(data), len(data), MIME_BY_EXT["xlsx"])
+
+    def slow_convert(prepared: Path, out_dir: Path) -> Path:
+        """每轮 0.2 秒；额度不够就当场超时（真转换层此时会杀 soffice 并抛 50041）。"""
+        remaining = doc_parser.remaining_render_seconds()
+        wait = 0.2 if remaining is None else min(0.2, remaining)
+        time.sleep(wait)
+        if remaining is not None and wait < 0.2:
+            raise BusinessError("文档转换超时，请稍后重试", code=50041)
+        with fitz.open() as document:
+            page = document.new_page()
+            _write_text(page, (90, 100), "表格", size=6)  # 字号偏小，会触发放宽重试
+            document.save(str(out_dir / f"{prepared.stem}.pdf"))
+        return out_dir / f"{prepared.stem}.pdf"
+
+    monkeypatch.setattr(doc_parser, "convert_to_pdf", slow_convert)
+    monkeypatch.setattr(settings, "spreadsheet_render_budget_seconds", 0.3)
+    monkeypatch.setattr(settings, "soffice_timeout_seconds", 180)
+
+    report = parse_document(db_session, key)
+
+    spreadsheet_stats = report["spreadsheet"]
+    assert spreadsheet_stats["render_truncated"] is True
+    assert "因超时按前一次结果出纸" in spreadsheet_stats["render_note"]
+    assert spreadsheet_stats["render_attempts"] == 1
+    assert report["page_count"] == 1

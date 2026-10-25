@@ -164,13 +164,112 @@ def sanitize_actions(raw: Any) -> tuple[list[dict], list[dict]]:
 
 
 # ---------------------------------------------------------------- 指令执行
-def _iter_paragraphs(doc: Document):
+#
+# 能被「统一正文行距/字号」动到的段落分布在三处：正文、表格单元格、页眉页脚。
+# 早期只取 doc.paragraphs，表格里的参考文献条目一个字也改不到；但反过来无差别地
+# 套一遍也不行：
+# - 标题类段落（Heading 1-9 / Title / 自定义大纲级别样式）的字号与字体由
+#   format_rules.json 的 typography.heading* 单独定义（黑体二号/三号…）。用正文的
+#   宋体小四套上去，标题层级直接被压平，而学生看不出是修复弄的。
+# - 页眉页脚是版面装饰，字号由版心决定（常见楷体五号），套正文规则只会把它改花。
+# 所以遍历覆盖三处，各条指令再按「区域 + 段落类型」决定动不动它。
+KIND_BODY = "body"
+KIND_TABLE = "table"
+KIND_HEADER = "header"
+
+# Word 内置样式的 w:name 存的是英文名，中文版 Word 也读作 heading 1；
+# 自定义样式可能叫「一级标题」这种名字，一并认下来。
+HEADING_STYLE_PREFIXES = ("heading", "title", "subtitle", "标题", "副标题", "章标题")
+
+
+def _iter_table_paragraphs(table):
+    """表格里所有段落，嵌套表格逐层往下走。"""
+    for row in table.rows:
+        for cell in row.cells:
+            yield from cell.paragraphs
+            for nested in cell.tables:
+                yield from _iter_table_paragraphs(nested)
+
+
+def _header_footer_parts(section):
+    """这一节实际的页眉页脚：只取已经存在的，不凭空创建。"""
+    for part in (
+        section.header,
+        section.footer,
+        section.first_page_header,
+        section.first_page_footer,
+        section.even_page_header,
+        section.even_page_footer,
+    ):
+        # 继承上一节（没有自己的定义）时跳过：读它的段落会把定义凭空建出来，
+        # 存回去的文件里会多几个空页眉部件
+        if part.is_linked_to_previous:
+            continue
+        yield part
+
+
+def iter_text_paragraphs(doc: Document):
+    """遍历所有可能被改到的段落，产出 (段落, 所在区域)。
+
+    区域：body（正文段落）、table（正文里的表格单元格）、header（页眉与页脚，
+    含其中的表格）。删除空白页不用它，只看正文，理由见 _apply_remove_blank_page。
+    """
+    for paragraph in doc.paragraphs:
+        yield paragraph, KIND_BODY
+    for table in doc.tables:
+        for paragraph in _iter_table_paragraphs(table):
+            yield paragraph, KIND_TABLE
+    for section in doc.sections:
+        for part in _header_footer_parts(section):
+            for paragraph in part.paragraphs:
+                yield paragraph, KIND_HEADER
+            for table in part.tables:
+                for paragraph in _iter_table_paragraphs(table):
+                    yield paragraph, KIND_HEADER
+
+
+def _outline_level(paragraph_properties) -> int | None:
+    """大纲级别 0-8 对应 1-9 级标题；9 是「正文文本」，不算标题。"""
+    if paragraph_properties is None:
+        return None
+    element = paragraph_properties.find(qn("w:outlineLvl"))
+    if element is None:
+        return None
+    raw = (element.get(qn("w:val")) or "").strip()
+    if not raw.isdigit():
+        return None
+    level = int(raw)
+    return level if 0 <= level <= 8 else None
+
+
+def is_heading_paragraph(paragraph) -> bool:
+    """标题类段落：字号字体由 typography.heading* 单独定义，不参与正文统一修改。"""
+    try:
+        style = paragraph.style
+    except KeyError:
+        # 样式定义被删掉、只剩 pStyle 引用的野段落：认不出标题就按正文处理，
+        # 不能因为一份脏 docx 让整个修复报 500
+        return False
+    name = (getattr(style, "name", "") or "").strip().lower()
+    if name.startswith(HEADING_STYLE_PREFIXES):
+        return True
+    # 自定义样式名看不出来，但大纲级别是 Word 自己认的标题层级
+    if _outline_level(getattr(paragraph._element, "pPr", None)) is not None:
+        return True
+    return _outline_level(getattr(getattr(style, "element", None), "pPr", None)) is not None
+
+
+def _iter_body_paragraphs(doc: Document):
+    """只要正文段落（doc.paragraphs），不包含表格与页眉页脚。"""
     return list(doc.paragraphs)
 
 
 def _apply_set_line_spacing(doc: Document, value: float) -> int:
     changed = 0
-    for paragraph in _iter_paragraphs(doc):
+    for paragraph, region in iter_text_paragraphs(doc):
+        if region == KIND_HEADER or is_heading_paragraph(paragraph):
+            # 页眉页脚与标题不套正文行距：前者是版面装饰，后者有自己的规范
+            continue
         paragraph.paragraph_format.line_spacing = value
         changed += 1
     return changed
@@ -178,7 +277,9 @@ def _apply_set_line_spacing(doc: Document, value: float) -> int:
 
 def _apply_set_font(doc: Document, cn: str, size: float) -> int:
     changed = 0
-    for paragraph in _iter_paragraphs(doc):
+    for paragraph, region in iter_text_paragraphs(doc):
+        if region == KIND_HEADER or is_heading_paragraph(paragraph):
+            continue
         for run in paragraph.runs:
             run.font.name = cn
             run.font.size = Pt(size)
@@ -199,6 +300,7 @@ def _has_graphic(paragraph) -> bool:
 # 表格造成的空页通常是某一行太高或被整行留空，按段落规则删行会连带删掉数据；
 # 页眉页脚里的空段落只会让页眉留白，不会生成新的纸页。要改这两处得先有可靠的
 # 「这行是纯装饰」判据，否则删错了学生拿到的是一份缺内容的文件。
+# （字号与行距是另一回事：那两条指令会走到表格与页眉页脚，见 iter_text_paragraphs）
 KIND_CONTENT = "content"
 KIND_SOFT_BREAK = "soft_break"
 KIND_PAGE_BREAK = "page_break"
@@ -255,7 +357,7 @@ def _apply_remove_blank_page(doc: Document) -> int:
     章节之间），把它当空白页删掉，看起来像排版，实际是把正文留白压平。
     含软换行的段落同理，不清除。
     """
-    paragraphs = _iter_paragraphs(doc)
+    paragraphs = _iter_body_paragraphs(doc)
     kinds = [_paragraph_kind(paragraph) for paragraph in paragraphs]
     remove = [False] * len(paragraphs)
 
@@ -310,7 +412,9 @@ def _replace_paragraph_text(paragraph, new_text: str) -> None:
 
 def _apply_fix_reference(doc: Document, original: str, new_text: str) -> bool:
     key = _normalize_text(original)
-    paragraphs = _iter_paragraphs(doc)
+    # 文献条目可能在正文、也可能在表格里（有些模版把参考文献做成表），
+    # 两处都要找；页眉页脚一并搜，匹不上自然不改
+    paragraphs = [paragraph for paragraph, _region in iter_text_paragraphs(doc)]
 
     if key:
         for paragraph in paragraphs:

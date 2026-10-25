@@ -61,6 +61,12 @@ def _permanent_error(exc: BaseException) -> BusinessError:
 
 _client: OpenAI | None = None
 _async_client: AsyncOpenAI | None = None
+# 懒加载必须加锁：首次被并发调用时，几个线程会同时看到 None，各建一个客户端，
+# 后建的把先建的覆盖掉。被覆盖的那个连接池没人关闭（AsyncOpenAI 还绑着事件循环），
+# 「第一次有人点体检」就成了一个稳定的连接泄漏点。
+# 锁只包住「创建」这一小段，模型请求一行都不在锁里，否则并发又被串回一条线。
+_client_lock = threading.Lock()
+_async_client_lock = threading.Lock()
 
 # 并发闸门：模型调用慢，必须限流，否则几十个人同时点体检会占满线程池，
 # 登录、下单这些快接口跟着排队。闸门大小随配置变化自动重建，改配置不用重启也行。
@@ -83,21 +89,31 @@ def is_configured() -> bool:
     return bool(settings.llm_api_key and settings.llm_api_key.strip())
 
 
+def _client_kwargs() -> dict[str, Any]:
+    """同步与异步客户端共用同一套参数，避免两处各写一遍后慢慢跑偏。"""
+    return {
+        "api_key": settings.llm_api_key,
+        "base_url": settings.llm_base_url,
+        "timeout": settings.llm_timeout_seconds,
+        # 关掉 SDK 自带重试：外层 _chat_with_retry 已经重试，两层叠加时
+        # 最坏 2×3×timeout 秒，模块承诺的「一次调用 60 秒内结束」直接作废
+        "max_retries": 0,
+    }
+
+
 def get_client() -> OpenAI:
     """懒加载 OpenAI 客户端（DeepSeek 完全兼容 OpenAI SDK）。"""
     global _client
     if not is_configured():
         raise BusinessError("服务端未配置 LLM_API_KEY，AI 功能暂不可用", code=50030)
-    if _client is None:
-        _client = OpenAI(
-            api_key=settings.llm_api_key,
-            base_url=settings.llm_base_url,
-            timeout=settings.llm_timeout_seconds,
-            # 关掉 SDK 自带重试：外层 _chat_with_retry 已经重试，两层叠加时
-            # 最坏 2×3×timeout 秒，模块承诺的「一次调用 60 秒内结束」直接作废
-            max_retries=0,
-        )
-    return _client
+    client = _client
+    if client is not None:
+        # 快路径不加锁：建好之后每次调用都走这里，不该为一把锁排一次队
+        return client
+    with _client_lock:
+        if _client is None:
+            _client = OpenAI(**_client_kwargs())
+        return _client
 
 
 def get_async_client() -> AsyncOpenAI:
@@ -105,15 +121,13 @@ def get_async_client() -> AsyncOpenAI:
     global _async_client
     if not is_configured():
         raise BusinessError("服务端未配置 LLM_API_KEY，AI 功能暂不可用", code=50030)
-    if _async_client is None:
-        _async_client = AsyncOpenAI(
-            api_key=settings.llm_api_key,
-            base_url=settings.llm_base_url,
-            timeout=settings.llm_timeout_seconds,
-            # 同上：重试只由 _chat_with_retry 统一控制
-            max_retries=0,
-        )
-    return _async_client
+    client = _async_client
+    if client is not None:
+        return client
+    with _async_client_lock:
+        if _async_client is None:
+            _async_client = AsyncOpenAI(**_client_kwargs())
+        return _async_client
 
 
 def _build_kwargs(

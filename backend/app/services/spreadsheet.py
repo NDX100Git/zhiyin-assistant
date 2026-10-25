@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 import pymupdf
@@ -34,19 +36,54 @@ from app.utils.exceptions import BusinessError
 
 logger = logging.getLogger(__name__)
 
-# 一条表格请求总共允许多久花在「归一版式 + 转换」上（见 settings 里的同名配置）。
-# 每放宽一次横向页数，就要重跑一轮转换，一次最长 SOFFICE_TIMEOUT_SECONDS（默认 180 秒），
-# 期间全程占住一个 AI 并发名额。按配置里的 max_width_pages（默认 4）逐页试，
-# 最差是四次串行＝十几分钟独占一个名额，排在他后面的人只会看到超时。
+# 一条表格请求允许花在「归一版式 + 转换」上的总时长（见 settings 里的同名配置）。
+# 每放宽一次横向页数，就要重跑一轮归一化 + 转换，期间全程占住一个 AI 并发名额。
 #
-# 收敛方式取**总耗时预算**，而不是拍一个固定次数：
-# - 真正吃容量的是时间，不是次数。小表放宽一页只要几秒，多试一次很便宜；
-#   大表一次就上百秒，第二次开始就是拿全站容量赌。
-# - 固定次数会让「小表只试两次」和「大表仍旧跑满」两件事同时发生：该省的地方
-#   省不下多少，该停的地方也没停。
-# 所以每次起转换之前先看已经花了多久：超预算就按当前这份出纸，并在体检报告里
-# 提示「列太多、打印后字偏小」，让用户自己拆表 —— 不拿全站容量去碰运气。
+# 光限次数不够，只限总时间也不够，两个都是硬约束：
+# - 次数：横向页数 1..max_width_pages（默认 4），到上限就按当前结果出纸；
+# - 时间：第一轮给满一次转换超时（不给连一份 PDF 都拿不出来），之后每一轮只能用
+#   「预算 - 已用」，剩余时间用尽就不再重试。于是最坏总耗时 = max(预算, 单次转换超时)，
+#   默认 240 秒。
+#
+# 为什么两轮都要把剩余时间交给转换层（见 render_deadline）：验收实测过「每次转换
+# 130 秒时仍跑 2 次、占用 260 秒」—— 因为此前只看「已用 ≥ 预算」才决定停不停，
+# 第二轮一旦开始就能跑满自己的 180 秒，预算形同虚设。真正吃容量的是时间，所以
+# 额度必须传到真正等待 soffice 的那一层，预算耗尽即杀进程、归还名额。
+# 超预算就按已有结果出纸，并在体检报告里写明「因超时按前一次结果出纸」，
+# 让用户自己拆表 —— 不拿全站容量去碰运气。
 RENDER_BUDGET_SECONDS_FALLBACK = 240.0
+# 单次转换的默认上限（settings.soffice_timeout_seconds 的兜底值）
+SINGLE_CONVERSION_SECONDS_FALLBACK = 180.0
+RENDER_TIMEOUT_NOTE = "因超时按前一次结果出纸"
+RENDER_FAILED_NOTE = "放宽横向页数时的转换失败，按前一次结果出纸"
+
+# 当前这次转换的截止时刻（monotonic）。用 ContextVar 而不是参数透传：转换函数
+# 在 doc_parser 里，签名被十几个调用方与测试替身共用，为了一次预算就改契约
+# 得不偿失；而 render_pdf 与转换在同一线程同一调用栈里跑，传递范围刚好够用。
+_render_deadline: ContextVar[float | None] = ContextVar(
+    "spreadsheet_render_deadline", default=None
+)
+
+
+@contextmanager
+def render_deadline(seconds: float | None):
+    """在 with 里跑的转换最多只能等 seconds 秒；None 表示不受表格预算约束。"""
+    if seconds is None:
+        yield
+        return
+    token = _render_deadline.set(time.monotonic() + max(0.0, seconds))
+    try:
+        yield
+    finally:
+        _render_deadline.reset(token)
+
+
+def remaining_render_seconds() -> float | None:
+    """这次转换还剩多少秒可用；不在表格渲染里（Word/PDF 转换）时返回 None。"""
+    deadline = _render_deadline.get()
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
 
 
 def _is_blank(value: object) -> bool:
@@ -196,34 +233,71 @@ def render_pdf(source: Path, work_dir: Path, convert, stats: dict | None = None)
     出纸等于白印。所以先按一页宽试，中位字号低于阈值就把横向页数放宽一页重来，
     直到字够大或到上限。首列会作为标签列重复，横向分页也不会丢行头。
 
-    stats 不为 None 时，把最终实际使用的横向页数、中位字号与各表空白区写进去；
-    体检规则据此判断「列太多字号过小」与「末尾大片空行空列」。
+    次数上限（max_width_pages）与总耗时上限（spreadsheet_render_budget_seconds）
+    都是硬约束：每一轮的等待额度交给转换层，预算用尽即停，按已有的那份出纸。
+
+    stats 不为 None 时，把最终实际使用的横向页数、中位字号、各表空白区，
+    以及是否因超时降级（render_truncated / render_note / 已用时间与次数）写进去；
+    体检规则据此判断「列太多字号过小」与「末尾大片空行空列」，
+    返回体里的 render_note 则直接告诉用户为什么没有继续放宽。
     """
     rules = get_spreadsheet_rules()
     min_pt = float(rules.get("min_readable_font_pt", 8.0))
     max_width = max(1, int(rules.get("max_width_pages", 4)))
     budget = max(0.0, float(getattr(settings, "spreadsheet_render_budget_seconds", RENDER_BUDGET_SECONDS_FALLBACK)))
+    single = max(
+        1.0, float(getattr(settings, "soffice_timeout_seconds", SINGLE_CONVERSION_SECONDS_FALLBACK))
+    )
     started = time.monotonic()
 
     pdf_path: Path | None = None
     attempt_stats: dict = {}
+    attempts = 0
+    note = ""
+
     for width_pages in range(1, max_width + 1):
-        # 第一轮总要跑（否则连一份 PDF 都拿不出来）；之后每一轮先看预算
-        if width_pages > 1 and time.monotonic() - started >= budget:
-            logger.warning(
-                "表格渲染已用掉 %.0f 秒预算（上限 %.0f 秒），不再放宽横向页数：%s",
-                time.monotonic() - started,
-                budget,
-                source.name,
-            )
-            break
+        if width_pages == 1:
+            # 第一轮必须跑满一次转换的时间：没有它连一份 PDF 都交不出来，
+            # 预算再紧也不能把它卡成半份
+            cap = max(budget, single)
+        else:
+            cap = budget - (time.monotonic() - started)
+            if cap <= 0:
+                logger.warning(
+                    "表格渲染已用掉 %.0f 秒预算（上限 %.0f 秒），不再放宽横向页数：%s",
+                    time.monotonic() - started,
+                    budget,
+                    source.name,
+                )
+                note = RENDER_TIMEOUT_NOTE
+                break
+
         attempt_dir = work_dir / f"fit{width_pages}"
         attempt_dir.mkdir(parents=True, exist_ok=True)
-        attempt_stats = {}
-        prepared = normalize_spreadsheet(
-            source, attempt_dir, fit_to_width=width_pages, stats=attempt_stats
-        )
-        pdf_path = convert(prepared, attempt_dir)
+        pending_stats: dict = {}
+        try:
+            # 归一化也算在这一轮的额度里：大表 load_workbook + save 本身就不便宜
+            with render_deadline(cap):
+                prepared = normalize_spreadsheet(
+                    source, attempt_dir, fit_to_width=width_pages, stats=pending_stats
+                )
+                produced = convert(prepared, attempt_dir)
+        except BusinessError as exc:
+            if pdf_path is None:
+                raise  # 第一轮就失败：手里没有任何结果，照旧报错
+            logger.warning(
+                "表格横向 %d 页重试失败（%s），按前一次结果出纸：%s",
+                width_pages,
+                exc.message,
+                source.name,
+            )
+            # 额度比单次转换超时更紧，说明是被预算卡死的；否则是转换自己失败
+            note = RENDER_TIMEOUT_NOTE if cap < single else RENDER_FAILED_NOTE
+            break
+
+        attempts = width_pages
+        pdf_path = produced
+        attempt_stats = pending_stats
         font_pt = _print_font_percentile(pdf_path)
         attempt_stats.update(
             {
@@ -239,17 +313,25 @@ def render_pdf(source: Path, work_dir: Path, convert, stats: dict | None = None)
                 width_pages,
                 font_pt or 0.0,
             )
-            if stats is not None:
-                stats.update(attempt_stats)
-            return pdf_path
+            break
         logger.info(
             "表格缩到横向 %d 页后中位字号只有 %.1f pt，低于 %.1f pt，放宽一页重试",
             width_pages,
             font_pt,
             min_pt,
         )
+    else:
+        logger.warning("表格横向已放宽到 %d 页仍偏小，按最大宽度出纸：%s", max_width, source.name)
 
-    logger.warning("表格横向已放宽到 %d 页仍偏小，按最大宽度出纸：%s", max_width, source.name)
+    if pdf_path is None:  # 只有 max_width < 1 这种配置错位才可能走到，兜底不返回 None
+        raise BusinessError("表格渲染失败，请稍后重试", code=50047)
+
+    attempt_stats["render_attempts"] = attempts
+    attempt_stats["render_elapsed_seconds"] = round(time.monotonic() - started, 2)
+    attempt_stats["render_budget_seconds"] = budget
+    if note:
+        attempt_stats["render_truncated"] = True
+        attempt_stats["render_note"] = note
     if stats is not None:
         stats.update(attempt_stats)
     return pdf_path
