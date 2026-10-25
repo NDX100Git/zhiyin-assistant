@@ -10,7 +10,7 @@ from __future__ import annotations
 import itertools
 from datetime import date, datetime, time
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.models.order import Order
 from app.models.queue_session import QueueSession
@@ -83,6 +83,24 @@ def test_已归零不再减(db_session):
 def test_时段行不存在时安全跳过(db_session):
     order = _order_row(db_session, moment=_at(14), took_slot=True)
     assert release_session_slot(db_session, order) is False
+
+
+def test_归还按订单创建时刻判定时段而不是当前时间(db_session, monkeypatch):
+    """下午时段下的单，深夜取消照样归还：依据是订单创建时刻，不是跑用例时几点。"""
+    frozen = _at(23, 30)  # 收单时段之外
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen
+
+    monkeypatch.setattr(session_service, "datetime", _FrozenDatetime)
+
+    row = _session_row(db_session, "pm", used=2)
+    order = _order_row(db_session, moment=_at(14), took_slot=True)
+    assert release_session_slot(db_session, order) is True
+    db_session.commit()
+    assert _used_now(db_session, row) == 1
 
 
 def test_非收单时段不动容量(db_session):
@@ -349,11 +367,13 @@ def test_容量5时取消满员期3单已用数仍是5(client, db_session, monke
 
 
 def test_占到名额的标记落在订单上(db_session):
-    """凭证落在 orders.slot_taken：占到=1，没占到=0，取消归还后清回 0。"""
-    from sqlalchemy import text
+    """凭证落在 orders.slot_taken：占到=1，没占到=0，取消归还后清回 0。
 
-    from app.models.order import Order
-
+    created_at 必须显式写成收单时段内：归还容量按**订单创建时刻**反推时段
+    （见 release_session_slot），不写就会取「当前时间」，用例于是只在 08:00-18:00
+    之间能过——凌晨、深夜跑全量时这一条会红。这里不冻结时钟而是把语义写进用例：
+    要紧的是「订单属于哪个时段」，不是「跑用例时几点」。
+    """
     row = _pm_row(db_session, capacity=1)
     row.used = 1  # 这单下单时自增过的那一格
     db_session.commit()
@@ -368,6 +388,7 @@ def test_占到名额的标记落在订单上(db_session):
         copies=1,
         paper_size="A4",
         amount_cents=15,
+        created_at=_at(14),
     )
     db_session.add(order)
     db_session.commit()
@@ -394,10 +415,6 @@ def test_占到名额的标记落在订单上(db_session):
 
 
 def test_没占到名额的订单不归还容量(db_session):
-    from datetime import datetime
-
-    from app.models.order import Order
-
     row = _pm_row(db_session, capacity=3)
     row.used = 2
     db_session.commit()
@@ -413,7 +430,7 @@ def test_没占到名额的订单不归还容量(db_session):
         copies=1,
         paper_size="A4",
         amount_cents=15,
-        created_at=datetime.combine(_TODAY, time(14, 0)),
+        created_at=_at(14),
     )
     db_session.add(order)
     db_session.commit()
