@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import logging
 import tempfile
+import threading
 from pathlib import Path
 
 from sqlalchemy.orm import Session
 
-from app.config import BACKEND_DIR
+from app.config import BACKEND_DIR, settings
 from app.models.user import User
 from app.services.file_service import record_generated_upload
 from app.services.storage import build_object_key, get_storage
@@ -78,17 +79,38 @@ def convert_pdf_to_docx(
 
 
 def pdf_to_docx_file(pdf_path: Path, docx_path: Path) -> Path:
-    """本地 PDF → docx（供格式转换接口与文档修复流程共用）。"""
-    try:
-        from pdf2docx import Converter
+    """本地 PDF → docx（供格式转换接口与文档修复流程共用）。
 
-        converter = Converter(str(pdf_path))
+    pdf2docx 是纯 Python 同步库，本身不带超时也不能取消，扫描件能跑几分钟。
+    这里放到独立线程里等，超时就返回业务错误——线程仍会自己跑完，但至少不会
+    把请求和 AI 并发槽位一直占住（槽位不释放，其他学生排队 20 秒就超时）。
+    """
+    timeout = max(1, int(settings.pdf2docx_timeout_seconds))
+    errors: list[BaseException] = []
+
+    def _work() -> None:
         try:
-            converter.convert(str(docx_path))
-        finally:
-            converter.close()
-    except Exception as exc:  # 转换失败统一转成业务错误，避免暴露底层栈
-        logger.exception("PDF 转 Word 失败：%s", pdf_path.name)
+            from pdf2docx import Converter
+
+            converter = Converter(str(pdf_path))
+            try:
+                converter.convert(str(docx_path))
+            finally:
+                converter.close()
+        except BaseException as exc:  # 线程里的异常不会自己冒泡，必须显式带出来
+            errors.append(exc)
+
+    worker = threading.Thread(target=_work, name="pdf2docx", daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        logger.error("PDF 转 Word 超时（%d 秒）：%s", timeout, pdf_path.name)
+        raise BusinessError(
+            f"PDF 转 Word 超时（超过 {timeout} 秒），请先把 PDF 拆小或压缩后再试", code=50043
+        )
+    if errors:
+        exc = errors[0]
+        logger.exception("PDF 转 Word 失败：%s", pdf_path.name, exc_info=exc)
         raise BusinessError("PDF 转 Word 失败，请确认文件未加密且未损坏", code=50043) from exc
 
     if not docx_path.exists() or docx_path.stat().st_size == 0:

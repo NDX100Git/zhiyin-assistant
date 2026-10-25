@@ -121,6 +121,9 @@ class Settings(BaseSettings):
     # 不提供盘符默认值：Windows 与 Linux 的安装位置不同，猜错了比没配更难查。
     soffice_path: str = ""
     soffice_timeout_seconds: int = 180
+    # PDF 转 Word（pdf2docx）在进程内跑，没有自己的超时。上限设在这里：
+    # 扫描件要跑几分钟，卡死时必须能失败返回，否则会一直占着 AI 并发槽位。
+    pdf2docx_timeout_seconds: int = 180
     # 同时最多几个转换进程。每次转换都新起一个 soffice，几十人同时上传时
     # 进程数与内存会把机器打满，所以超出上限的请求排队，排不到就返回 50046。
     soffice_max_concurrency: int = 2

@@ -55,6 +55,9 @@ def get_client() -> OpenAI:
             api_key=settings.llm_api_key,
             base_url=settings.llm_base_url,
             timeout=settings.llm_timeout_seconds,
+            # 关掉 SDK 自带重试：外层 _chat_with_retry 已经重试，两层叠加时
+            # 最坏 2×3×timeout 秒，模块承诺的「一次调用 60 秒内结束」直接作废
+            max_retries=0,
         )
     return _client
 
@@ -69,6 +72,8 @@ def get_async_client() -> AsyncOpenAI:
             api_key=settings.llm_api_key,
             base_url=settings.llm_base_url,
             timeout=settings.llm_timeout_seconds,
+            # 同上：重试只由 _chat_with_retry 统一控制
+            max_retries=0,
         )
     return _async_client
 

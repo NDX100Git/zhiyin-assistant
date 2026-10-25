@@ -195,6 +195,19 @@ def _has_graphic(paragraph) -> bool:
     )
 
 
+def _has_page_break(paragraph) -> bool:
+    """这一段是否真的含分页符。
+
+    只有 `w:type="page"` 才是分页；无 type 的 `<w:br/>` 是软换行（Shift+Enter）。
+    把软换行也当分页符，会让「删除空白页」把正文里的换行留白整片压平。
+    """
+    for br in paragraph._element.findall(f".//{qn('w:br')}"):
+        if (br.get(qn("w:type")) or "").strip().lower() == "page":
+            return True
+    # Word 另存的一种渲染标记，语义等同分页
+    return bool(paragraph._element.findall(f".//{qn('w:lastRenderedPageBreak')}"))
+
+
 def _apply_remove_blank_page(doc: Document) -> int:
     """删除空白页：连续空段落（保留第一个）与只含分页符的空段落。"""
     paragraphs = _iter_paragraphs(doc)
@@ -214,7 +227,7 @@ def _apply_remove_blank_page(doc: Document) -> int:
         ):
             run_end += 1
 
-        has_page_break = bool(paragraph._element.findall(f".//{qn('w:br')}"))
+        has_page_break = _has_page_break(paragraph)
         if run_end - index >= 2 or has_page_break:
             for target in paragraphs[index:run_end]:
                 target._element.getparent().remove(target._element)
@@ -256,11 +269,15 @@ def _apply_fix_reference(doc: Document, original: str, new_text: str) -> bool:
                 _replace_paragraph_text(paragraph, _with_reference_label(label, new_text))
                 return True
 
-    # 退化匹配：用原文前 12 个字符定位
+    # 退化匹配：原文被模型改写较多时，用前 12 个字符定位。
+    # 必须同时校验长度接近：只做包含匹配的话，「3.1 方法」会把同前缀的
+    # 「3.1 方法论及其局限……」整段替换掉。原文本身不足 12 字时不做退化，
+    # 那个前缀等于全文，上面已经精确扫过一遍。
     head = key[:12]
-    if head:
+    if len(key) >= 12:
         for paragraph in paragraphs:
-            if head and head in _normalize_text(paragraph.text):
+            candidate = _normalize_text(paragraph.text)
+            if head in candidate and abs(len(candidate) - len(key)) <= max(8, len(key) // 3):
                 label = _reference_label(paragraph.text, original)
                 _replace_paragraph_text(paragraph, _with_reference_label(label, new_text))
                 return True

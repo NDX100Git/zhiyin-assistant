@@ -10,9 +10,12 @@ PDF 用 PyMuPDF 提取：页数、每页文本、图片数量与位置尺寸、�
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import re
+import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -125,6 +128,38 @@ def _is_ascii_path(path: Path) -> bool:
         return False
 
 
+_fallback_temp_lock = threading.Lock()
+_fallback_temp_dir: Path | None = None
+
+
+def _drop_fallback_temp_dir() -> None:
+    """进程退出时清掉回退临时目录（失败不影响退出）。"""
+    global _fallback_temp_dir
+    with _fallback_temp_lock:
+        target, _fallback_temp_dir = _fallback_temp_dir, None
+    if target is not None:
+        shutil.rmtree(target, ignore_errors=True)
+
+
+atexit.register(_drop_fallback_temp_dir)
+
+
+def _shared_fallback_temp_dir() -> Path:
+    """进程级复用的回退临时目录。
+
+    用 mkdtemp 而不是 "zhiyin-lo-{pid}"：后者名字可预测，同机其他用户可以先建好
+    同路径目录并塞符号链接；mkdtemp 是随机名 + 0700 权限，且随进程退出清理。
+    """
+    global _fallback_temp_dir
+    with _fallback_temp_lock:
+        if _fallback_temp_dir is None or not _fallback_temp_dir.exists():
+            _fallback_temp_dir = Path(tempfile.mkdtemp(prefix="zhiyin-lo-"))
+            logger.warning(
+                "项目路径含非 ASCII 字符，LibreOffice 临时目录回退到 %s", _fallback_temp_dir
+            )
+        return _fallback_temp_dir
+
+
 def _subprocess_temp_dir(out_dir: Path) -> Path:
     """给 LibreOffice 子进程准备纯 ASCII 的临时目录。
 
@@ -136,11 +171,7 @@ def _subprocess_temp_dir(out_dir: Path) -> Path:
     if _is_ascii_path(candidate):
         candidate.mkdir(parents=True, exist_ok=True)
         return candidate
-
-    fallback = Path(tempfile.gettempdir()) / f"zhiyin-lo-{os.getpid()}"
-    fallback.mkdir(parents=True, exist_ok=True)
-    logger.warning("项目路径含非 ASCII 字符，LibreOffice 临时目录回退到 %s", fallback)
-    return fallback
+    return _shared_fallback_temp_dir()
 
 
 def _container_path(path: Path) -> str:
@@ -265,6 +296,35 @@ def conversion_slot():
     return _conversion_gate.slot()
 
 
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """杀掉转换进程及其派生进程，并等它真正退出。
+
+    soffice 会派生 soffice.bin 干活。只 kill 直接子进程时孙进程会留成孤儿，
+    继续吃 CPU 并锁住 profile 目录，下一单直接转不动；而且槽位在 kill 后立刻
+    归还，SOFFICE_MAX_CONCURRENCY 等于没限住。
+    """
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            proc.kill()
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        logger.warning("转换进程 %s 在超时后仍未退出", proc.pid)
+
+
 def _run_soffice(
     cmd: list[str], out_dir: Path, stdout_log: Path, stderr_log: Path
 ) -> None:
@@ -275,12 +335,19 @@ def _run_soffice(
     child_env["TMP"] = child_env["TEMP"] = str(_subprocess_temp_dir(out_dir))
     with stdout_log.open("wb") as stdout_fp, stderr_log.open("wb") as stderr_fp:
         proc = subprocess.Popen(
-            cmd, stdout=stdout_fp, stderr=stderr_fp, cwd=str(out_dir), env=child_env
+            cmd,
+            stdout=stdout_fp,
+            stderr=stderr_fp,
+            cwd=str(out_dir),
+            env=child_env,
+            # POSIX 下单独开会话，超时才敢按进程组整棵杀；否则 killpg 会连后端
+            # 自己的进程组一起打掉
+            start_new_session=(os.name != "nt"),
         )
         try:
             proc.wait(timeout=settings.soffice_timeout_seconds)
         except subprocess.TimeoutExpired as exc:
-            proc.kill()
+            _kill_process_tree(proc)
             raise BusinessError("文档转换超时，请稍后重试", code=50041) from exc
 
 
