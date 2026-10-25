@@ -53,6 +53,13 @@ export function warnOnPlatformConfig() {
   )
 }
 
+/**
+ * 本地存储键名：全端唯一来源。
+ *
+ * 页面与服务层一律用这里的常量，不许再手写字符串。
+ * 历史上「我的」页的昵称保存曾手写 'zhiyin_user'，与登录处的常量各存一份，
+ * 两边一旦改得不同步，重启后就读不到用户信息。
+ */
 export const STORAGE_KEYS = {
   token: 'zhiyin_token',
   user: 'zhiyin_user',

@@ -48,7 +48,7 @@
 
     <div class="page-card table-card">
       <div class="table-head">
-        <div>接单队列 <span class="muted">（每 5 秒自动刷新，确认换文件后该单排到队尾）</span></div>
+        <div>接单队列 <span class="muted">（每 5 秒自动刷新第一屏 {{ QUEUE_PAGE_SIZE_POLL }} 条；统计每 15 秒刷一次；超过第一屏请用搜索定位，确认换文件后该单排到队尾）</span></div>
         <div>
           <el-button
             type="warning"
@@ -523,6 +523,21 @@ const stats = reactive({
 const isMobile = useIsMobile()
 const orders = ref([])
 
+/**
+ * 轮询与拉取条数（本轮从「每 5 秒 × 200 条」收敛而来）。
+ *
+ * 旧实现每次轮询都同时拉统计与 200 条队列，柜台机开着一天就是两万多次请求，
+ * 而且每次都把整张 200 单的表叠回去。现在拆成三件事：
+ * - 队列：仍然 5 秒，但只拉当前视口能看到的条数（第一屏 60 单）；
+ *   有筛选/关键词时手动查询走全量 200 条，搜索不受影响。
+ * - 统计：每 3 次轮询（约 15 秒）拉一次；换文件、打印完成这类关键动作之后
+ *   仍然立即 refreshAll() 全量刷新，统计不会漏。
+ * - 页面隐藏时不轮询（原有行为不变）。
+ */
+const QUEUE_PAGE_SIZE_POLL = 60
+const QUEUE_PAGE_SIZE_FULL = 200
+const POLL_INTERVAL_MS = 5000
+const SUMMARY_POLL_TICKS = 3
 /** 桌面表格文件列最多显示几行，其余用「等 N 个文件」收口。 */
 const MAX_FILE_LINES = 3
 
@@ -673,10 +688,10 @@ async function loadSummary() {
   }
 }
 
-async function loadQueue() {
+async function loadQueue(pageSize = QUEUE_PAGE_SIZE_FULL) {
   loading.value = true
   try {
-    const params = { page: 1, page_size: 200 }
+    const params = { page: 1, page_size: pageSize }
     if (filters.status) params.status = filters.status
     if (filters.keyword) params.keyword = filters.keyword.trim()
     const data = await fetchQueue(params)
@@ -688,17 +703,24 @@ async function loadQueue() {
   }
 }
 
+/** 全量刷新：手点查询/刷新、以及每次改完订单后调，统计与队列一起拉最新。 */
 async function refreshAll() {
-  await Promise.all([loadSummary(), loadQueue()])
+  await Promise.all([loadSummary(), loadQueue(QUEUE_PAGE_SIZE_FULL)])
 }
+
+let pollTicks = 0
 
 function startPolling() {
   stopPolling()
+  pollTicks = 0
   timer = setInterval(() => {
-    if (!document.hidden) {
-      refreshAll()
-    }
-  }, 5000)
+    if (document.hidden) return
+    pollTicks += 1
+    // 有筛选/关键词时轮询也用全量：搜索结果被截断比多拉几条更难解释
+    const hasFilter = Boolean(filters.status || filters.keyword.trim())
+    loadQueue(hasFilter ? QUEUE_PAGE_SIZE_FULL : QUEUE_PAGE_SIZE_POLL)
+    if (pollTicks % SUMMARY_POLL_TICKS === 0) loadSummary()
+  }, POLL_INTERVAL_MS)
 }
 
 function stopPolling() {

@@ -247,13 +247,29 @@
         </view>
       </view>
       <text v-if="quoteError" class="quote-error">
-        服务端报价失败：{{ quoteError }}；上面显示的是上一次服务端算出的金额，改参数后会自动重试。
+        服务端报价失败：{{ quoteError }}；上面显示的是上一次服务端算出的金额，点下面「重新报价」或改参数都会重新请求。
       </text>
+      <!--
+        自动重试用完后的手动出口：不加这个按钮，用户只能改参数才能重新报价，
+        下单按钮会被一直禁用，看起来像「页面坏了」。
+      -->
+      <button
+        v-if="quoteError"
+        class="action retry-quote"
+        :disabled="quoting"
+        @click="retryQuote"
+      >
+        {{ quoting ? '重新报价中…' : '重新报价' }}
+      </button>
       <text class="plan-reason">{{ singleFile ? 'AI 建议理由' : '方案估算依据' }}：{{ plan.reason }}</text>
+      <!--
+        收费按文档页数算，这里只是「预计张数」，不能写成「省多少张」当收费承诺：
+        学生把省张数当成该收的钱，实际收费按页数算，对不上就会投诉。
+        金额仍只取服务端报价（quoteAmount），页面不乘单价。
+      -->
       <view v-if="singleFile" class="savings">
-        <text>纸张 {{ plan.original_sheets }} → {{ plan.sheets_needed }} 张</text>
-        <text class="green">省 {{ plan.saved_sheets }} 张</text>
-        <text class="money">预计 {{ formatMoney(quoteAmount) }}</text>
+        <text class="savings-tip">纸张 {{ plan.original_sheets }} → {{ plan.sheets_needed }} 张是预计张数，实际以老师确认为准</text>
+        <text class="money">服务端报价 {{ formatMoney(quoteAmount) }}</text>
       </view>
       <view v-else class="savings">
         <text>{{ files.length }} 个文件 · 文档 {{ docPages }} 页 · 打印 {{ printPages === null ? '—' : printPages }} 页</text>
@@ -467,6 +483,23 @@ async function refreshQuote(retry = 0) {
   } finally {
     if (seq === quoteSeq && !quoteTimer) quoting.value = false
   }
+}
+
+/**
+ * 手动重新报价。
+ *
+ * 自动重试 3 次用完后 quoteError 会一直留着，下单按钮随之永久禁用;
+ * 早期实现里用户只能改参数才能重新报价。这里给一个明确出口：
+ * 点一下立刻清掉错误（同时解锁下单按钮）并重新请求，失败会把错误写回来。
+ */
+async function retryQuote() {
+  if (quoting.value || !files.value.length) return
+  if (quoteTimer) {
+    clearTimeout(quoteTimer)
+    quoteTimer = null
+  }
+  quoteError.value = ''
+  await refreshQuote(0)
 }
 
 const severitySummary = computed(() => {
@@ -1395,6 +1428,16 @@ onUnmounted(() => {
   font-weight: 700;
   line-height: 1.6;
 }
+/* 手动重新报价：报价失败后唯一的出口，禁用时也不要看起来像主按钮 */
+.action.retry-quote {
+  width: 100%;
+  margin: 12rpx 0 0;
+  border-color: var(--zi-danger);
+  color: var(--zi-danger);
+}
+.action.retry-quote[disabled] {
+  opacity: 0.5;
+}
 /* 多文件时参数逐份设置，订单级只留版式 */
 .multi-tip {
   margin-top: 14rpx;
@@ -1421,9 +1464,10 @@ onUnmounted(() => {
   color: var(--zi-ink);
   font-size: 24rpx;
 }
-.savings .green {
-  color: var(--zi-ok);
-  font-weight: 700;
+/* 预计张数说明：一行读完，不再单独放大「省 N 张」 */
+.savings-tip {
+  flex: 1 1 auto;
+  line-height: 1.5;
 }
 .savings .money {
   color: var(--zi-ink);

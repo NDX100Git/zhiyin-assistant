@@ -1,5 +1,14 @@
 # 智印助手运行依赖（由本机 venv 的 pip freeze 锁定，部署只需安装本文件）
-# 验证环境：Windows + Python 3.14.7；代码兼容 Python 3.11+
+#
+# Python 版本要求：3.12+（与 backend/Dockerfile 的 FROM python:3.12-slim 一致）。
+#   1) 镜像里的事实：本文件是 pip freeze 的全量锁定，其中 numpy==2.5.4 声明
+#      requires_python>=3.12，装在 3.11 及以下会直接失败——这就是本套依赖对 Python 的下界；
+#   2) 3.12 是满足该下界、且 pydantic-core、pymupdf、cryptography、cffi、
+#      opencv-python-headless、argon2-cffi-bindings、jiter、lxml 都有 cp312/abi3
+#      预编译 wheel 的版本，镜像里不必装编译器；
+#   3) 3.13/3.14 也能装，但部分依赖只剩 abi3 wheel、个别包要源码编译，国内构建更易失败，
+#      因此不作为镜像基线（本机开发用 3.14 跑通过，但不要据此把下界写成 3.11）。
+# 早期本文件里写的「代码兼容 Python 3.11+」与实际依赖表自相矛盾，已改为统一 3.12+。
 
 fastapi==0.143.3
 starlette==1.8.0

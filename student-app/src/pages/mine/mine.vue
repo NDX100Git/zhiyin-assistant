@@ -91,7 +91,7 @@
 <script setup>
 import { onHide, onPullDownRefresh, onShow } from '@dcloudio/uni-app'
 import { computed, onUnmounted, ref } from 'vue'
-import { POLL_INTERVAL } from '@/config'
+import { POLL_INTERVAL, STORAGE_KEYS } from '@/config'
 import { request } from '@/services/api'
 import { ensureLogin, getCurrentUser } from '@/services/auth'
 import { createPoller, notify, notifyError } from '@/services/notify'
@@ -218,7 +218,9 @@ async function saveNickname() {
   saving.value = true
   try {
     const user = await request('/api/auth/profile', { method: 'POST', data: { nickname: value } })
-    uni.setStorageSync('zhiyin_user', user)
+    // 键名统一走 config/index.js 的常量：以前这里手写 'zhiyin_user'，
+    // 与 services/auth.js 用的常量各写一份，改键名时两边会不同步。
+    uni.setStorageSync(STORAGE_KEYS.user, user)
     notify('昵称已保存', 'success')
   } catch (error) {
     notifyError(error)
