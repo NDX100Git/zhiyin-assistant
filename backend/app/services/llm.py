@@ -2,7 +2,11 @@
 
 约定：所有 DeepSeek 调用收口到本模块，业务代码不得直接调用 SDK。
 API Key、base_url、模型名全部从环境变量读取（见 app.config.settings）。
-内置 3 次重试与 60 秒超时；简单任务不开思考模式，复杂任务开启。
+内置有限次重试与超时；简单任务不开思考模式，复杂任务开启。
+
+重试只对「等一会儿可能就好了」的失败生效：网络抖动、超时、5xx、限流。
+鉴权失败、参数不合法这类必然失败的错，重试只会把同一个错误再撞一遍，
+白等几十秒还多烧一次请求，所以按错误类型分流，一次就报错。
 """
 
 from __future__ import annotations
@@ -14,12 +18,46 @@ import re
 import threading
 from typing import Any
 
-from openai import AsyncOpenAI, OpenAI
+from openai import (
+    AsyncOpenAI,
+    AuthenticationError,
+    BadRequestError,
+    NotFoundError,
+    OpenAI,
+    PermissionDeniedError,
+)
 
 from app.config import settings
 from app.utils.exceptions import BusinessError
 
 logger = logging.getLogger(__name__)
+
+# 必然失败的状态码：改配置或改代码才会好，重试毫无意义
+PERMANENT_STATUS_CODES = frozenset({400, 401, 403, 404, 405, 409, 422})
+# 必然失败的异常类型（SDK 已按语义分好类，比只看状态码更稳）
+PERMANENT_ERROR_TYPES = (
+    AuthenticationError,
+    PermissionDeniedError,
+    BadRequestError,
+    NotFoundError,
+)
+
+
+def is_permanent_error(exc: BaseException) -> bool:
+    """这次失败重试也没用吗？鉴权、参数、模型不存在都属于这一类。"""
+    if isinstance(exc, PERMANENT_ERROR_TYPES):
+        return True
+    status = getattr(exc, "status_code", None)
+    return isinstance(status, int) and status in PERMANENT_STATUS_CODES
+
+
+def _permanent_error(exc: BaseException) -> BusinessError:
+    """把必然失败包装成对外错误：说清是配置问题，别让学生一直点重试。"""
+    status = getattr(exc, "status_code", None)
+    detail = f"（HTTP {status}）" if isinstance(status, int) else ""
+    return BusinessError(
+        f"AI 服务当前不可用{detail}，请联系管理员检查模型与密钥配置", code=50031
+    )
 
 _client: OpenAI | None = None
 _async_client: AsyncOpenAI | None = None
@@ -189,6 +227,9 @@ def _chat_with_retry(client: OpenAI, kwargs: dict[str, Any]) -> str:
             response = client.chat.completions.create(**kwargs)
             return response.choices[0].message.content or ""
         except Exception as exc:  # 需要把各类 SDK 异常统一成重试
+            if is_permanent_error(exc):
+                logger.error("模型调用失败且重试无效，直接报错：%s", exc)
+                raise _permanent_error(exc) from exc
             last_error = exc
             logger.warning("模型调用失败（第 %d/%d 次）：%s", attempt, attempts, exc)
 
@@ -273,7 +314,10 @@ async def achat(
             try:
                 response = await get_async_client().chat.completions.create(**kwargs)
                 return response.choices[0].message.content or ""
-            except Exception as exc:  # 统一重试
+            except Exception as exc:  # 统一重试，但必然失败的不重试
+                if is_permanent_error(exc):
+                    logger.error("异步模型调用失败且重试无效，直接报错：%s", exc)
+                    raise _permanent_error(exc) from exc
                 last_error = exc
                 logger.warning("异步模型调用失败（第 %d/%d 次）：%s", attempt, attempts, exc)
 

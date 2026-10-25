@@ -5,6 +5,12 @@
 铁律：所有接口先校验 file_key 归属（ensure_files_owned_by）。只要求「已登录」不够 ——
 任何人都能登录，拿到别人的 file_key 就能读论文内容；而 /convert 与 /fix 还会把
 生成的文件挂到自己名下，等于把别人的论文洗成自己的。
+
+两件容易踩的事：
+1. 报告缓存按账号隔离（产品口径：各账号各存一份，互不共用）。所以每个入口在跑任务前
+   都把当前用户绑到会话上（bind_report_owner），缓存读写据此带上账号维度。
+2. 慢活跑在 ai_pool 的线程里，用的仍是这个请求的数据库会话。客户端断开时请求会先
+   结束、会话随之关闭，线程却还在用 —— 见 ai_pool.run_ai_job 里屏蔽取消的做法。
 """
 
 from __future__ import annotations
@@ -25,6 +31,7 @@ from app.schemas.ai import (
 from app.services.ai_pool import ai_slot, run_ai_job
 from app.services.converter import convert_pdf_to_docx
 from app.services.doc_fixer import fix_document
+from app.services.doc_parser import bind_report_owner
 from app.services.file_service import ensure_files_owned_by
 from app.services.format_checker import check_format
 from app.services.ocr import ocr_image
@@ -49,6 +56,7 @@ async def ai_check(
     异步端点 + 专用线程池：模型慢的时候只占 AI 名额，不会挤掉登录与下单。
     """
     ensure_files_owned_by(db, user, [payload.file_key])
+    bind_report_owner(db, user.id)
     return ok(await run_ai_job(check_format, db, payload.file_key, force=payload.force))
 
 
@@ -60,6 +68,7 @@ def ai_proofread(
 ) -> dict:
     """立即返回 task_id；用 GET /api/ai/proofread/{task_id} 轮询进度与结果（不用 WebSocket）。"""
     ensure_files_owned_by(db, user, [payload.file_key])
+    bind_report_owner(db, user.id)
     return ok(start_proofread(payload.file_key, owner=str(user.id)))
 
 
@@ -78,6 +87,7 @@ async def ai_print_plan(
 ) -> dict:
     """模型给推荐方案与理由，纸张数与金额由服务端按 pricing.json 计算。"""
     ensure_files_owned_by(db, user, [payload.file_key])
+    bind_report_owner(db, user.id)
     options = payload.options.model_dump(exclude_none=True) if payload.options else {}
     return ok(await run_ai_job(plan_print, db, payload.file_key, options, force=payload.force))
 
@@ -91,6 +101,7 @@ async def ai_ocr(
 ) -> dict:
     """多模态模型识别图片文字，返回纯文本。"""
     ensure_files_owned_by(db, user, [payload.file_key])
+    bind_report_owner(db, user.id)
     return ok(await run_ai_job(ocr_image, db, payload.file_key, force=payload.force))
 
 
@@ -107,6 +118,7 @@ async def ai_convert(
     生成的文件记在当前用户名下，学生才能在「移除」时把对象一起删掉。
     """
     ensure_files_owned_by(db, user, [payload.file_key])
+    bind_report_owner(db, user.id)
     if payload.target.lower() != "docx":
         raise BusinessError("V1 只支持转换为 docx", code=40079)
     return ok(
@@ -128,6 +140,7 @@ async def ai_fix(
     修复副本同样记在当前用户名下，学生才能把它撤回。
     """
     ensure_files_owned_by(db, user, [payload.file_key])
+    bind_report_owner(db, user.id)
     return ok(
         await run_ai_job(
             fix_document,

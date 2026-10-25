@@ -595,3 +595,92 @@ def test_文件删除失败时报告跟着留着(db_session, fake_storage):
     assert stats.reports_deleted == 0
     assert key in fake_storage.objects
     assert _report_keys(db_session) == [key]
+
+
+# ---------------------------------------------------------------- 上传记录的僵尸行
+def _add_upload_record(db_session, file_key: str, user_id: int = 1):
+    record = UploadedFile(
+        user_id=user_id,
+        file_key=file_key,
+        file_name="僵尸.pdf",
+        size=1024,
+        content_type="application/pdf",
+    )
+    db_session.add(record)
+    db_session.flush()
+    return record
+
+
+def _record_exists(db_session, file_key: str) -> bool:
+    return (
+        db_session.execute(
+            select(UploadedFile).where(UploadedFile.file_key == file_key)
+        ).scalar_one_or_none()
+        is not None
+    )
+
+
+def test_对象已不在的上传记录被清掉(db_session, fake_storage):
+    """对象删掉了、上传记录还留着：下一轮永远扫不到它（对象已不在 list 结果里）。
+
+    学生点预览、下单会一直拿到 40053，而这一行会永久留在表里。所以每轮按上传记录
+    反查对象是否存在，缺失就把记录连同它的报告一起删。
+    """
+    key = "files/2026/02/zombie.pdf"
+    _add_upload_record(db_session, key)
+    _add_report(db_session, key, FRESH_AT)
+
+    stats = run_cleanup(db_session, fake_storage, now=NOW)
+
+    assert stats.records_deleted == 1
+    assert stats.reports_deleted == 1
+    assert not _record_exists(db_session, key)
+    assert _report_keys(db_session) == []
+
+
+def test_演练模式只统计不清僵尸记录(db_session, fake_storage):
+    key = "files/2026/02/zombie-dry.pdf"
+    _add_upload_record(db_session, key)
+
+    stats = run_cleanup(db_session, fake_storage, now=NOW, dry_run=True)
+
+    assert stats.records_deleted == 1
+    assert stats.dry_run is True
+    assert _record_exists(db_session, key)
+
+
+def test_列不出对象时不碰上传记录(db_session, fake_storage):
+    """列举对象失败时无法判断谁不在，删记录会把文件还在的上传记录删掉。"""
+    key = "files/2026/02/alive.pdf"
+    fake_storage.put(key, FRESH_AT)
+    _add_upload_record(db_session, key)
+    fake_storage.list_error = RuntimeError("对象存储不可用")
+
+    stats = run_cleanup(db_session, fake_storage, now=NOW)
+
+    assert stats.records_deleted == 0
+    assert _record_exists(db_session, key)
+
+
+def test_列举结果滞后但对象其实存在时不动记录(db_session, fake_storage, monkeypatch):
+    """列目录可能有延迟或前缀差异，删除前必须再问一次对象存储。"""
+    key = "files/2026/02/lagging.pdf"
+    fake_storage.put(key, FRESH_AT)
+    _add_upload_record(db_session, key)
+    monkeypatch.setattr(fake_storage, "list_objects", lambda prefix="": [])
+
+    stats = run_cleanup(db_session, fake_storage, now=NOW)
+
+    assert stats.records_deleted == 0
+    assert _record_exists(db_session, key)
+
+
+def test_对象还在的普通上传记录不受影响(db_session, fake_storage):
+    alive = "files/2026/02/alive-normal.pdf"
+    fake_storage.put(alive, FRESH_AT)
+    _add_upload_record(db_session, alive)
+
+    stats = run_cleanup(db_session, fake_storage, now=NOW)
+
+    assert stats.records_deleted == 0
+    assert _record_exists(db_session, alive)

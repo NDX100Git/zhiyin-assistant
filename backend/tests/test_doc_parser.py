@@ -213,3 +213,102 @@ def test_pptx经转换容器转换后可解析(db_session, test_storage, tmp_pat
     report = parse_document(db_session, key)
     assert report["source"]["converted_from"] == "pptx"
     assert report["page_count"] >= 1
+
+
+# ---------------------------------------------------------------- 章节定位
+def test_正文里提到参考文献不误判为章节标题():
+    """「本文的参考文献均按 GB/T 7714 著录」不是标题。
+
+    早期实现用全文 find：正文里出现这四个字就被当成章节，而且只取第一个匹配，
+    真正的标题反而看不到 —— 章节顺序、结构完整性、文献条目提取全被带偏。
+    """
+    text = (
+        "摘要\n本文研究论文格式自动检查方法。\n"
+        "本文的参考文献均按 GB/T 7714 著录，具体条目见文末。\n"
+        "第一章 绪论\n参考文献的排版也会影响查重结果。\n"
+        "参考文献\n[1] 张三. 题目[J]. 期刊, 2020, 12(3): 45-52.\n"
+    )
+
+    assert detect_sections(text) == ["摘要", "正文", "参考文献"]
+
+    items = extract_references(text)
+    assert [item["index"] for item in items] == [1]
+    assert "45-52" in items[0]["text"]
+
+
+def test_参考文献标题带冒号或英文时仍能识别():
+    for heading in ("参考文献：", "参考文献 References", "参考文献"):
+        text = f"摘要\n正文内容\n{heading}\n[1] 王五. 标题[J]. 期刊, 2021, 3(1): 1-9.\n"
+        assert "参考文献" in detect_sections(text), heading
+        assert [item["index"] for item in extract_references(text)] == [1], heading
+
+
+def test_正文里的编号列表不会被当成参考文献条目():
+    """正文里提到「参考文献」后紧跟 [1] 编号列表时，不能把正文列表当文献著录。"""
+    text = (
+        "摘要\n本文研究格式检查。\n"
+        "参考文献的取舍标准如下：[1] 只收公开发表的成果。\n"
+        "第一章 绪论\n内容\n"
+        "参考文献\n[1] 张三. 题目[J]. 期刊, 2020, 12(3): 45-52.\n"
+    )
+
+    items = extract_references(text)
+    assert len(items) == 1
+    assert items[0]["text"].startswith("张三")
+
+
+# ---------------------------------------------------------------- 转换子进程的环境变量
+def test_转换子进程只拿到最小环境变量(monkeypatch, tmp_path):
+    """后端环境里有数据库口令、JWT 密钥、模型 API Key，不能传给 LibreOffice。
+
+    LibreOffice 会派生一串子进程，转换的又是学生上传的任意文档；宏、扩展、
+    崩溃报告任何一处把环境打出来，密钥就跟着泄露。
+    """
+    from app.services import doc_parser
+
+    monkeypatch.setenv("DB_PASSWORD", "should-not-leak-db")
+    monkeypatch.setenv("JWT_SECRET", "should-not-leak-jwt")
+    monkeypatch.setenv("LLM_API_KEY", "sk-should-not-leak-llm")
+
+    out_dir = tmp_path / "work"
+    out_dir.mkdir()
+    env = doc_parser._child_env(out_dir)
+
+    assert "DB_PASSWORD" not in env
+    assert "JWT_SECRET" not in env
+    assert "LLM_API_KEY" not in env
+    leaked = " ".join(env.values())
+    for secret in ("should-not-leak-db", "should-not-leak-jwt", "sk-should-not-leak-llm"):
+        assert secret not in leaked
+
+    # 跑起来需要的变量还在
+    assert env.get("PATH")
+    assert env["TMP"] == env["TEMP"]
+    assert Path(env["TMP"]).is_dir()
+
+
+def test_启动转换进程时传的是白名单环境(monkeypatch, tmp_path):
+    from app.services import doc_parser
+
+    captured: dict = {}
+
+    class _FakeProc:
+        pid = 4242
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(cmd, **kwargs):
+        captured.update(kwargs)
+        return _FakeProc()
+
+    monkeypatch.setattr(doc_parser.subprocess, "Popen", fake_popen)
+    monkeypatch.setenv("DB_PASSWORD", "should-not-leak-db")
+
+    out_dir = tmp_path / "w"
+    out_dir.mkdir()
+    doc_parser._run_soffice(["true"], out_dir, out_dir / "o.log", out_dir / "e.log")
+
+    assert "DB_PASSWORD" not in captured["env"]
+    assert "should-not-leak-db" not in " ".join(captured["env"].values())
+    assert captured["env"]["TMP"] == captured["env"]["TEMP"]

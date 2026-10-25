@@ -133,6 +133,11 @@ class Settings(BaseSettings):
     # 填容器名即走 docker exec，容器内把后端的 runtime 目录挂成 soffice_container_dir。
     soffice_container: str = ""
     soffice_container_dir: str = "/workspace/runtime"
+    # 表格渲染（归一版式 + LibreOffice 转换）一条请求的总耗时预算，单位秒。
+    # 字太小会逐页放宽重试，每次重试都要重新转换一次，单次最长 soffice_timeout_seconds。
+    # 不设预算时最差四次串行＝十几分钟一直占住一个 AI 并发名额，后面排队的人只会超时。
+    # 超预算就按当前结果出纸，并在体检报告里提示列太多、字号偏小。
+    spreadsheet_render_budget_seconds: float = 240.0
 
     # 可扩展点：V1 用简化实现，V2 换实现只改环境变量
     auth_provider: str = "device"  # device | wechat | cas

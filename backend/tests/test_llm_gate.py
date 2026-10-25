@@ -257,3 +257,108 @@ def test_取消排队中的异步调用不占死名额(monkeypatch) -> None:
         return await llm.achat(_messages())  # 名额已归还，这里必须成功
 
     assert asyncio.run(scenario()) == "好的"
+
+
+# ---------------------------------------------------------------- 必然失败的错误不重试
+_STATUS_TO_ERROR = {
+    400: "BadRequestError",
+    401: "AuthenticationError",
+    403: "PermissionDeniedError",
+    404: "NotFoundError",
+    422: "UnprocessableEntityError",
+}
+
+
+def _api_error(status: int) -> Exception:
+    """构造一个和真实 SDK 一样带 status_code 的异常，不真的发请求。"""
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "https://api.deepseek.com/chat/completions")
+    response = httpx.Response(status, request=request)
+    error_class = getattr(openai, _STATUS_TO_ERROR.get(status, "APIStatusError"))
+    return error_class("模拟必然失败", response=response, body=None)
+
+
+class _FailingCompletions:
+    """每次都抛指定异常，记录被调用了几次。"""
+
+    def __init__(self, error_factory) -> None:
+        self.error_factory = error_factory
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def create(self, **kwargs):
+        with self._lock:
+            self.calls += 1
+        raise self.error_factory()
+
+
+class _FailingAsyncCompletions(_FailingCompletions):
+    async def create(self, **kwargs):
+        with self._lock:
+            self.calls += 1
+        raise self.error_factory()
+
+
+@pytest.mark.parametrize("status", sorted(_STATUS_TO_ERROR))
+def test_必然失败的错误只调用一次(monkeypatch, status: int) -> None:
+    """鉴权失败、参数错误、模型不存在这类错，重试只会把同一个错再撞一遍。"""
+    completions = _FailingCompletions(lambda: _api_error(status))
+    monkeypatch.setattr(llm, "get_client", lambda: _FakeClient(completions))
+    monkeypatch.setattr(settings, "llm_max_attempts", 3)
+
+    with pytest.raises(BusinessError) as excinfo:
+        llm.chat(_messages())
+
+    assert completions.calls == 1, f"HTTP {status} 不该重试"
+    assert excinfo.value.code == 50031
+    assert "配置" in excinfo.value.message
+
+
+def test_服务端错误仍然按配置次数重试(monkeypatch) -> None:
+    """500 这类「等会儿可能就好」的失败该重试，别把临时故障当永久故障。"""
+    completions = _FailingCompletions(lambda: _api_error(500))
+    monkeypatch.setattr(llm, "get_client", lambda: _FakeClient(completions))
+    monkeypatch.setattr(settings, "llm_max_attempts", 3)
+
+    with pytest.raises(BusinessError):
+        llm.chat(_messages())
+
+    assert completions.calls == 3
+
+
+def test_鉴权失败一次就报错且提示配置(monkeypatch) -> None:
+    completions = _FailingCompletions(lambda: _api_error(401))
+    monkeypatch.setattr(llm, "get_client", lambda: _FakeClient(completions))
+    monkeypatch.setattr(settings, "llm_max_attempts", 5)
+
+    with pytest.raises(BusinessError) as excinfo:
+        llm.chat(_messages())
+
+    assert completions.calls == 1
+    assert "HTTP 401" in excinfo.value.message
+
+
+def test_异步调用同样不重试必然失败(monkeypatch) -> None:
+    completions = _FailingAsyncCompletions(lambda: _api_error(401))
+    monkeypatch.setattr(llm, "get_async_client", lambda: _FakeAsyncClient(completions))
+    monkeypatch.setattr(llm, "is_configured", lambda: True)
+    monkeypatch.setattr(settings, "llm_max_attempts", 3)
+    monkeypatch.setattr(settings, "llm_max_concurrency", 2)
+    monkeypatch.setattr(settings, "llm_queue_wait_seconds", 2.0)
+
+    async def scenario() -> None:
+        with pytest.raises(BusinessError) as excinfo:
+            await llm.achat(_messages())
+        assert excinfo.value.code == 50031
+
+    asyncio.run(scenario())
+    assert completions.calls == 1
+
+
+def test_可重试与不可重试的分流规则() -> None:
+    assert llm.is_permanent_error(_api_error(401)) is True
+    assert llm.is_permanent_error(_api_error(400)) is True
+    assert llm.is_permanent_error(_api_error(500)) is False
+    assert llm.is_permanent_error(RuntimeError("网络抖动")) is False

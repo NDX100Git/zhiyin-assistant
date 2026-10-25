@@ -195,46 +195,96 @@ def _has_graphic(paragraph) -> bool:
     )
 
 
+# 「删除空白页」只处理正文段落（doc.paragraphs）。表格与页眉页脚故意不动：
+# 表格造成的空页通常是某一行太高或被整行留空，按段落规则删行会连带删掉数据；
+# 页眉页脚里的空段落只会让页眉留白，不会生成新的纸页。要改这两处得先有可靠的
+# 「这行是纯装饰」判据，否则删错了学生拿到的是一份缺内容的文件。
+KIND_CONTENT = "content"
+KIND_SOFT_BREAK = "soft_break"
+KIND_PAGE_BREAK = "page_break"
+KIND_BLANK = "blank"
+
+
+def _break_types(paragraph) -> list[str]:
+    """段落里所有换行符的类型（小写），没有就是空列表。"""
+    return [(br.get(qn("w:type")) or "").strip().lower() for br in paragraph._element.findall(f".//{qn('w:br')}")]
+
+
 def _has_page_break(paragraph) -> bool:
     """这一段是否真的含分页符。
 
     只有 `w:type="page"` 才是分页；无 type 的 `<w:br/>` 是软换行（Shift+Enter）。
     把软换行也当分页符，会让「删除空白页」把正文里的换行留白整片压平。
     """
-    for br in paragraph._element.findall(f".//{qn('w:br')}"):
-        if (br.get(qn("w:type")) or "").strip().lower() == "page":
-            return True
+    if "page" in _break_types(paragraph):
+        return True
     # Word 另存的一种渲染标记，语义等同分页
     return bool(paragraph._element.findall(f".//{qn('w:lastRenderedPageBreak')}"))
 
 
+def _paragraph_kind(paragraph) -> str:
+    """给段落分类，决定「删除空白页」能不能动它。
+
+    - content：有文字、图片或表格，任何情况都不动
+    - soft_break：只含软换行（Shift+Enter）。看起来是空行，但它是正文排版里的
+      换行留白，清掉就把正文压平了，所以与普通正文同等对待
+    - page_break：只含分页符，本身不算空白（删它会把两章并到一页上）
+    - blank：真正什么都没有
+    """
+    if paragraph.text.strip() or _has_graphic(paragraph) or paragraph._element.findall(
+        f".//{qn('w:tbl')}"
+    ):
+        return KIND_CONTENT
+    breaks = _break_types(paragraph)
+    if _has_page_break(paragraph):
+        return KIND_PAGE_BREAK
+    if breaks:
+        return KIND_SOFT_BREAK
+    return KIND_BLANK
+
+
 def _apply_remove_blank_page(doc: Document) -> int:
-    """删除空白页：连续空段落（保留第一个）与只含分页符的空段落。"""
+    """删除空白页。
+
+    只删真正会多出一张纸的那几种空段落，不再「连续两个空段落就压平」：
+    - 分页符之后的连续空段落：这才是标准的空白页；
+    - 连续的多余分页符：两个分页符之间没有内容，后一个把空白页挤了出来；
+    - 文末的空段落与分页符：文档末尾多出来的那一页。
+
+    正文中间的连续空段落一律保留：那是作者自己留的段落间距（图表与正文之间、
+    章节之间），把它当空白页删掉，看起来像排版，实际是把正文留白压平。
+    含软换行的段落同理，不清除。
+    """
     paragraphs = _iter_paragraphs(doc)
-    removed = 0
-    index = 0
-    while index < len(paragraphs):
-        paragraph = paragraphs[index]
-        if paragraph.text.strip() or _has_graphic(paragraph):
-            index += 1
+    kinds = [_paragraph_kind(paragraph) for paragraph in paragraphs]
+    remove = [False] * len(paragraphs)
+
+    # 文末：空段落与末尾分页符都只会多出一张空白页
+    tail = len(paragraphs) - 1
+    while tail >= 0 and kinds[tail] in (KIND_BLANK, KIND_PAGE_BREAK):
+        remove[tail] = True
+        tail -= 1
+
+    # 分页符之后、下一段内容之前的空段落
+    for index, kind in enumerate(kinds):
+        if kind != KIND_PAGE_BREAK:
             continue
+        cursor = index + 1
+        while cursor < len(kinds) and kinds[cursor] == KIND_BLANK:
+            remove[cursor] = True
+            cursor += 1
+        # 两个分页符紧挨着：中间什么都没有，后一个是多余的
+        if cursor < len(kinds) and kinds[cursor] == KIND_PAGE_BREAK:
+            remove[cursor] = True
 
-        run_end = index
-        while (
-            run_end < len(paragraphs)
-            and not paragraphs[run_end].text.strip()
-            and not _has_graphic(paragraphs[run_end])
-        ):
-            run_end += 1
-
-        has_page_break = _has_page_break(paragraph)
-        if run_end - index >= 2 or has_page_break:
-            for target in paragraphs[index:run_end]:
-                target._element.getparent().remove(target._element)
-                removed += 1
-            index = run_end
-        else:
-            index += 1
+    removed = 0
+    for index, paragraph in enumerate(paragraphs):
+        if not remove[index]:
+            continue
+        parent = paragraph._element.getparent()
+        if parent is not None:
+            parent.remove(paragraph._element)
+            removed += 1
     return removed
 
 
