@@ -49,7 +49,7 @@
     <div class="page-card table-card">
       <div class="table-head">
         <div>
-          接单队列 <span class="muted">（每 5 秒自动刷新，不会把你点「加载更多」多显示的单缩回第一屏，当前显示 {{ orders.length }} 单；统计每 15 秒刷一次；勾选的行与滚动位置保留；确认换文件后该单排到队尾；找某单请用搜索）</span>
+          接单队列 <span class="muted">（每 5 秒自动刷新；点过「加载更多」多显示的单不会缩回第一屏——点开始打印、打印完成、核销这些订单动作之后也不会，当前显示 {{ orders.length }} 单；统计每 15 秒刷一次；勾选的行与滚动位置保留；确认换文件后该单排到队尾；找某单请用搜索）</span>
           <!-- 队列有单没显示时必须让老师知道“下面还有单”，不能默默截断。
                封顶 200 条之后再说「点加载更多」就是骗人：按钮已经拉不出来，要说清楚
                现在看到的是前 200 单，剩下的只能用搜索精确定位。 -->
@@ -620,7 +620,7 @@ const orders = ref([])
  * - 队列：仍然 5 秒，但只拉当前视口能看到的条数（第一屏 60 单）；
  *   有筛选/关键词时手动查询走全量 200 条，搜索不受影响。
  * - 统计：每 3 次轮询（约 15 秒）拉一次；换文件、打印完成这类关键动作之后
- *   仍然立即 refreshAll() 全量刷新，统计不会漏。
+ *   仍然立即刷新队列与统计，统计不会漏。
  * - 页面隐藏时不轮询（原有行为不变）。
  *
  * 只拉一屏就必须把“没拉完”说出去：队列末尾写上当前显示多少单、还有多少单没显示，
@@ -632,6 +632,10 @@ const orders = ref([])
  * - 轮询按「已加载条数」拉（60 + queueExtra，封顶 200），条数不缩水；
  * - 轮询走 mergeOrders()：按订单 id 原地合并更新，不整体替换列表——行对象引用不变，
  *   el-table 就不会重建行，滚动位置不跳；勾选由 restoreQueueSelection() 按 id 放回去；
+ * - **订单动作之后的刷新也不清零增量**（refreshAfterAction()）：点一次「开始打印」/
+ *   「打印完成」就回到第一屏的旧行为更隐蔽——动作那一瞬看着还是 120 条（动作后拉的是
+ *   200 条），下一拍轮询才缩回 60 条，老师几乎必然撞上。所以动作后按「已经显示的条数」
+ *   重拉，增量留在 queueExtra 里，下一页轮询也是同一个数；
  * - 老师手点「查询」/「刷新」是“重新查一遍”，清零增量并按后端单页拉（既有行为）。
  */
 const QUEUE_PAGE_SIZE_POLL = 60
@@ -833,6 +837,17 @@ function queuePageSize() {
 }
 
 /**
+ * 订单动作之后该拉多少条：不低于「已经显示在屏上的条数」。
+ *
+ * queuePageSize() 是「轮询口径」（60 + 增量），这里再多看一眼当前列表长度：手点
+ * 「刷新」会一次拉满 200 条，紧接着做个动作不该在动作这一瞬缩回 60 条（缩到第一屏的
+ * 时机只有一个——下一拍轮询，那是既有行为）。两者取大，封顶后端单页上限。
+ */
+function queuePageSizeAfterAction() {
+  return Math.min(Math.max(queuePageSize(), orders.value.length), QUEUE_PAGE_SIZE_MAX)
+}
+
+/**
  * 把新拉到的队列按订单 id 合并进现有列表，不整体替换。
  *
  * 已经显示过的行原地更新字段：行对象引用不变，el-table（row-key=id）不会重建这一行，
@@ -908,11 +923,27 @@ async function loadMoreQueue() {
   await loadQueue(queuePageSize())
 }
 
-/** 全量刷新：手点查询/刷新、以及每次改完订单后调，统计与队列一起拉最新。 */
+/** 全量刷新：手点查询/刷新、以及页面重新可见时调，统计与队列一起拉最新。 */
 async function refreshAll() {
   // 条件变了或重新查询时别把上一轮的“加载更多”带到新结果上
   queueExtra.value = 0
   await Promise.all([loadSummary(), loadQueue(QUEUE_PAGE_SIZE_FULL)])
+}
+
+/**
+ * 订单动作之后刷新队列与统计（开始打印、打印完成、核销、确认换文件、标记异常…）。
+ *
+ * 与 refreshAll() 只差一件事：**不清零「加载更多」的增量**。
+ * 旧实现在这里调 refreshAll()，增量被清零，动作那一瞬按 200 条拉看起来还好，
+ * 下一拍轮询按 60 条拉，列表当场缩回第一屏——页头写着不会缩回，行为却缩回了。
+ * 现在按「已经显示多少条就拉多少条」去拉，并用 merge 原地合并：条数不缩水，
+ * 勾选与滚动位置也一并保住（老师刚点完一个动作，正看着的那一行不该跳走）。
+ */
+async function refreshAfterAction() {
+  await Promise.all([
+    loadSummary(),
+    loadQueue(queuePageSizeAfterAction(), { merge: true }),
+  ])
 }
 
 let pollTicks = 0
@@ -980,7 +1011,7 @@ async function downloadOne(row, file) {
     await confirmFileSeen(row.id)
     markRowSeen(row)
     ElMessage.success('已确认看到新文件')
-    await refreshAll()
+    await refreshAfterAction()
   } catch (error) {
     /* 拦截器已提示 */
   }
@@ -1020,7 +1051,7 @@ async function markSeen(row) {
     await confirmFileSeen(row.id)
     markRowSeen(row)
     ElMessage.success('已确认看到新文件')
-    await refreshAll()
+    await refreshAfterAction()
   } catch (error) {
     /* 拦截器已提示 */
   }
@@ -1050,7 +1081,7 @@ async function start(row) {
     }
     await startPrint(row.id)
     ElMessage.success('已开始打印')
-    await refreshAll()
+    await refreshAfterAction()
     return
   }
   await ElMessageBox.confirm(`确认开始打印订单 ${row.order_no}？`, '开始打印', {
@@ -1059,7 +1090,7 @@ async function start(row) {
   })
   await startPrint(row.id)
   ElMessage.success('已开始打印')
-  refreshAll()
+  refreshAfterAction()
 }
 
 async function openComplete(row) {
@@ -1092,7 +1123,7 @@ async function submitComplete() {
         : `已完成，金额 ${yuan(result.amount_cents)}`,
     )
     completeDialog.visible = false
-    refreshAll()
+    refreshAfterAction()
   } finally {
     completeDialog.loading = false
   }
@@ -1112,7 +1143,7 @@ async function submitVerify() {
       result.collected_onsite ? '已核销，并完成现场收款' : '已核销，订单完成',
     )
     verifyDialog.visible = false
-    refreshAll()
+    refreshAfterAction()
   } finally {
     verifyDialog.loading = false
   }
@@ -1130,7 +1161,7 @@ async function submitVerifyCode() {
       : `已核销 ${result.order.order_no}`,
   )
   verifyCodeValue.value = ''
-  refreshAll()
+  refreshAfterAction()
 }
 
 function openAbnormal(row) {
@@ -1146,7 +1177,7 @@ async function submitAbnormal() {
     await markAbnormal(abnormalDialog.order.id, abnormalDialog.reason)
     ElMessage.success('已标记异常')
     abnormalDialog.visible = false
-    refreshAll()
+    refreshAfterAction()
   } finally {
     abnormalDialog.loading = false
   }
@@ -1158,7 +1189,7 @@ async function recover(row) {  await ElMessageBox.confirm('确认异常已处理
   })
   await recoverOrder(row.id)
   ElMessage.success('已恢复排队')
-  refreshAll()
+  refreshAfterAction()
 }
 
 /**
@@ -1202,7 +1233,7 @@ async function submitCancelAbnormal() {
       amount > 0 ? `已关闭异常单，已退款 ${yuan(amount)}` : '已关闭异常单，未收款无需退款',
     )
     cancelDialog.visible = false
-    await refreshAll()
+    await refreshAfterAction()
   } catch (error) {
     // 后端 40061/40062/40906 都在这里兜底显示成中文（40062 可能来自真实已收）
     cancelDialog.error = error.message || '关闭异常单失败，请稍后重试'
@@ -1244,7 +1275,7 @@ async function submitFileChange(approve) {
     }
     fileChangeDialog.visible = false
     // 通过后该单会出现在队尾，重新拉队列与统计
-    await refreshAll()
+    await refreshAfterAction()
   } finally {
     fileChangeDialog.loading = false
   }
@@ -1259,7 +1290,7 @@ async function submitBatchComplete() {
   )
   const result = await batchComplete(selected.value.map((item) => item.id))
   ElMessage.success(`完成 ${result.succeeded.length} 单，失败 ${result.failed.length} 单`)
-  refreshAll()
+  refreshAfterAction()
 }
 
 </script>
