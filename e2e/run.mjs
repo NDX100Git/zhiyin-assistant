@@ -501,6 +501,8 @@ const QUEUE_PAGE_SIZE_MAX = 200
 const QUEUE_PAGE_SIZE_POLL = 60
 /** 「加载更多」每次多要的条数（DashboardView.vue 的 QUEUE_LOAD_MORE_STEP）。 */
 const QUEUE_LOAD_MORE_STEP = 60
+/** 第 43 步用来做「订单动作」的假单：cloneQueueItems() 造的第 1 条订单号。 */
+const FAKE_ACTION_ORDER_NO = 'FAKE0001'
 
 /**
  * 同一帧里读全「页面列出来多少单」与「页面对隐藏了多少单的说法」。
@@ -590,6 +592,22 @@ async function waitQueueRows(page, min, timeout = 15000) {
   return snapshot
 }
 
+/**
+ * 等到页面正好列出 count 单（不是「至少」：多一条少一条都算没对上）。
+ *
+ * 「加载更多之后条数不缩水」不能只看「至少 120」：页面改回按旧口径拉满 200 条时，
+ * 假数据会返回 150 条，「至少 120」会把这种错误状态判成通过。
+ */
+async function waitQueueRowsExactly(page, count, timeout = 15000) {
+  const deadline = Date.now() + timeout
+  let snapshot = await readQueueSnapshot(page)
+  while (snapshot.rows !== count && Date.now() < deadline) {
+    await sleep(200)
+    snapshot = await readQueueSnapshot(page)
+  }
+  return snapshot
+}
+
 /** 桌面表格里当前勾选着哪些行（按订单号读，跨轮询比对用）。 */
 async function readQueueCheckedRows(page) {
   return page.evaluate((rowSelector) => {
@@ -638,10 +656,22 @@ async function checkFirstQueueRow(page) {
  * 否则测到的只是「一份固定 60 条的假数据」。
  * `records` 按顺序记下页面真实请求过的 `page_size`，后面的断言全靠这份记录：
  * 「点过加载更多之后，下一拍轮询按多少条拉」就是要看请求参数，而不是看页面文案。
+ *
+ * `fakeActionPattern` 用来连「订单动作」的 POST 一起伪造成功：假单的 id 是 fake-N，
+ * 真后端里没有这些单，不伪造的话点「开始打印」只会报错、页面压根不会刷新，
+ * 想测的「动作之后那条刷新按多少条拉」就永远测不到。
+ * `actions` 记录这些动作请求，并在每次命中时存下当时已经发过多少条队列请求
+ * （`recordsAt`）：动作之后的那条刷新就在 `recordsAt` 之后，不会与恰好撞上的轮询混淆。
  */
-async function openFakeQueue(page, buildData) {
+async function openFakeQueue(page, buildData, { fakeActionPattern = null } = {}) {
   const records = []
+  const actions = []
   await page.setRequestInterception(true)
+  const corsHeaders = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': '*',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+  }
   const handler = (request) => {
     const url = request.url()
     if (request.method() === 'GET' && url.includes('/api/admin/queue')) {
@@ -651,12 +681,18 @@ async function openFakeQueue(page, buildData) {
         status: 200,
         contentType: 'application/json',
         // 页面与接口不同源，不带 CORS 头浏览器会直接拦掉，测到的就只是网络错误
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Headers': '*',
-          'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-        },
+        headers: corsHeaders,
         body: JSON.stringify({ code: 0, message: 'ok', data: buildData(pageSize) }),
+      })
+      return
+    }
+    if (fakeActionPattern && request.method() === 'POST' && fakeActionPattern.test(url)) {
+      actions.push({ url, recordsAt: records.length })
+      request.respond({
+        status: 200,
+        contentType: 'application/json',
+        headers: corsHeaders,
+        body: JSON.stringify({ code: 0, message: 'ok', data: {} }),
       })
       return
     }
@@ -665,6 +701,7 @@ async function openFakeQueue(page, buildData) {
   page.on('request', handler)
   return {
     records,
+    actions,
     async close() {
       page.off('request', handler)
       await page.setRequestInterception(false)
@@ -2911,13 +2948,16 @@ async function runPriceAndRefundPhase({ student, teacher, viewport, step }) {
 
   // ---- 7. 点过「加载更多」之后，自动刷新必须保留已加载条数
   await step('队列：点过「加载更多」后，自动刷新保留已加载条数（不缩回第一屏）', async () => {
-    // 老板已拍板：老师按 120 条在看某一单，下一拍 5 秒轮询不能把列表缩回 60 条。
-    // 页头文案与实际行为必须同一个口径，先锁文案。
+    // 老板已拍板：老师按 120 条在看某一单，下一拍 5 秒轮询不能把列表缩回 60 条；
+    // 中间做个订单动作（开始打印、打印完成…）也不行。页头文案与实际行为必须同一个口径，先锁文案。
     const headerText = await teacher.evaluate(() => document.body.innerText || '')
-    if (!headerText.includes('不会把你点「加载更多」多显示的单缩回第一屏')) {
+    if (!headerText.includes('点过「加载更多」多显示的单不会缩回第一屏')) {
       throw new Error(
         '队列页头文案没写「保留已加载条数」的新口径（点过「加载更多」后自动刷新不回第一屏）',
       )
+    }
+    if (!headerText.includes('点开始打印、打印完成、核销这些订单动作之后也不会')) {
+      throw new Error('队列页头文案没写「订单动作之后也不缩回」这句，说法盖不住实际行为')
     }
 
     // 假数据按请求的 page_size 造条数（上限 fakeTotal）：请求 60 给 60 条，请求 120 就给
@@ -2925,12 +2965,26 @@ async function runPriceAndRefundPhase({ student, teacher, viewport, step }) {
     // 先取真实单当模版：开了拦截之后页面里的 fetch 也会被拦到假数据上。
     const real = await fetchQueueFromPage(teacher, QUEUE_PAGE_SIZE_POLL)
     const fakeTotal = 150
+    // 这一步要先点一次「开始打印」：模板单可能是「待取件/已完成」，也可能带着
+    // 「已替换未确认」的拦截标记，原样复制会让这一下根本不发请求（只弹一句提醒），
+    // 测到的就不是「动作之后那条刷新按多少条拉」了。
     const fakePageSize = (pageSize) => {
-      const items = cloneQueueItems(real.items || [], Math.min(pageSize, fakeTotal))
+      const items = cloneQueueItems(real.items || [], Math.min(pageSize, fakeTotal)).map(
+        (item) => ({
+          ...item,
+          status: 'queuing',
+          files_unconfirmed: false,
+          change_seen_at: null,
+          file_change: null,
+        }),
+      )
       return { ...real, items, total: fakeTotal, page: 1, page_size: pageSize }
     }
     // 库里没那么多单，造不出 150 单：真实单克隆到 150 总数（理由见 e2e/README.md）
-    const queue = await openFakeQueue(teacher, fakePageSize)
+    // POST /api/admin/order/<id>/start 也一起伪造成功，否则点「开始打印」只会报错、页面不刷新。
+    const queue = await openFakeQueue(teacher, fakePageSize, {
+      fakeActionPattern: /\/api\/admin\/order\/[^/]+\/start$/,
+    })
     try {
       // 等一拍轮询把第一屏 60 条拉进来，这时「加载更多」按钮才出现
       if ((await waitQueuePageSize(queue.records, QUEUE_PAGE_SIZE_POLL, 0, 30000)) === -1) {
@@ -2977,56 +3031,76 @@ async function runPriceAndRefundPhase({ student, teacher, viewport, step }) {
         )
       }
 
-      // 连续两拍自动刷新：请求条数不能回落到第一屏，列表条数不能缩水，勾选不能丢
-      let cursor = loadMoreAt + 1
-      for (let tick = 1; tick <= 2; tick += 1) {
-        const at = await waitQueuePageSize(
-          queue.records,
-          QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP,
-          cursor,
-          25000,
-        )
+      const KEPT = QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP
+
+      /**
+       * 等一拍「按已加载条数重拉的队列请求」，并确认列表条数与勾选都还在。
+       * 返回下一条请求的起点，方便接着数下一拍。
+       *
+       * 条数要求正好 `KEPT` 条：假后端按 page_size 给条数，按 120 拉就是 120 条；
+       * 少了是缩水，多了说明又按旧口径（拉满 200）拉了——两种都不算保住已加载条数。
+       */
+      const expectKeptRows = async (label, from) => {
+        const at = await waitQueuePageSize(queue.records, KEPT, from, 25000)
         if (at === -1) {
           throw new Error(
-            `第 ${tick} 拍自动刷新没有按已加载条数 ` +
-              `${QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP} 条拉，已发出的请求：` +
-              `${queue.records.slice(loadMoreAt).join(',') || '无'}`,
+            `${label}没有按已加载条数 ${KEPT} 条拉，已发出的请求：` +
+              `${queue.records.slice(from).join(',') || '无'}`,
           )
         }
-        cursor = at + 1
-        const snapshot = await waitQueueRows(
-          teacher,
-          QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP,
-        )
-        if (snapshot.rows < QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP) {
-          throw new Error(
-            `第 ${tick} 拍自动刷新把列表从 ` +
-              `${QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP} 单缩水到 ${snapshot.rows} 单`,
-          )
+        const snapshot = await waitQueueRowsExactly(teacher, KEPT)
+        if (snapshot.rows !== KEPT) {
+          throw new Error(`${label}把列表从 ${KEPT} 单变成了 ${snapshot.rows} 单`)
         }
-        if (viewport.mobile) continue
-        const stillChecked = await readQueueCheckedRows(teacher)
-        if (!stillChecked.includes(checkedRow)) {
-          throw new Error(
-            `第 ${tick} 拍自动刷新把勾选弄丢了（勾的是 ${checkedRow}，` +
-              `现在勾着：${stillChecked.join(',') || '无'}）`,
-          )
+        if (!viewport.mobile) {
+          const stillChecked = await readQueueCheckedRows(teacher)
+          if (!stillChecked.includes(checkedRow)) {
+            throw new Error(
+              `${label}把勾选弄丢了（勾的是 ${checkedRow}，` +
+                `现在勾着：${stillChecked.join(',') || '无'}）`,
+            )
+          }
         }
+        return at + 1
       }
-      // 加载更多之后不许再出现按第一屏条数的请求（旧行为就是回落到 60）
+
+      // 连续两拍自动刷新：请求条数不能回落到第一屏，列表条数不能缩水，勾选不能丢
+      let cursor = loadMoreAt + 1
+      cursor = await expectKeptRows('第 1 拍自动刷新', cursor)
+      cursor = await expectKeptRows('第 2 拍自动刷新', cursor)
+
+      // ---- 订单动作之后也不许缩回第一屏
+      // 旧实现里订单动作走的是 refreshAll()，会把「加载更多」的增量清零：动作那一瞬
+      // 按 200 条拉看着还行，紧接的那拍 5 秒轮询就只剩 60 条——页头写着不会缩回。
+      // 这里点一次「开始打印」（POST 由假后端回成功），断言看的还是页面真实请求的 page_size。
+      await clickRowButton(teacher, FAKE_ACTION_ORDER_NO, '开始打印')
+      await clickDialog(teacher, '开始')
+      const actionDeadline = Date.now() + 20000
+      while (queue.actions.length === 0 && Date.now() < actionDeadline) await sleep(200)
+      if (queue.actions.length === 0) {
+        throw new Error('点了「开始打印」却没有发出订单动作请求，测不到动作之后的刷新')
+      }
+      const actionFrom = queue.actions[0].recordsAt
+      const actionTick = await expectKeptRows('订单动作之后的刷新', actionFrom)
+      cursor = await expectKeptRows('订单动作后第 1 拍自动刷新', actionTick)
+      await expectKeptRows('订单动作后第 2 拍自动刷新', cursor)
+      // 加载更多之后不许再出现按第一屏条数的请求（旧行为就是回落到 60），
+      // 订单动作之后那几条也算在内：tail 从「加载更多」那一刻数起
       const tail = queue.records.slice(loadMoreAt)
       if (tail.includes(QUEUE_PAGE_SIZE_POLL)) {
         throw new Error(
-          `加载更多之后自动刷新又按第一屏 ${QUEUE_PAGE_SIZE_POLL} 条拉过：${tail.join(',')}`,
+          `加载更多之后（含订单动作之后）又按第一屏 ${QUEUE_PAGE_SIZE_POLL} 条拉过：${tail.join(',')}`,
         )
       }
       result.pollKeepRows = {
         sizedTail: tail.slice(),
         rows: afterLoadMore.rows,
         checkedRow,
+        actionRequests: queue.actions.length,
+        actionPath: queue.actions[0].url,
       }
       console.log(
-        `      队列：加载更多后两拍轮询请求 page_size ${tail.join('→')}，` +
+        `      队列：加载更多后两拍轮询 + 一次开始打印后两拍轮询，请求 page_size ${tail.join('→')}，` +
           `列表保持 ${afterLoadMore.rows} 单` +
           (checkedRow ? `，勾选行 ${checkedRow} 未丢` : '（手机视口无勾选）'),
       )

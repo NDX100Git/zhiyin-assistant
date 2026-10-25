@@ -65,12 +65,22 @@ export function isAiPath(path) {
 }
 
 /**
- * 给失败对象打上「这次请求带过学生密钥」的标记。
+ * 给失败对象挂上后端业务码，并打上「这次请求带过学生密钥」的标记。
  *
- * llmKey.js 的 isLlmKeyFailure() 靠它区分「密钥不行」与「文件解析失败」：
- * 没带密钥的请求失败，绝不能提示学生去清理密钥。
+ * 业务码必须挂到错误对象上，不能只留一条译好的中文：文案是给人看的，码才是契约。
+ * 上层（llmKey.js 的 isLlmKeyFailure）判断「学生的密钥是不是坏了」只认码；
+ * 码丢了就只能退回拿后端措辞去比对，后端改一次错别字判定就失灵。
+ * 两条通道（uni.request 与 uni.uploadFile）都走这里，别只补一条。
+ *
+ * `llmKeySent` / `llmKeyRejected` 标记的用途：isLlmKeyFailure() 靠它区分
+ * 「密钥不行」与「文件解析失败」——没带密钥的请求失败，绝不能提示学生去清理密钥。
  */
-function decorateLlmKeyError(error, sentLlmKey, rejected = false) {
+function decorateApiError(error, { code, sentLlmKey = false, rejected = false } = {}) {
+  if (typeof code !== 'undefined') {
+    // 有的代理会把码变成字符串：能转成数字就统一成数字，免得上层比 50035 与 '50035' 不等
+    const numeric = Number(code)
+    error.code = Number.isFinite(numeric) ? numeric : code
+  }
   if (sentLlmKey) {
     error.llmKeySent = true
     if (rejected) error.llmKeyRejected = true
@@ -118,26 +128,30 @@ export function request(path, options = {}) {
           // 请求都 401，页面永远自愈不了。清掉后由 App.vue 静默重新登录。
           clearToken()
           uni.$emit(AUTH_EXPIRED_EVENT)
-          reject(new Error(body.message || '登录已失效，正在重新登录'))
+          reject(
+            decorateApiError(new Error(body.message || '登录已失效，正在重新登录'), {
+              code: body.code,
+            })
+          )
           return
         }
         if (body && typeof body.code !== 'undefined') {
-          // 业务码统一在这里译成中文：页面上不需要再认码，也不会漏掉某一屏
+          // 业务码统一在这里译成中文：页面上不需要再认码，也不会漏掉某一屏。
+          // 码本身也挂到错误对象上——页面与 isLlmKeyFailure() 要的是码，不是句子。
           reject(
-            decorateLlmKeyError(
-              new Error(explainApiCode(body.code, body.message)),
+            decorateApiError(new Error(explainApiCode(body.code, body.message)), {
+              code: body.code,
               sentLlmKey,
-              httpRejected
-            )
+              rejected: httpRejected,
+            })
           )
           return
         }
         reject(
-          decorateLlmKeyError(
-            new Error(`服务返回异常（HTTP ${response.statusCode}）`),
+          decorateApiError(new Error(`服务返回异常（HTTP ${response.statusCode}）`), {
             sentLlmKey,
-            httpRejected
-          )
+            rejected: httpRejected,
+          })
         )
       },
       fail(error) {
@@ -164,9 +178,13 @@ export function uploadFile(filePath, fileName) {
           return
         }
         // 转换类错误（50041 / 50043 / 50046）多数在解析上传文件时就发生，
-        // 走的是这条上传通道而不是 request()，映射必须两边都做。
+        // 走的是这条上传通道而不是 request()，翻译与挂码必须两边都做。
         if (body && typeof body.code !== 'undefined') {
-          reject(new Error(explainApiCode(body.code, body.message)))
+          reject(
+            decorateApiError(new Error(explainApiCode(body.code, body.message)), {
+              code: body.code,
+            })
+          )
           return
         }
         reject(new Error('上传失败'))
