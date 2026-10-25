@@ -238,15 +238,10 @@ def _cleanup_files(
             logger.info("[演练] 将删除过期文件 %s 及其 %d 条体检报告缓存", obj.key, reports)
             continue
 
-        try:
-            storage.delete(obj.key)
-        except Exception:
-            # 不吞异常：计入失败并保留日志，对象没删掉，下一轮还能扫到
-            stats.failed += 1
-            logger.exception("删除文件失败，下一轮重试：%s", obj.key)
-            continue
-
-        # 对象已经删掉，上传记录一并清掉，避免表里留下不可撤回的僵尸行
+        # 先把数据库删除落地，再删对象。顺序反过来（先删对象、后删库行）一旦在两者之间
+        # 崩溃，记录还在但对象已经不在下一轮的 list 结果里，永远扫不到它 —— 成为永久
+        # 僵尸行，学生点预览/下单直接 40053。反过来只会剩孤儿对象，下一轮 list 还能
+        # 扫到并重试，两个删除都是幂等的。
         db.execute(
             delete(UploadedFile)
             .where(UploadedFile.file_key == obj.key)
@@ -254,6 +249,16 @@ def _cleanup_files(
         )
         # 报告跟文件同寿命：文件这一轮走的，报告同一轮走，不等下一轮
         reports = _delete_reports_of_file(db, obj.key, dry_run=False, stats=stats)
+        db.commit()
+
+        try:
+            storage.delete(obj.key)
+        except Exception:
+            # 记录已清、对象没删掉：下一轮还会列到它，重新走一遍即可
+            stats.failed += 1
+            logger.exception("删除对象失败，下一轮重试：%s", obj.key)
+            continue
+
         stats.deleted += 1
         logger.info("已删除过期文件 %s，同时删除体检报告缓存 %d 条", obj.key, reports)
 
@@ -312,7 +317,8 @@ def run_cleanup(
     """执行一轮清理，返回统计。
 
     now 可注入便于测试；不传时取服务端本地时间。dry_run 只统计不真正删除。
-    不提交事务，由调用方决定事务边界。
+    注意：文件清理会**逐条提交删除**（先删库行、再删对象）。它必须比对象删除
+    先落地，否则中途崩溃会留下永远扫不到的僵尸记录。调用方负责收尾提交。
     """
     reference = _as_local_naive(now or datetime.now())
     stats = CleanupStats(dry_run=dry_run)
