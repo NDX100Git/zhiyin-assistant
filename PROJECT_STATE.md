@@ -181,8 +181,8 @@ npm.cmd run dev:h5
 **可以直接做**
 
 4. **补跑 Office 转换的 1 条用例**（本机缺 LibreOffice 被 skip）。
-5. **把 `e2e/` 接进 CI**：`e2e/run.mjs` 4354 行 / 56 步全链路回归，目前完全不在 CI 里跑。
-6. **CI 补 lint**：两个前端 `package.json` 都没有 `lint`/`test` script，后端也没在 CI 里跑 ruff。
+5. **把 `e2e/` 接进 CI**：`e2e/run.mjs` 4428 行 / 56 步全链路回归，已作为独立作业接入流水线（`.github/workflows/ci.yml` 的 browser-e2e）。
+6. **CI 补 lint**：两个前端都已具备 `lint` 与 `test` 脚本并接入流水线，后端 ruff 也在流水线里跑。
 7. **Docker 实测**：容器降权 + 命名卷需真机验证一次。
 8. **阶段 9 打包交付**：按 `docs/PACKAGING.md` 在 HBuilderX 云打包 APK（需替换 appid、选择 `src/static/app-icon.png`、配置签名证书）；部署按 `docs/DEPLOYMENT.md`，评委安装看 `docs/INSTALL.md`。
 9. **真机验证**：拿到 Android 手机后验证 `plus.io.chooseFile`，失败则继续用"载入示例论文"兜底。
