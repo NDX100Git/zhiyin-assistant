@@ -489,8 +489,12 @@ async function readQueueNote(page) {
   })
 }
 
-/** 页面上真的列出来多少单：桌面是表格行，手机是一单一张卡。 */
+/**
+ * 页面上真的列出来多少单：桌面是表格行，手机是一单一张卡。
+ */
 const QUEUE_ROW_SELECTOR = '.order-card, .el-table__row'
+/** 队列卡片里的表格行（勾选只在桌面表格里有，手机卡片没有复选框）。 */
+const QUEUE_TABLE_ROW_SELECTOR = '.table-card .el-table__body-wrapper .el-table__row'
 /** 后端 /api/admin/queue 的 page_size 上限（DashboardView.vue 的 QUEUE_PAGE_SIZE_MAX）。 */
 const QUEUE_PAGE_SIZE_MAX = 200
 /** 轮询一屏的条数（DashboardView.vue 的 QUEUE_PAGE_SIZE_POLL）。 */
@@ -571,9 +575,67 @@ function queueNoteProblem(snapshot, total) {
 }
 
 /**
+ * 等到页面真的列出至少 min 单。
+ *
+ * 请求发出去不等于表格已经渲染：el-table 拿到数据后还要一帧才出 `<tr>`，
+ * 「加载更多之后条数没缩水」必须在行真的在 DOM 里之后读，否则读到的是上一帧。
+ */
+async function waitQueueRows(page, min, timeout = 15000) {
+  const deadline = Date.now() + timeout
+  let snapshot = await readQueueSnapshot(page)
+  while (snapshot.rows < min && Date.now() < deadline) {
+    await sleep(200)
+    snapshot = await readQueueSnapshot(page)
+  }
+  return snapshot
+}
+
+/** 桌面表格里当前勾选着哪些行（按订单号读，跨轮询比对用）。 */
+async function readQueueCheckedRows(page) {
+  return page.evaluate((rowSelector) => {
+    return [...document.querySelectorAll(rowSelector)]
+      .filter((row) => row.querySelector('.el-checkbox.is-checked'))
+      .map((row) => {
+        const cells = row.querySelectorAll('td')
+        return ((cells[1] && cells[1].innerText) || '').trim()
+      })
+      .filter(Boolean)
+  }, QUEUE_TABLE_ROW_SELECTOR)
+}
+
+/**
+ * 勾上队列第一行（只有桌面表格有复选框），返回这一行的订单号。
+ *
+ * 用 DOM 直接 click 而不是点坐标：轮询随时会盖上 v-loading 遮罩，
+ * 坐标点击会被遮罩拦掉，DOM click 不会。
+ */
+async function checkFirstQueueRow(page) {
+  const picked = await page.evaluate((rowSelector) => {
+    const row = document.querySelector(rowSelector)
+    if (!row) return { ok: false, reason: '队列表格里没有任何一行' }
+    const box = row.querySelector('.el-checkbox')
+    if (!box) return { ok: false, reason: '第一行没有复选框' }
+    const cells = row.querySelectorAll('td')
+    const orderNo = ((cells[1] && cells[1].innerText) || '').trim()
+    box.click()
+    return { ok: true, orderNo }
+  }, QUEUE_TABLE_ROW_SELECTOR)
+  if (!picked.ok) throw new Error(`勾选队列第一行失败：${picked.reason}`)
+  const checked = await readQueueCheckedRows(page)
+  if (!checked.includes(picked.orderNo)) {
+    throw new Error(
+      `勾选后没读回选中行：勾的是 ${picked.orderNo}，实际勾着 ${checked.join(',') || '无'}`,
+    )
+  }
+  return picked.orderNo
+}
+
+/**
  * 打开一个假的 `/api/admin/queue` 返回，其余请求照常放行。
  *
- * `buildData()` 每次请求都会重新造一份数据（页面会自己重拉，不能给它同一个可变对象）。
+ * `buildData(pageSize)` 每次请求都会重新造一份数据，并拿到页面这次请求的 page_size：
+ * 要验证「加载更多之后条数不缩水」，假数据就必须像真后端一样按请求条数返回，
+ * 否则测到的只是「一份固定 60 条的假数据」。
  * `records` 按顺序记下页面真实请求过的 `page_size`，后面的断言全靠这份记录：
  * 「点过加载更多之后，下一拍轮询按多少条拉」就是要看请求参数，而不是看页面文案。
  */
@@ -583,7 +645,8 @@ async function openFakeQueue(page, buildData) {
   const handler = (request) => {
     const url = request.url()
     if (request.method() === 'GET' && url.includes('/api/admin/queue')) {
-      records.push(Number(new URL(url).searchParams.get('page_size')) || 0)
+      const pageSize = Number(new URL(url).searchParams.get('page_size')) || 0
+      records.push(pageSize)
       request.respond({
         status: 200,
         contentType: 'application/json',
@@ -593,7 +656,7 @@ async function openFakeQueue(page, buildData) {
           'Access-Control-Allow-Headers': '*',
           'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
         },
-        body: JSON.stringify({ code: 0, message: 'ok', data: buildData() }),
+        body: JSON.stringify({ code: 0, message: 'ok', data: buildData(pageSize) }),
       })
       return
     }
@@ -634,6 +697,81 @@ function cloneQueueItems(items, count) {
 }
 
 /**
+ * 用学生端真实接口批量下单，造出「超过 200 单」的真实数据。
+ *
+ * 只调学生端自己的 `/api/order/create`，复用回归里刚上传的文件（下单宽限期 48 小时），
+ * 不碰后端代码、不直接写库。实测 19ms/ 单，造 200 多单不到 5 秒。
+ * 第一单用哪个文件当模版是逐个试的：历史上传的文件可能已被定时清理，
+ * 换下一单再试比直接报错稳。返回 `{ created, elapsed }` 或 `{ error, created }`。
+ */
+async function bulkCreateOrders(page, count) {
+  return page.evaluate(
+    async ({ backendUrl, count }) => {
+      const key = Object.keys(localStorage).find((item) => item.includes('zhiyin_token'))
+      const token = key ? localStorage.getItem(key) : ''
+      if (!token) {
+        return { error: `localStorage 里没有 token：${Object.keys(localStorage).join(',')}` }
+      }
+      const auth = { Authorization: `Bearer ${token}` }
+      const list = await fetch(`${backendUrl}/api/order/list`, { headers: auth }).then((r) =>
+        r.json(),
+      )
+      if (list.code !== 0) return { error: `订单列表返回 ${list.code} ${list.message}` }
+      const items = (list.data.items || []).filter((item) => item.status !== 'cancelled')
+      if (items.length === 0) return { error: '学生端一单都没有，拿不到可复用的文件' }
+
+      const started = Date.now()
+      const create = (payload) =>
+        fetch(`${backendUrl}/api/order/create`, {
+          method: 'POST',
+          headers: { ...auth, 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        }).then((r) => r.json())
+
+      let template = null
+      let created = 0
+      for (const item of items.slice(0, 5)) {
+        const detail = await fetch(`${backendUrl}/api/order/${item.id}`, { headers: auth }).then(
+          (r) => r.json(),
+        )
+        if (detail.code !== 0 || !detail.data || !detail.data.file_key) continue
+        const source = detail.data
+        const payload = {
+          file_key: source.file_key,
+          file_name: source.file_name,
+          page_count: source.page_count,
+          print_side: 2,
+          color_mode: 0,
+          copies: 1,
+          paper_size: 'A4',
+        }
+        const first = await create(payload)
+        // 这一单的文件已经被清理或过期：换下一单当模版，而不是直接失败
+        if (first.code !== 0) continue
+        template = payload
+        created = 1
+        break
+      }
+      if (!template) return { error: '5 个候选单的文件都下不了单（可能已被定时清理）' }
+
+      while (created < count) {
+        const body = await create(template)
+        if (body.code !== 0) {
+          return {
+            error: `第 ${created + 1} 单造单失败：${body.code} ${body.message}`,
+            created,
+            elapsed: Date.now() - started,
+          }
+        }
+        created += 1
+      }
+      return { created, elapsed: Date.now() - started }
+    },
+    { backendUrl: BACKEND_URL, count },
+  )
+}
+
+/**
  * 等到页面再发一次指定 page_size 的队列请求（轮询每 5 秒一次）。
  * `from` 之后新出现的记录才算，避免拿历史请求充数。
  */
@@ -643,6 +781,23 @@ async function waitQueuePageSize(records, size, from = 0, timeout = 25000) {
     const hit = records.slice(from).findIndex((value) => value === size)
     if (hit !== -1) return from + hit
     await sleep(200)
+  }
+  return -1
+}
+
+/**
+ * 点一次「加载更多」，等到页面真的按预期条数重拉了队列。
+ *
+ * Element Plus 的按钮在 loading 时会吞掉点击，而队列每 5 秒正好在轮询（那一瞬按钮刚好
+ * 在 loading），所以点空一次是可能的。这里只重试「点击没被页面接受」这一种情况：
+ * 断言本身不变——必须真的发出预期条数的请求。
+ */
+async function clickLoadMore(page, records, size, { attempts = 3, timeout = 8000 } = {}) {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const before = records.length
+    await clickByText(page, '加载更多')
+    const at = await waitQueuePageSize(records, size, before, timeout)
+    if (at !== -1) return at
   }
   return -1
 }
@@ -2731,10 +2886,12 @@ async function runPriceAndRefundPhase({ student, teacher, viewport, step }) {
 
       // 先清空：上面「查询」自己就会发一个 200 条的请求，留着会让「加载更多」白捡一个
       requests.length = 0
-      await clickByText(teacher, '加载更多')
-      await sleep(1500)
-      const loaded = requests.filter((size) => size >= 120)
-      if (loaded.length === 0) {
+      const loadMoreAt = await clickLoadMore(
+        teacher,
+        requests,
+        QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP,
+      )
+      if (loadMoreAt === -1) {
         throw new Error(
           `「加载更多」没有按更大条数重拉队列，点击后实际请求 page_size：${requests.join(',') || '无'}`,
         )
@@ -2752,91 +2909,127 @@ async function runPriceAndRefundPhase({ student, teacher, viewport, step }) {
     await sleep(1200)
   }, teacher)
 
-  // ---- 7. 点过「加载更多」之后，下一拍轮询必须回落到第一屏
-  await step('队列：点过「加载更多」后，下一拍轮询回落到第一屏 60 条', async () => {
-    // 页头文案与实际行为必须一致：文案写「每 5 秒自动刷新第一屏 60 条」，
-    // 轮询就得只拉 60 条。以前点过一次「加载更多」，轮询把增量带到了以后每一拍（120/180/200）。
+  // ---- 7. 点过「加载更多」之后，自动刷新必须保留已加载条数
+  await step('队列：点过「加载更多」后，自动刷新保留已加载条数（不缩回第一屏）', async () => {
+    // 老板已拍板：老师按 120 条在看某一单，下一拍 5 秒轮询不能把列表缩回 60 条。
+    // 页头文案与实际行为必须同一个口径，先锁文案。
     const headerText = await teacher.evaluate(() => document.body.innerText || '')
-    if (!headerText.includes('每 5 秒自动刷新第一屏 60 条')) {
-      throw new Error('队列页头没有写「每 5 秒自动刷新第一屏 60 条」，文案与轮询行为无法对照')
+    if (!headerText.includes('不会把你点「加载更多」多显示的单缩回第一屏')) {
+      throw new Error(
+        '队列页头文案没写「保留已加载条数」的新口径（点过「加载更多」后自动刷新不回第一屏）',
+      )
     }
 
-    // 库里现在没那么多单，造一个必然有「没显示」的单数：真实单 + 34 单
-    const real = await fetchQueueFromPage(teacher, 60)
-    const items = cloneQueueItems(real.items || [], 60)
-    const total = items.length + 34
-    const fake = { ...real, items, total, page: 1, page_size: 60 }
-    const queue = await openFakeQueue(teacher, () => ({ ...fake, items: [...fake.items] }))
+    // 假数据按请求的 page_size 造条数（上限 fakeTotal）：请求 60 给 60 条，请求 120 就给
+    // 120 条。不这样做的话，固定返回 60 条的假数据会把「条数不缩水」测成恒真。
+    // 先取真实单当模版：开了拦截之后页面里的 fetch 也会被拦到假数据上。
+    const real = await fetchQueueFromPage(teacher, QUEUE_PAGE_SIZE_POLL)
+    const fakeTotal = 150
+    const fakePageSize = (pageSize) => {
+      const items = cloneQueueItems(real.items || [], Math.min(pageSize, fakeTotal))
+      return { ...real, items, total: fakeTotal, page: 1, page_size: pageSize }
+    }
+    // 库里没那么多单，造不出 150 单：真实单克隆到 150 总数（理由见 e2e/README.md）
+    const queue = await openFakeQueue(teacher, fakePageSize)
     try {
-      // 手点「刷新」按一页 200 条拉，先把「加载更多」逗出来（隐藏 34 单）
-      const beforeRefresh = queue.records.length
-      await clickByText(teacher, '刷新')
-      await waitBody(teacher, `还有 ${total - items.length} 单未显示`, 30000)
-      if (!queue.records.slice(beforeRefresh).includes(QUEUE_PAGE_SIZE_MAX)) {
+      // 等一拍轮询把第一屏 60 条拉进来，这时「加载更多」按钮才出现
+      if ((await waitQueuePageSize(queue.records, QUEUE_PAGE_SIZE_POLL, 0, 30000)) === -1) {
         throw new Error(
-          `手点「刷新」没有按一页 ${QUEUE_PAGE_SIZE_MAX} 条拉，实际：` +
-            `${queue.records.slice(beforeRefresh).join(',') || '无'}`,
+          `没等到第一屏 ${QUEUE_PAGE_SIZE_POLL} 条的轮询请求：${queue.records.join(',') || '无'}`,
+        )
+      }
+      const firstScreen = await waitQueueRows(teacher, QUEUE_PAGE_SIZE_POLL)
+      if (firstScreen.rows !== QUEUE_PAGE_SIZE_POLL) {
+        throw new Error(`第一屏应列出 ${QUEUE_PAGE_SIZE_POLL} 单，实际 ${firstScreen.rows} 单`)
+      }
+      // 超量提示与「加载更多」按钮仍然要在（原有断言，不放宽）
+      const firstProblem = queueNoteProblem(firstScreen, fakeTotal)
+      if (firstProblem) throw new Error(`${firstProblem}（假 total ${fakeTotal}）`)
+      if (!firstScreen.hasLoadMore) {
+        throw new Error(
+          `还隐藏 ${fakeTotal - QUEUE_PAGE_SIZE_POLL} 单却没给「加载更多」：「${firstScreen.note}」`,
         )
       }
 
-      // 第一次「加载更多」：在第一屏 60 条的基础上 +60 条 = 120
-      const beforeLoadMore = queue.records.length
-      await clickByText(teacher, '加载更多')
-      const firstLoadMoreAt = await waitQueuePageSize(
+      // 桌面视口先勾一行：整体替换列表会把这一行的勾选弄丢，按 id 合并更新不会
+      const checkedRow = viewport.mobile ? '' : await checkFirstQueueRow(teacher)
+
+      // 点「加载更多」：在第一屏 60 条的基础上 +60 = 120
+      const loadMoreAt = await clickLoadMore(
+        teacher,
         queue.records,
         QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP,
-        beforeLoadMore,
-        15000,
       )
-      if (firstLoadMoreAt === -1) {
+      if (loadMoreAt === -1) {
         throw new Error(
           `「加载更多」没有按 ${QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP} 条重拉，实际：` +
-            `${queue.records.slice(beforeLoadMore).join(',') || '无'}`,
+            `${queue.records.slice(-5).join(',') || '无'}`,
         )
       }
-
-      // 下一拍轮询（5 秒一次）必须回到第一屏 60 条
-      const pollAt = await waitQueuePageSize(
-        queue.records,
-        QUEUE_PAGE_SIZE_POLL,
-        firstLoadMoreAt + 1,
-        25000,
-      )
-      if (pollAt === -1) {
-        throw new Error(
-          `加载更多之后的轮询没有回落到第一屏 ${QUEUE_PAGE_SIZE_POLL} 条，实际：` +
-            `${queue.records.slice(firstLoadMoreAt + 1).join(',') || '无'}`,
-        )
-      }
-      result.pollFallback = queue.records.slice(beforeLoadMore)
-      console.log(
-        `      队列：刷新→加载更多→轮询 请求 page_size ${queue.records.slice(beforeRefresh).join('→')}`,
-      )
-
-      // 增量不累积：回落后再点一次「加载更多」，仍然只到 120，不是 180
-      const beforeSecond = queue.records.length
-      await clickByText(teacher, '加载更多')
-      const secondAt = await waitQueuePageSize(
-        queue.records,
+      const afterLoadMore = await waitQueueRows(
+        teacher,
         QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP,
-        beforeSecond,
-        15000,
       )
-      if (secondAt === -1) {
+      if (afterLoadMore.rows !== QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP) {
         throw new Error(
-          `轮询回落后再点「加载更多」没按 ${QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP} 条拉，实际：` +
-            `${queue.records.slice(beforeSecond).join(',') || '无'}`,
+          `「加载更多」后应列出 ${QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP} 单，` +
+            `实际 ${afterLoadMore.rows} 单`,
         )
       }
-      const bigger = queue.records
-        .slice(beforeSecond, secondAt + 1)
-        .filter((size) => size > QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP)
-      if (bigger.length) {
+
+      // 连续两拍自动刷新：请求条数不能回落到第一屏，列表条数不能缩水，勾选不能丢
+      let cursor = loadMoreAt + 1
+      for (let tick = 1; tick <= 2; tick += 1) {
+        const at = await waitQueuePageSize(
+          queue.records,
+          QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP,
+          cursor,
+          25000,
+        )
+        if (at === -1) {
+          throw new Error(
+            `第 ${tick} 拍自动刷新没有按已加载条数 ` +
+              `${QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP} 条拉，已发出的请求：` +
+              `${queue.records.slice(loadMoreAt).join(',') || '无'}`,
+          )
+        }
+        cursor = at + 1
+        const snapshot = await waitQueueRows(
+          teacher,
+          QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP,
+        )
+        if (snapshot.rows < QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP) {
+          throw new Error(
+            `第 ${tick} 拍自动刷新把列表从 ` +
+              `${QUEUE_PAGE_SIZE_POLL + QUEUE_LOAD_MORE_STEP} 单缩水到 ${snapshot.rows} 单`,
+          )
+        }
+        if (viewport.mobile) continue
+        const stillChecked = await readQueueCheckedRows(teacher)
+        if (!stillChecked.includes(checkedRow)) {
+          throw new Error(
+            `第 ${tick} 拍自动刷新把勾选弄丢了（勾的是 ${checkedRow}，` +
+              `现在勾着：${stillChecked.join(',') || '无'}）`,
+          )
+        }
+      }
+      // 加载更多之后不许再出现按第一屏条数的请求（旧行为就是回落到 60）
+      const tail = queue.records.slice(loadMoreAt)
+      if (tail.includes(QUEUE_PAGE_SIZE_POLL)) {
         throw new Error(
-          `「加载更多」的增量累积了（出现 ${bigger.join(',')} 条请求），应该每次只 +${QUEUE_LOAD_MORE_STEP}`,
+          `加载更多之后自动刷新又按第一屏 ${QUEUE_PAGE_SIZE_POLL} 条拉过：${tail.join(',')}`,
         )
       }
-      result.loadMoreAfterFallback = queue.records[secondAt]
+      result.pollKeepRows = {
+        sizedTail: tail.slice(),
+        rows: afterLoadMore.rows,
+        checkedRow,
+      }
+      console.log(
+        `      队列：加载更多后两拍轮询请求 page_size ${tail.join('→')}，` +
+          `列表保持 ${afterLoadMore.rows} 单` +
+          (checkedRow ? `，勾选行 ${checkedRow} 未丢` : '（手机视口无勾选）'),
+      )
     } finally {
       await queue.close()
     }
@@ -2845,48 +3038,78 @@ async function runPriceAndRefundPhase({ student, teacher, viewport, step }) {
     await sleep(1200)
   }, teacher)
 
-  // ---- 8. 超过 200 单：必须说「已显示前 200 单」，并且不再给「加载更多」
-  await step('队列：超过 200 单时提示封顶且不再给「加载更多」', async () => {
-    // 库里只有不到 200 单，永远触发不到封顶分支；这里把返回伪造到 200 条明细 + 260 总数，
-    // 正好落在「page_size 已顶到后端上限、还有单没显示」这个分支上。
-    const real = await fetchQueueFromPage(teacher, QUEUE_PAGE_SIZE_MAX)
-    const items = cloneQueueItems(real.items || [], QUEUE_PAGE_SIZE_MAX)
-    const total = QUEUE_PAGE_SIZE_MAX + 60
-    const fake = { ...real, items, total, page: 1, page_size: QUEUE_PAGE_SIZE_MAX }
-    const queue = await openFakeQueue(teacher, () => ({ ...fake, items: [...fake.items] }))
-    try {
-      const before = queue.records.length
-      await clickByText(teacher, '刷新')
-      if ((await waitQueuePageSize(queue.records, QUEUE_PAGE_SIZE_MAX, before, 30000)) === -1) {
-        throw new Error(
-          `手点「刷新」没有按一页 ${QUEUE_PAGE_SIZE_MAX} 条拉，实际：` +
-            `${queue.records.slice(before).join(',') || '无'}`,
-        )
-      }
-      await waitBody(teacher, `已显示前 ${QUEUE_PAGE_SIZE_MAX} 单`, 30000)
-
-      // 同一帧里读条数与提示（队列会自己轮询回 60 条，分两次读会读到两个状态）
-      const snapshot = await readQueueSnapshot(teacher)
-      const problem = queueNoteProblem(snapshot, total)
-      if (problem) throw new Error(`${problem}（假 total ${total}）`)
-      if (snapshot.rows < QUEUE_PAGE_SIZE_MAX) {
-        throw new Error(`页面只列了 ${snapshot.rows} 单，没到封顶的 ${QUEUE_PAGE_SIZE_MAX} 单`)
-      }
-      if (snapshot.hasLoadMore) {
-        throw new Error(`已经顶到单页上限，还给了「加载更多」：「${snapshot.note}」`)
-      }
-      if (!snapshot.note.includes(`还有 ${total - QUEUE_PAGE_SIZE_MAX} 单未显示`)) {
-        throw new Error(
-          `封顶提示没写剩余单数（应写「还有 ${total - QUEUE_PAGE_SIZE_MAX} 单未显示」）：「${snapshot.note}」`,
-        )
-      }
-      result.queueCap = { rows: snapshot.rows, note: snapshot.note, total }
-      console.log(
-        `      队列封顶：列出 ${snapshot.rows} 单 / 假 total ${total} / 提示「${snapshot.note}」/ 加载更多 ${snapshot.hasLoadMore ? '还在' : '已隐藏'}`,
-      )
-    } finally {
-      await queue.close()
+  // ---- 8. 超过 200 单：必须按 200 条渲染、说「已显示前 200 单」、并不再给「加载更多」
+  await step('队列：超过 200 单时按 200 条渲染、提示封顶且不再给「加载更多」', async () => {
+    // 真造超量数据：复用回归里刚上传的文件（下单宽限期 48 小时），用学生端自己的
+    // /api/order/create 批量下单，不伪造接口返回。这样测到的是真后端、真分页、真 total。
+    // 实测 19ms/单，造到 200 单以上不到 5 秒（数字与实测见 e2e/README.md）。
+    // 造出来的单留在本轮专用的 zhiyin_r12b 库里（学生端没有删除接口）；同库第二次跑到
+    // 这一步时条数已经够，need 会算成 0，不会重复造。
+    const targetTotal = QUEUE_PAGE_SIZE_MAX + 60
+    const beforeQueue = await fetchQueueFromPage(teacher, QUEUE_PAGE_SIZE_MAX)
+    const need = Math.max(0, targetTotal - (Number(beforeQueue.total) || 0))
+    const built = need > 0 ? await bulkCreateOrders(student, need) : { created: 0, elapsed: 0 }
+    if (built.error) {
+      throw new Error(`造超量数据失败：${built.error}（已造 ${built.created || 0} 单）`)
     }
+    if (need > 0) {
+      console.log(
+        `      造超量数据：调学生端下单接口造 ${built.created} 单，耗时 ${built.elapsed} ms`,
+      )
+    }
+
+    // 封顶状态只维持到下一拍轮询（轮询按第一屏 60 条拉），所以重试着看：
+    // 每次手点「刷新」后盯 12 秒，没碰上 200 条的那一瞬就再刷一次。
+    let snapshot = null
+    for (let attempt = 1; attempt <= 3 && !snapshot; attempt += 1) {
+      await clickByText(teacher, '刷新')
+      const until = Date.now() + 12000
+      while (Date.now() < until) {
+        const current = await readQueueSnapshot(teacher)
+        if (current.rows === QUEUE_PAGE_SIZE_MAX) {
+          snapshot = current
+          break
+        }
+        await sleep(150)
+      }
+    }
+    if (!snapshot) {
+      throw new Error(`手点「刷新」后始终没看到按 ${QUEUE_PAGE_SIZE_MAX} 条渲染的封顶状态`)
+    }
+
+    const afterQueue = await fetchQueueFromPage(teacher, QUEUE_PAGE_SIZE_MAX)
+    const total = Number(afterQueue.total) || 0
+    if (total <= QUEUE_PAGE_SIZE_MAX) {
+      throw new Error(`造单后接口 total 仍只有 ${total}，没到封顶条件（应多于 ${QUEUE_PAGE_SIZE_MAX}）`)
+    }
+    // 三件都要单独验：页面按 200 条渲染 / 提示写还有 N 单 / 「加载更多」按钮消失
+    if (snapshot.rows !== QUEUE_PAGE_SIZE_MAX) {
+      throw new Error(
+        `顶到单页上限时页面应正好按 ${QUEUE_PAGE_SIZE_MAX} 条渲染，实际 ${snapshot.rows} 单`,
+      )
+    }
+    const hidden = total - QUEUE_PAGE_SIZE_MAX
+    if (!snapshot.note.includes(`还有 ${hidden} 单未显示`)) {
+      throw new Error(
+        `封顶提示没写剩余单数（应写「还有 ${hidden} 单未显示」）：「${snapshot.note}」`,
+      )
+    }
+    if (snapshot.hasLoadMore) {
+      throw new Error(`已经顶到单页上限，还给了「加载更多」：「${snapshot.note}」`)
+    }
+    const problem = queueNoteProblem(snapshot, total)
+    if (problem) throw new Error(`${problem}（接口 total ${total}）`)
+    result.queueCap = {
+      rows: snapshot.rows,
+      note: snapshot.note,
+      total,
+      created: built.created || 0,
+      hasLoadMore: snapshot.hasLoadMore,
+    }
+    console.log(
+      `      队列封顶：列出 ${snapshot.rows} 单 / 接口 total ${total} / 提示「${snapshot.note}」/ 加载更多 ${snapshot.hasLoadMore ? '还在' : '已隐藏'}`,
+    )
+
     // 回到真实数据：刷新一次，并等轮询把条数接回第一屏
     await clickByText(teacher, '刷新')
     await sleep(1200)

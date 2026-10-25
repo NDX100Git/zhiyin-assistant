@@ -2,7 +2,8 @@
  * 老师端错误码映射单测：`npm test` 即可，不依赖浏览器与 Element Plus 的真实渲染。
  *
  * 锁四件事：
- * 1. 本轮新增的码都译成可读中文，且各码说法互不相同；
+ * 1. 本轮新增的码都译成可读中文，且各码说法互不相同（40061 的文案要与后端
+ *    AMOUNT_NOT_POSITIVE_MESSAGE 同口径：负数与 0 元都要拒，免单走作废）；
  * 2. 未收录的码保留后端原文（后端文案本来就是中文）；
  * 3. **错误对象真的带着业务码**：驱动 `src/api/http.js` 里真实的响应拦截器逻辑，
  *    确认它抛出的 Error 上 `error.code` 就是后端业务码，且 `explainError` 直接按码译；
@@ -76,7 +77,13 @@ test('本轮要求的八个错误码都有中文映射，文案非空且互不�
 })
 
 test('金额类错误分开说：不合法 / 超出范围（40061 / 40062）', () => {
-  assert.match(explainApiCode(40061), /负数|不合法/)
+  // 40061 现在与后端 pricing.py 的 AMOUNT_NOT_POSITIVE_MESSAGE 对齐：负数与 0 元共用
+  // 一个码，只说「不能为负数」会让老师把 300 敲成 0 时看不懂为什么被拒。
+  const notPositive = explainApiCode(40061)
+  assert.match(notPositive, /大于 0/)
+  assert.match(notPositive, /不能填负数/)
+  assert.match(notPositive, /也不能填 0/)
+  assert.match(notPositive, /作废/, '免单要说清只能走作废流程')
   assert.match(explainApiCode(40062), /超过|上限/)
   assert.notEqual(explainApiCode(40061), explainApiCode(40062))
 })

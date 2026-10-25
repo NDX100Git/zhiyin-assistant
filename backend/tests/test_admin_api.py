@@ -126,6 +126,47 @@ def test_队列按订单号排序且支持筛选与搜索(client, db_session):
     assert searched["items"][0]["pickup_code"] == _full_code("B-12")
 
 
+def test_队列每页条数上限边界(client, db_session):
+    """page_size 的上下界是接口契约：老师端「加载更多」就靠它封顶 200。
+
+    之前 `backend/tests/` 对这个边界零覆盖，改坏 `Query(ge=1, le=200)` 也没人发现：
+    - 恰好 200：正常返回，page_size 回显 200（前端 QUEUE_PAGE_SIZE_MAX 照这个数写死）；
+    - 201 / 500：超过上限必须直接拒，否则一次轮询就把整个库拉回浏览器；
+    - 0 / -1：小于下界也必须拒（`limit(0)` 会平静地返回空列表，看起来像“队列空了”）。
+
+    被拒的要是统一响应格式里的 code 40001 + 可读原因（参数名 + 边界值），不是 500。
+    """
+    token = admin_token(client)
+    for index in range(3):
+        _make_order(db_session, status="queuing", pickup_code=f"C-{index + 1:02d}")
+
+    accepted = client.get(
+        "/api/admin/queue", params={"page": 1, "page_size": 200}, headers=auth(token)
+    ).json()
+    assert accepted["code"] == 0, accepted
+    assert accepted["data"]["page_size"] == 200
+    assert accepted["data"]["total"] == 3
+    assert len(accepted["data"]["items"]) == 3
+
+    rejected = (
+        (201, "less than or equal to 200"),
+        (500, "less than or equal to 200"),
+        (0, "greater than or equal to 1"),
+        (-1, "greater than or equal to 1"),
+    )
+    for page_size, reason in rejected:
+        response = client.get(
+            "/api/admin/queue", params={"page_size": page_size}, headers=auth(token)
+        )
+        assert response.status_code == 200, f"page_size={page_size} 应该是统一响应，不是 HTTP 错误"
+        body = response.json()
+        assert body["code"] == 40001, (page_size, body)
+        assert body["data"] is None, (page_size, body)
+        assert "参数校验失败" in body["message"], (page_size, body["message"])
+        assert "page_size" in body["message"], (page_size, body["message"])
+        assert reason in body["message"].lower(), (page_size, body["message"])
+
+
 def test_开始打印然后完成打印(client, db_session, test_storage):
     token = admin_token(client)
     order = _make_order(db_session, status="queuing")
