@@ -49,15 +49,15 @@
     <div class="page-card table-card">
       <div class="table-head">
         <div>
-          接单队列 <span class="muted">（每 5 秒自动刷新第一屏 {{ QUEUE_PAGE_SIZE_POLL }} 条；统计每 15 秒刷一次；超过第一屏请用搜索定位，确认换文件后该单排到队尾；点「加载更多」多显示的部分只到下一次自动刷新，之后回到第一屏）</span>
-          <!-- 队列只拉一屏，超过时必须让老师知道“下面还有单”，不能默默截断。
+          接单队列 <span class="muted">（每 5 秒自动刷新，不会把你点「加载更多」多显示的单缩回第一屏，当前显示 {{ orders.length }} 单；统计每 15 秒刷一次；勾选的行与滚动位置保留；确认换文件后该单排到队尾；找某单请用搜索）</span>
+          <!-- 队列有单没显示时必须让老师知道“下面还有单”，不能默默截断。
                封顶 200 条之后再说「点加载更多」就是骗人：按钮已经拉不出来，要说清楚
                现在看到的是前 200 单，剩下的只能用搜索精确定位。 -->
           <div v-if="queueAtCap" class="queue-more-note">
-            已显示前 {{ QUEUE_PAGE_SIZE_MAX }} 单，请用搜索精确定位；还有 {{ queueHiddenCount }} 单未显示
+            已显示前 {{ QUEUE_PAGE_SIZE_MAX }} 单（当前显示 {{ orders.length }} 单），请用搜索精确定位；还有 {{ queueHiddenCount }} 单未显示
           </div>
           <div v-else-if="queueHiddenCount > 0" class="queue-more-note">
-            共 {{ queueTotal }} 单，还有 {{ queueHiddenCount }} 单未显示，请用搜索定位或点右侧「加载更多」
+            当前显示 {{ orders.length }} 单，共 {{ queueTotal }} 单，还有 {{ queueHiddenCount }} 单未显示，可点右侧「加载更多」或搜索定位
           </div>
         </div>
         <div>
@@ -83,6 +83,7 @@
 
       <el-table
         v-if="!isMobile"
+        ref="queueTable"
         v-loading="loading"
         :data="orders"
         row-key="id"
@@ -560,7 +561,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { useIsMobile } from '../composables/useIsMobile'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
@@ -622,11 +623,16 @@ const orders = ref([])
  *   仍然立即 refreshAll() 全量刷新，统计不会漏。
  * - 页面隐藏时不轮询（原有行为不变）。
  *
- * 只拉一屏就必须把“没拉完”说出去：队列末尾写上总条数，多出的部分用
- * 「加载更多」分次拉（每次 +60，上限 200——后端 page_size 的上限），
- * 但**增量只归这一次展示**：queueExtra 在轮询与手点查询/刷新时清零，
- * 下一拍轮询重新只拉第一屏 60 条。不这样做的话，点过一次「加载更多」之后
- * 每 5 秒都按放大后的条数（120/180/200）拉，页头文案却还写着「第一屏 60 条」。
+ * 只拉一屏就必须把“没拉完”说出去：队列末尾写上当前显示多少单、还有多少单没显示，
+ * 多出的部分用「加载更多」分次拉（每次 +60，上限 200——后端 page_size 的上限）。
+ *
+ * **「加载更多」点出来的条数要留住**：老板已拍板，自动刷新不再把列表缩回第一屏。
+ * 老师按 120 条在看某一单，下一拍轮询把列表缩回 60 条，正在看的行会跳走，比多拉几条
+ * 难受得多。所以：
+ * - 轮询按「已加载条数」拉（60 + queueExtra，封顶 200），条数不缩水；
+ * - 轮询走 mergeOrders()：按订单 id 原地合并更新，不整体替换列表——行对象引用不变，
+ *   el-table 就不会重建行，滚动位置不跳；勾选由 restoreQueueSelection() 按 id 放回去；
+ * - 老师手点「查询」/「刷新」是“重新查一遍”，清零增量并按后端单页拉（既有行为）。
  */
 const QUEUE_PAGE_SIZE_POLL = 60
 const QUEUE_PAGE_SIZE_FULL = 200
@@ -686,6 +692,8 @@ function targetFile(row) {
 }
 
 const loading = ref(false)
+/** 桌面表格的实例：换数据后要靠它把勾选按订单 id 放回去。 */
+const queueTable = ref(null)
 const selected = ref([])
 const verifyCodeValue = ref('')
 const filters = reactive({ status: '', keyword: '' })
@@ -812,10 +820,11 @@ async function loadSummary() {
 }
 
 /**
- * 本次该拉多少条（只给「加载更多」用）。
+ * 本次该拉多少条。
  *
- * 「加载更多」在各自基数上每次 +60，封顶后端上限 200；轮询与手点查询/刷新
- * 不走这个函数（见 pollQueueSize），否则增量会粘住不放。
+ * 基数：没筛选时是第一屏 60，有筛选/关键词时是后端单页上限（搜索结果被截断比多拉
+ * 几条更难解释）；在这个基数上叠加「加载更多」已点出来的增量，封顶后端上限 200。
+ * 轮询也走这个函数：老师点过「加载更多」，自动刷新就按同样的条数拉，条数不缩水。
  */
 function queuePageSize() {
   const hasFilter = Boolean(filters.status || filters.keyword.trim())
@@ -824,24 +833,65 @@ function queuePageSize() {
 }
 
 /**
- * 轮询该拉多少条：永远只拉第一屏（有筛选/关键词时才拉满一页）。
+ * 把新拉到的队列按订单 id 合并进现有列表，不整体替换。
  *
- * 页头文案写的是「每 5 秒自动刷新第一屏 60 条」，轮询就必须只拉 60 条：
- * 「加载更多」多要的部分只影响当次展示，下一拍回到第一屏，文案与行为才一致。
+ * 已经显示过的行原地更新字段：行对象引用不变，el-table（row-key=id）不会重建这一行，
+ * 老师在看的行不会跳走。新出现的单才插进列表，已经在队列里消失的单（被完成、被取消）
+ * 从列表里摘掉。返回本次是不是真的换了数组（换了才需要重新恢复勾选）。
  */
-function pollQueueSize() {
-  const hasFilter = Boolean(filters.status || filters.keyword.trim())
-  return hasFilter ? QUEUE_PAGE_SIZE_FULL : QUEUE_PAGE_SIZE_POLL
+function mergeOrders(items) {
+  const prev = orders.value
+  const prevById = new Map(prev.map((row) => [String(row.id), row]))
+  const merged = items.map((item) => {
+    const old = prevById.get(String(item.id))
+    if (!old) return item
+    // 原地更新：保住行对象引用，字段变化照常是响应式的
+    Object.assign(old, item)
+    return old
+  })
+  // 条数与顺序都没变时连数组引用都不换，避免整表重渲染把滚动位置推回顶部
+  const sameOrder = merged.length === prev.length && merged.every((row, i) => row === prev[i])
+  if (sameOrder) return false
+  orders.value = merged
+  return true
 }
 
-async function loadQueue(pageSize = QUEUE_PAGE_SIZE_FULL) {
+/**
+ * 换完数据后把勾选按订单 id 放回去。
+ *
+ * el-table 的 data 一换就会清空 selection（Element Plus 只在 reserve-selection 下按 row-key
+ * 保留），而 reserve-selection 又会把已经从队列里消失的单也留在选中里，批量完成就带上
+ * 了不该带的单。所以自己按“当前列表里还在的行”恢复：消失的单自然不在里面。
+ */
+function restoreQueueSelection(keepIds) {
+  const table = queueTable.value
+  if (!table) return
+  table.clearSelection()
+  if (!keepIds.size) return
+  for (const row of orders.value) {
+    if (keepIds.has(String(row.id))) table.toggleRowSelection(row, true)
+  }
+}
+
+async function loadQueue(pageSize = QUEUE_PAGE_SIZE_FULL, { merge = false } = {}) {
   loading.value = true
   try {
     const params = { page: 1, page_size: pageSize }
     if (filters.status) params.status = filters.status
     if (filters.keyword) params.keyword = filters.keyword.trim()
     const data = await fetchQueue(params)
-    orders.value = data.items || []
+    const items = data.items || []
+    // 老师勾了哪几行：换完数据要按 id 放回去，不能因为一次刷新就丢掉
+    const keepIds = new Set(selected.value.map((row) => String(row.id)))
+    // 自动刷新走合并；手点查询/刷新是“重新查一遍”，整页替换才对
+    let replaced = true
+    if (merge) replaced = mergeOrders(items)
+    else orders.value = items
+    if (replaced && keepIds.size) {
+      // 等 el-table 把新数据渲染完再勾：直接 toggle 会勾在旧行对象上
+      await nextTick()
+      restoreQueueSelection(keepIds)
+    }
     // total 是满足筛选条件的总条数：没给就按本页条数算，不能凭空报“还有 N 单”
     const total = Number(data.total)
     queueTotal.value = Number.isFinite(total) ? total : orders.value.length
@@ -873,12 +923,9 @@ function startPolling() {
   timer = setInterval(() => {
     if (document.hidden) return
     pollTicks += 1
-    // 轮询回到第一屏：先把「加载更多」的增量复位，再按第一屏条数拉。
-    // 不复位的话，点过一次「加载更多」就每 5 秒都按放大后的条数拉，页面越跑越重；
-    // 复位的代价是下一拍显示条数从 120 退回 60，这正是页头写的「刷新第一屏 60 条」。
-    queueExtra.value = 0
-    // 有筛选/关键词时轮询也用全量：搜索结果被截断比多拉几条更难解释
-    loadQueue(pollQueueSize())
+    // 保留老师已经点出来的条数：不在这里复位 queueExtra，按已加载条数重拉（封顶 200）。
+    // 合并更新而不是整体替换，条数不缩水、勾选与滚动位置都不跳。
+    loadQueue(queuePageSize(), { merge: true })
     if (pollTicks % SUMMARY_POLL_TICKS === 0) loadSummary()
   }, POLL_INTERVAL_MS)
 }
