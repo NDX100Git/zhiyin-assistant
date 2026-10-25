@@ -52,8 +52,11 @@ services:
 
   # Word/Excel 等文档转 PDF 的调用入口（阶段 5-A 使用）。
   # 容器常驻，后端通过 docker exec 调用 soffice；也可在本机安装 LibreOffice 后直接调用。
-  # 注意：同一个宿主机目录 ./runtime 同时挂给本容器（/workspace/runtime）和后端容器
+  # 注意：同一个卷 runtime-data 同时挂给本容器（/workspace/runtime）和后端容器
   # （/app/runtime），后端算出的容器内路径才能落到这里，两边不要改成不同的卷。
+  # 用命名卷而不是 ./runtime 绑定挂载：后端镜像已降权到 uid 10001 运行，绑定挂载
+  # 会用宿主机目录的属主覆盖镜像内的属主，容器里就写不进去了；命名卷首次创建时
+  # 从镜像复制属主，天然对齐。要看中间产物：docker exec -it zhiyin-backend ls /app/runtime/tmp
   libreoffice:
     build:
       context: ./docker/libreoffice
@@ -64,7 +67,7 @@ services:
     container_name: zhiyin-libreoffice
     restart: unless-stopped
     volumes:
-      - ./runtime:/workspace/runtime
+      - runtime-data:/workspace/runtime
     command: ["sleep", "infinity"]
 
   # 后端应用（FastAPI + uvicorn）。
@@ -103,9 +106,10 @@ services:
       SOFFICE_CONTAINER: ""
       SOFFICE_PATH: /usr/bin/soffice
     volumes:
-      # 与 libreoffice 服务挂同一个宿主机目录：后端写 /app/runtime/tmp，
-      # 换算成 /workspace/runtime/tmp 交给转换容器，两边必须同源。
-      - ./runtime:/app/runtime
+      # 与 libreoffice 服务挂同一个卷：后端写 /app/runtime/tmp，换算成
+      # /workspace/runtime/tmp 交给转换容器，两边必须同源。
+      # 用命名卷的原因见上方 libreoffice 服务的注释（降权后属主必须对齐）。
+      - runtime-data:/app/runtime
     depends_on:
       mysql:
         condition: service_healthy
@@ -131,7 +135,8 @@ services:
 # 编排模式选第一条，原因：
 #   1) 挂 /var/run/docker.sock 等于把宿主机 root 交给一个会解析用户上传文件的 Web 服务，
 #      泄露面从单个容器扩大到整台机器；
-#   2) 容器内进程是 root，经 docker exec 产出的临时文件属主也是 root，会污染宿主机 ./runtime；
+#   2) 转换容器经 docker exec 写出的文件属主不受控（默认 root），会和后端卷里的
+#      属主（10001）打架；装进同一个镜像后两种情况都不存在；
 #   3) 装 docker CLI 要额外的软件源，国内构建更易断。
 # 代价是镜像大几百兆，换来 Word、Excel、PPT 转 PDF 在编排模式下直接可用。
 # 独立的 libreoffice 服务保留给宿主机模式：在宿主机跑 uvicorn 时用
@@ -140,3 +145,5 @@ services:
 volumes:
   mysql-data:
   minio-data:
+  # 后端与转换容器共用的运行时临时目录（属主对齐到后端镜像里的 uid 10001）
+  runtime-data:

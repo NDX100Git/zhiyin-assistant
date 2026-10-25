@@ -60,9 +60,16 @@ ENV SOFFICE_PATH=/usr/bin/soffice
 COPY app ./app
 COPY config ./config
 
-# 运行时临时目录。宿主机 ./runtime 会覆盖挂载到这里，
-# 且转换容器把同一个宿主机目录挂成 /workspace/runtime，两边路径才能对上。
-RUN mkdir -p /app/runtime/tmp
+# 降权运行：这个容器专职解析学生上传的 docx/xlsx/pptx，还装着 LibreOffice，
+# 以 root 跑等于把「格式解析漏洞」和「整台宿主机」绑在一起。
+# 固定 uid/gid 10001，方便挂载卷与 docker exec 共用同一个身份。
+# 运行时临时目录也在这里建好并交给 app 用户。
+RUN groupadd --system --gid 10001 app \
+    && useradd --system --uid 10001 --gid app --home-dir /app --shell /usr/sbin/nologin app \
+    && mkdir -p /app/runtime/tmp \
+    && chown -R app:app /app
+
+USER app
 
 EXPOSE 8000
 
