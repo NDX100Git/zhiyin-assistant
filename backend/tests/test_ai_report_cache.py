@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import itertools
+import time
 
 import fitz
 import pytest
@@ -27,6 +28,7 @@ from app.migrations import (
 )
 from app.models.ai_report import AiReport
 from app.models.uploaded_file import UploadedFile
+from app.services import proofreader, task_registry
 from app.services.doc_parser import bind_report_owner, get_cached_report, save_report
 from app.services.format_checker import check_format
 from app.services.storage import build_object_key
@@ -271,3 +273,90 @@ def test_上传记录与报告各自记着账号(db_session):
     save_report(db_session, key, {"file_key": key}, "parse")
 
     assert _report_rows(db_session, key, "parse")[0].user_id == user_id
+
+
+# ---------------------------------------------------------------- 校对任务（后台线程）
+def _wait_task(task_id: str, owner: str = "", timeout: float = 30.0) -> dict:
+    """等后台校对任务结束，返回最后一次进度（owner 与任务归属一致才查得到）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        progress = proofreader.get_progress(task_id, owner)
+        if progress["status"] in {task_registry.STATUS_DONE, task_registry.STATUS_FAILED}:
+            return progress
+        time.sleep(0.05)
+    raise AssertionError(f"校对任务 {task_id} 未在 {timeout} 秒内结束")
+
+
+def _install_proofread_stub(monkeypatch) -> list[int]:
+    """把解析与模型都换掉：只验证缓存归属，不去跑真模型。"""
+    parsed = {
+        "page_count": 1,
+        "pages": [{"index": 1, "text": "实验结杲表明，该方法有效。" * 30, "images": []}],
+    }
+    monkeypatch.setattr(
+        "app.services.proofreader.parse_document", lambda db, key, force=False: parsed
+    )
+    seen: list[int] = []
+
+    async def fake_achat_json(messages, thinking=False, temperature=None):
+        seen.append(1)
+        return {"issues": []}
+
+    monkeypatch.setattr("app.services.proofreader.achat_json", fake_achat_json)
+    return seen
+
+
+def test_后台校对任务的缓存写到发起人名下(
+    db_session, session_factory, test_storage, tmp_path, monkeypatch
+):
+    """校对在后台线程里用自己的会话跑，缓存行仍然必须带发起人。
+
+    背景：路由把发起人给了 task_registry（owner），但后台 worker 拿到的是新建会话，
+    没有账号上下文，缓存行 user_id 为空、缓存键退化成只按文件。
+    """
+    pdf = _make_pdf(tmp_path / "proof.pdf")
+    key = build_object_key("proof.pdf")
+    test_storage.upload(key, io.BytesIO(pdf), len(pdf), PDF_MIME)
+    seen = _install_proofread_stub(monkeypatch)
+
+    started = proofreader.start_proofread(key, session_factory=session_factory, owner="11")
+    task = _wait_task(started["task_id"], "11")
+    assert task["status"] == task_registry.STATUS_DONE, task
+    assert len(seen) == 1
+
+    db_session.rollback()  # 结束当前事务，读到后台会话写入的行
+    rows = _report_rows(db_session, key, "proofread")
+    assert len(rows) == 1
+    assert rows[0].user_id == 11, "后台任务的缓存行必须记着发起人"
+
+    # 换一个账号跑同一份文件：各存一行，互不命中
+    other = proofreader.start_proofread(key, session_factory=session_factory, owner="22")
+    assert _wait_task(other["task_id"], "22")["status"] == task_registry.STATUS_DONE
+    assert len(seen) == 2, "另一个账号不能命中别人的校对缓存"
+
+    db_session.rollback()
+    rows = _report_rows(db_session, key, "proofread")
+    assert [row.user_id for row in rows] == [11, 22]
+
+    # 各自再跑一次：命中自己那一份，不再调用模型
+    again = proofreader.start_proofread(key, session_factory=session_factory, owner="11")
+    assert _wait_task(again["task_id"], "11")["status"] == task_registry.STATUS_DONE
+    assert len(seen) == 2, "同一账号重复发起不该重新调用模型"
+
+
+def test_没带发起人的校对任务缓存行为与改造前一致(
+    db_session, session_factory, test_storage, tmp_path, monkeypatch
+):
+    """内部调用（不传 owner）没有账号上下文，缓存行留空但读写仍然可用。"""
+    pdf = _make_pdf(tmp_path / "proof-anon.pdf")
+    key = build_object_key("proof-anon.pdf")
+    test_storage.upload(key, io.BytesIO(pdf), len(pdf), PDF_MIME)
+    _install_proofread_stub(monkeypatch)
+
+    started = proofreader.start_proofread(key, session_factory=session_factory)
+    assert _wait_task(started["task_id"])["status"] == task_registry.STATUS_DONE
+
+    db_session.rollback()
+    rows = _report_rows(db_session, key, "proofread")
+    assert len(rows) == 1
+    assert rows[0].user_id is None

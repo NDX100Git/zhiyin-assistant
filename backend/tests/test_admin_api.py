@@ -648,6 +648,90 @@ def test_退款金额不能超过已收金额(client, db_session):
     assert [p.amount_cents for p in payments] == [630]  # 没有退款行落地
 
 
+def test_接口可以指定部分退款金额(client, db_session):
+    """老师按实际情况退一部分：refund_cents 从 HTTP 一路落到退款流水。"""
+    token = admin_token(client)
+    order = _paid_order(db_session, pickup_code="R-05")
+    client.post(
+        f"/api/admin/order/{order.id}/abnormal", json={"reason": "少印了几页"}, headers=auth(token)
+    )
+
+    closed = client.post(
+        f"/api/admin/order/{order.id}/cancel",
+        json={"reason": "少印了几页，退一半", "refund_cents": 200},
+        headers=auth(token),
+    ).json()
+
+    assert closed["code"] == 0, closed
+    assert closed["data"]["refund_cents"] == 200
+    assert closed["data"]["paid_total_cents"] == 630
+    db_session.expire_all()
+    payments = list(
+        db_session.execute(select(PaymentLog).where(PaymentLog.order_id == order.id)).scalars()
+    )
+    refund = next(p for p in payments if p.method == "refund")
+    assert refund.amount_cents == -200  # 只冲掉退掉的那部分
+    summary = client.get("/api/admin/summary", headers=auth(token)).json()["data"]
+    assert summary["income_cents"] == 430
+
+
+def test_接口拒绝超过已收金额的退款(client, db_session):
+    """上限是实际收到的钱：多退会把当日收入冲成负数，接口层直接拒。"""
+    token = admin_token(client)
+    order = _paid_order(db_session, pickup_code="R-06")
+    client.post(
+        f"/api/admin/order/{order.id}/abnormal", json={"reason": "学生有异议"}, headers=auth(token)
+    )
+
+    refused = client.post(
+        f"/api/admin/order/{order.id}/cancel",
+        json={"reason": "学生有异议", "refund_cents": 700},
+        headers=auth(token),
+    ).json()
+
+    assert refused["code"] == 40062, refused
+    assert "630" in refused["message"]
+    db_session.expire_all()
+    assert db_session.get(Order, order.id).status == "abnormal", "被拒后订单状态不能被改掉"
+    payments = list(
+        db_session.execute(select(PaymentLog).where(PaymentLog.order_id == order.id)).scalars()
+    )
+    assert [p.amount_cents for p in payments] == [630]  # 没有退款行落地
+
+
+def test_接口不传退款金额时按全额退且拒负数(client, db_session):
+    """不传 refund_cents 时按成交价全额退；传负数在参数校验这一层就被拦下。"""
+    token = admin_token(client)
+    order = _paid_order(db_session, pickup_code="R-07")
+    client.post(
+        f"/api/admin/order/{order.id}/abnormal", json={"reason": "缺墨"}, headers=auth(token)
+    )
+
+    negative = client.post(
+        f"/api/admin/order/{order.id}/cancel",
+        json={"reason": "缺墨", "refund_cents": -1},
+        headers=auth(token),
+    ).json()
+    assert negative["code"] == 40001, negative  # 参数校验失败，不进业务层
+    db_session.expire_all()
+    assert db_session.get(Order, order.id).status == "abnormal"
+
+    closed = client.post(
+        f"/api/admin/order/{order.id}/cancel", json={"reason": "缺墨"}, headers=auth(token)
+    ).json()
+    assert closed["code"] == 0, closed
+    assert closed["data"]["refund_cents"] == 630  # 不传时全额退
+    db_session.expire_all()
+    refunds = [
+        p
+        for p in db_session.execute(
+            select(PaymentLog).where(PaymentLog.order_id == order.id)
+        ).scalars()
+        if p.method == "refund"
+    ]
+    assert [p.amount_cents for p in refunds] == [-630]
+
+
 def test_未付款的异常单关单不产生退款流水(client, db_session):
     token = admin_token(client)
     order = _make_order(db_session, status="abnormal", paid=0, pickup_code="R-04")
@@ -816,3 +900,27 @@ def test_全角字母的完整码能核销(client, db_session):
     assert body["data"]["order"]["id"] == order.id
     db_session.expire_all()
     assert db_session.get(Order, order.id).pickup_code == _full_code("A-09")
+
+
+# ---------------------------------------------------------------- 下载链接
+
+
+def test_文件被清理后拒绝签发下载链接(client, db_session, test_storage, monkeypatch):
+    """对象存储里已经没有这个文件时，不能签出一个指向空对象的链接。"""
+    from app.services.storage.minio_store import MinioStorage
+
+    token = admin_token(client)
+    order = _make_order(db_session, status="queuing")
+
+    # 默认桩把 stat_modified 当「刚刚写入」，即对象还在
+    alive = client.get(f"/api/admin/order/{order.id}/download", headers=auth(token)).json()
+    assert alive["code"] == 0, alive
+    assert alive["data"]["signed_url"].startswith("http")
+
+    # 模拟定时清理已经把对象删掉：存储层查不到这个 key
+    monkeypatch.setattr(MinioStorage, "stat_modified", lambda self, key: None)
+    gone = client.get(f"/api/admin/order/{order.id}/download", headers=auth(token)).json()
+
+    assert gone["code"] == 40406, gone
+    assert "已过期清理" in gone["message"]
+    assert gone["data"] is None, "被拒时不能带出签名链接"

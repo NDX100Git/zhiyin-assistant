@@ -205,9 +205,11 @@ def cancel_abnormal(
     operator: str = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict:
+    """关闭异常单；payload.refund_cents 可指定部分退款，不传时按成交价全额退。"""
     order = admin_service.get_order(db, order_id)
     reason = payload.reason if payload else None
-    return ok(admin_service.cancel_abnormal(db, order, reason, operator))
+    refund_cents = payload.refund_cents if payload else None
+    return ok(admin_service.cancel_abnormal(db, order, reason, operator, refund_cents))
 
 
 def _parse_day(value: str):

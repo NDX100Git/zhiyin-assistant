@@ -17,7 +17,12 @@ from typing import Any
 from app.config import get_ai_rules
 from app.database import SessionLocal
 from app.services import task_registry
-from app.services.doc_parser import get_cached_report, parse_document, save_report
+from app.services.doc_parser import (
+    bind_report_owner,
+    get_cached_report,
+    parse_document,
+    save_report,
+)
 from app.services.llm import achat_json
 from app.utils.exceptions import BusinessError
 
@@ -165,10 +170,24 @@ async def _run_chunks(task_id: str, chunks: list[str]) -> list[list[dict]]:
     return list(await asyncio.gather(*(run_one(i, chunk) for i, chunk in enumerate(chunks))))
 
 
+def _owner_id(raw: str) -> int | None:
+    """任务上的 owner 是 str(user.id)；空串或非法值一律视为「没有账号上下文」。"""
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _worker(task_id: str, file_key: str, session_factory=SessionLocal) -> None:
     """后台线程执行：解析 → 分块 → 并发校对 → 写缓存。"""
     db = session_factory()
     try:
+        # 后台线程用的是新会话，没有请求上下文，账号得从 task_registry 的 owner 取回来：
+        # 缓存行 user_id 留空会让缓存键退化成只按文件，两个账号碰到同一个 file_key
+        # （同传一份文件、以后要做的共享）时就会把 A 的校对结果发给 B。
+        # 发起人由路由层传给 start_proofread(owner=...)，与体检的缓存键保持同一口径。
+        running = task_registry.get_task(task_id)
+        bind_report_owner(db, _owner_id(running.owner) if running is not None else None)
         task_registry.update(task_id, status=task_registry.STATUS_RUNNING, message="正在解析文档…")
         cached = get_cached_report(db, file_key, "proofread")
         if cached is not None:

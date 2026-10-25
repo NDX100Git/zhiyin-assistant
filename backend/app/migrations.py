@@ -61,6 +61,13 @@ MIGRATION_COLUMNS: dict[str, dict[str, str]] = {
             "INT NOT NULL DEFAULT 0 COMMENT '该份打印页数 = page_count × copies'"
         ),
     },
+    "payment_logs": {
+        # 支付、现场收款、退款各用各的幂等键（pay: / onsite: / refund: + 订单 id），
+        # 重复提交与并发重放由 (order_id, idempotency_key) 唯一索引挡掉。
+        # 老库有这一列之前的所有流水都没有键，留 NULL；MySQL 唯一索引不对 NULL 去重，
+        # 所以多行 NULL 可以共存，历史数据不会被这一列挡住。
+        "idempotency_key": "VARCHAR(64) NULL COMMENT '同一订单内唯一的幂等键'",
+    },
     "order_file_versions": {
         "file_index": "INT NOT NULL DEFAULT 1 COMMENT '文件在订单清单里的序号'",
     },
@@ -78,6 +85,13 @@ MIGRATION_INDEXES: dict[str, dict[str, str]] = {
     "ai_reports": {
         "idx_report_owner": (
             "ALTER TABLE `ai_reports` ADD KEY `idx_report_owner` (`user_id`, `file_key`)"
+        ),
+    },
+    "payment_logs": {
+        # 建索引写在补列之后：MIGRATION_COLUMNS 先执行，这里才引用得到这一列。
+        "uq_payment_idem": (
+            "ALTER TABLE `payment_logs` "
+            "ADD UNIQUE KEY `uq_payment_idem` (`order_id`, `idempotency_key`)"
         ),
     },
     "order_file_changes": {

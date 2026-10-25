@@ -193,10 +193,27 @@ def queue_list(db: Session, status: str | None = None, keyword: str | None = Non
     }
 
 
+def _ensure_objects_exist(storage, file_keys: list[str]) -> None:
+    """签发链接前确认对象还在。
+
+    订单完成后原文件会被定时清理（cleanup.py），而订单行与文件清单行还留着。
+    直接签名会给出一个指向空对象的链接：老师点开只看到 S3 的 XML 报错，
+    分不清是网络问题还是文件没了。所以这里先逐个探一次，缺一个就整单拒绝。
+
+    用 stat_modified 判存在性是存储接口里现成、且不抛异常的探测方法
+    （返回 None 就表示对象不存在），不必为此新增接口。
+    """
+    missing = [key for key in dict.fromkeys(file_keys) if storage.stat_modified(key) is None]
+    if missing:
+        logger.info("拒绝签发下载链接：对象已不存在 %s", missing)
+        raise BusinessError("该订单的文件已过期清理，请让学生重新上传", code=40406)
+
+
 def download_url(db: Session, order: Order, file_index: int | None = None) -> dict:
     """给老师发限时签名下载链接（私有桶，禁止公开读）。
 
     不传 file_index 时返回全部文件链接，同时保留顶层的首份文件链接作为旧接口兼容。
+    签发前先确认对象还在，已被清理的文件一律不给链接。
     """
     rows = ensure_files(db, order)
     if not rows:
@@ -211,16 +228,12 @@ def download_url(db: Session, order: Order, file_index: int | None = None) -> di
                 f"订单里没有第 {file_index} 份文件，请刷新后重试", code=40405
             )
     storage = get_storage()
-    items = [
-        {**file_to_dict(row, order), "signed_url": storage.signed_url(row.file_key)}
-        for row in rows
-    ]
-    if not items and order.file_key:
+    views = [file_to_dict(row, order) for row in rows]
+    if not views and order.file_key:
         # 老订单迁移未回填时，兜底给第 1 份文件的链接
-        for view in files_view(db, order):
-            items.append(
-                {**view, "signed_url": storage.signed_url(view["file_key"])}
-            )
+        views = files_view(db, order)
+    _ensure_objects_exist(storage, [view["file_key"] for view in views])
+    items = [{**view, "signed_url": storage.signed_url(view["file_key"])} for view in views]
     primary = next(
         (item for item in items if item["file_index"] == int(target.file_index)),
         items[0] if items else None,

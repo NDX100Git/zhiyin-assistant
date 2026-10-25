@@ -161,11 +161,13 @@ CREATE TABLE IF NOT EXISTS `payment_logs` (
   `id`           BIGINT      NOT NULL AUTO_INCREMENT,
   `order_id`     BIGINT      NOT NULL,
   `amount_cents` INT         NOT NULL COMMENT '单位：分',
-  `method`       VARCHAR(16) DEFAULT NULL COMMENT 'mock / onsite',
+  `method`       VARCHAR(16) DEFAULT NULL COMMENT 'mock / onsite / refund',
   `operator`     VARCHAR(64) DEFAULT NULL,
+  `idempotency_key` VARCHAR(64) DEFAULT NULL COMMENT '同一订单内唯一的幂等键：pay:/onsite:/refund: + 订单 id',
   `created_at`   DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
-  KEY `idx_payment_order` (`order_id`)
+  KEY `idx_payment_order` (`order_id`),
+  UNIQUE KEY `uq_payment_idem` (`order_id`, `idempotency_key`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='收款记录';
 
 -- 收单时段设置：关闭只影响新订单
