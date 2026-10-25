@@ -28,6 +28,15 @@
       <button class="save" :disabled="saving" @click="saveNickname">保存</button>
     </view>
 
+    <!-- AI 密钥入口：一行说清现在用的是哪把钥匙，点开是面板 -->
+    <button class="key-entry" @click="openKeyPanel">
+      <view class="key-entry-text">
+        <text class="key-entry-title">AI 密钥</text>
+        <text class="key-entry-sub">{{ keyStatusLabel }}</text>
+      </view>
+      <text class="key-entry-arrow">›</text>
+    </button>
+
     <scroll-view scroll-x class="tabs">
       <view
         v-for="tab in tabs"
@@ -88,6 +97,39 @@
         </button>
       </view>
     </view>
+
+    <!--
+      AI 密钥面板：保存 / 测试连通 / 清除并改用学校共享三个动作。
+      密钥只写本机存储，面板里任何地方都不回显完整密钥（只显示前 4 后 4）。
+    -->
+    <view v-if="keyPanelOpen" class="theme-mask" @click="closeKeyPanel">
+      <view class="theme-sheet key-sheet" @click.stop>
+        <view class="theme-sheet-head">
+          <text class="theme-sheet-title">AI 密钥</text>
+          <button class="theme-close" @click="closeKeyPanel">关闭</button>
+        </view>
+        <text class="key-state" :class="{ own: keyOwn }">当前：{{ keyStatusLabel }}</text>
+        <text class="key-notice">{{ keyNotice }}</text>
+        <input
+          v-model="keyInput"
+          class="key-input"
+          :password="true"
+          type="text"
+          maxlength="200"
+          placeholder="粘贴你自己的密钥（sk-…）"
+          confirm-type="done"
+        />
+        <text v-if="keyInputPreview" class="key-preview">将保存为：{{ keyInputPreview }}</text>
+        <text v-if="keyMessage" class="key-message" :class="keyMessageKind">{{ keyMessage }}</text>
+        <view class="key-actions">
+          <button class="key-btn primary" :disabled="keyBusy" @click="saveKey">
+            {{ keyBusy ? '处理中…' : '保存' }}
+          </button>
+          <button class="key-btn" :disabled="keyBusy" @click="testKey">测试连通</button>
+          <button class="key-btn ghost" :disabled="keyBusy" @click="clearKey">清除并改用学校共享</button>
+        </view>
+      </view>
+    </view>
   </view>
 </template>
 
@@ -95,8 +137,19 @@
 import { onHide, onPullDownRefresh, onShow } from '@dcloudio/uni-app'
 import { computed, onUnmounted, ref } from 'vue'
 import { POLL_INTERVAL, STORAGE_KEYS } from '@/config'
-import { request } from '@/services/api'
+import { checkLlmKey, request } from '@/services/api'
 import { ensureLogin, getCurrentUser } from '@/services/auth'
+import {
+  LLM_KEY_NOTICE,
+  clearLlmKey,
+  getLlmKey,
+  isLlmKeyFailure,
+  llmKeyFailureText,
+  llmKeyStatus,
+  maskLlmKey,
+  saveLlmKey,
+  validateLlmKey,
+} from '@/services/llmKey'
 import { createPoller, notify, notifyError } from '@/services/notify'
 import { fileCount, fileSummary } from '@/services/orderFiles'
 import { usePullRefresh } from '@/ui/pullRefresh'
@@ -150,6 +203,95 @@ function formatMoney(cents) {
   return `¥${((Number(cents) || 0) / 100).toFixed(2)}`
 }
 
+/* ---------- AI 密钥面板：只读写本机存储，密钥不上传 ---------- */
+
+const keyPanelOpen = ref(false)
+const keyInput = ref('')
+const keyBusy = ref(false)
+const keyMessage = ref('')
+/** 'ok' | 'error' | ''：只影响颜色，不影响文案 */
+const keyMessageKind = ref('')
+/** 当前用哪把钥匙。存成 ref：保存/清除后状态行要立刻变 */
+const keyState = ref(llmKeyStatus())
+
+const keyStatusLabel = computed(() => keyState.value.label)
+const keyOwn = computed(() => keyState.value.mode === 'own')
+const keyNotice = LLM_KEY_NOTICE
+
+/** 粘贴后立即看到的脱敏预览：输入框是密码型，这行让学生确认没粘错一整段。 */
+const keyInputPreview = computed(() => maskLlmKey(keyInput.value))
+
+function refreshKeyState() {
+  keyState.value = llmKeyStatus()
+}
+
+function openKeyPanel() {
+  keyInput.value = ''
+  keyMessage.value = ''
+  keyMessageKind.value = ''
+  refreshKeyState()
+  keyPanelOpen.value = true
+}
+
+function closeKeyPanel() {
+  keyInput.value = ''
+  keyPanelOpen.value = false
+}
+
+/** 保存：只写本机存储，一个请求都不发。 */
+function saveKey() {
+  const result = saveLlmKey(keyInput.value)
+  if (!result.ok) {
+    keyMessage.value = result.error
+    keyMessageKind.value = 'error'
+    return
+  }
+  keyInput.value = ''
+  refreshKeyState()
+  keyMessage.value = `已保存到本机，之后的 AI 请求都带这把密钥（${keyState.value.masked}）`
+  keyMessageKind.value = 'ok'
+  notify('密钥已保存到本机', 'success')
+}
+
+/**
+ * 测试连通：把输入框里的密钥（没输入就用存着的那把）发给 /api/ai/key-check。
+ * 失败时把服务端给的原因原样告诉学生，并提示可以清除后改用学校共享。
+ */
+async function testKey() {
+  const typed = keyInput.value.trim()
+  const checked = validateLlmKey(typed || getLlmKey())
+  if (!checked.ok) {
+    keyMessage.value = checked.error
+    keyMessageKind.value = 'error'
+    return
+  }
+  keyBusy.value = true
+  keyMessage.value = '正在用这把密钥做一次最小调用…'
+  keyMessageKind.value = ''
+  try {
+    await checkLlmKey(checked.key)
+    keyMessage.value = '测试通过：这把密钥可以用，AI 请求会带着它。'
+    keyMessageKind.value = 'ok'
+  } catch (error) {
+    keyMessage.value = isLlmKeyFailure(error)
+      ? llmKeyFailureText(error)
+      : `测试没通过：${(error && error.message) || '未知原因'}。可以确认密钥是否复制完整，或稍后再试。`
+    keyMessageKind.value = 'error'
+  } finally {
+    keyBusy.value = false
+  }
+}
+
+/** 清除：立刻回到学校共享密钥（状态行下一帧就变，不用退出重进）。 */
+function clearKey() {
+  const done = clearLlmKey()
+  keyInput.value = ''
+  refreshKeyState()
+  keyMessage.value = done ? '已清除，现在改用学校共享密钥' : '本地存储删除失败，请稍后重试'
+  keyMessageKind.value = done ? 'ok' : 'error'
+  notify(done ? '已改用学校共享密钥' : '清除失败，请稍后重试', done ? 'success' : 'info')
+}
+
 /** 列表一行说清这份单要打什么：单文件给文件名，多文件给「N 个文件 · 共 X 页」。 */
 function fileLine(order) {
   if (fileCount(order) > 1) return fileSummary(order)
@@ -176,6 +318,8 @@ onShow(async () => {
     await ensureLogin()
     const user = getCurrentUser()
     nickname.value = (user && user.nickname) || ''
+    // 密钥可能在「AI 密钥」面板里被改过（也可能被系统清过缓存），每次回页重读
+    refreshKeyState()
     poller.start()
   } catch (error) {
     notifyError(error)
@@ -458,6 +602,142 @@ function openDetail(id) {
   line-height: 1.4;
 }
 
+/* AI 密钥入口：一行点开面板，高度与齿轮对齐（390 宽下约 50px，不小于 44px） */
+.key-entry {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16rpx;
+  width: 100%;
+  min-height: 96rpx;
+  margin: 0 0 20rpx;
+  padding: 16rpx 24rpx;
+  box-sizing: border-box;
+  border: var(--zi-card-border);
+  border-radius: var(--zi-radius);
+  background: var(--zi-paper);
+  text-align: left;
+  line-height: 1.35;
+}
+.key-entry-text {
+  flex: 1;
+  min-width: 0;
+}
+.key-entry-title {
+  display: block;
+  color: var(--zi-ink);
+  font-size: 28rpx;
+  font-weight: 900;
+  letter-spacing: 1rpx;
+}
+.key-entry-sub {
+  display: block;
+  margin-top: 4rpx;
+  color: var(--zi-muted);
+  font-size: 22rpx;
+  font-weight: 700;
+  word-break: break-all;
+}
+.key-entry-arrow {
+  flex: 0 0 auto;
+  color: var(--zi-muted);
+  font-size: 34rpx;
+  font-weight: 900;
+  line-height: 1;
+}
+
+/*
+  AI 密钥面板：三个动作竖排、每个满宽且不低于 44 像素（88rpx），
+  390 宽下不会横向溢出；密钥只在输入框（密码型）里出现，别处只给脱敏值。
+*/
+.key-sheet {
+  max-height: 86vh;
+  overflow-y: auto;
+}
+.key-state {
+  display: block;
+  color: var(--zi-muted);
+  font-size: 24rpx;
+  font-weight: 800;
+  line-height: 1.5;
+  word-break: break-all;
+}
+.key-state.own {
+  color: var(--zi-accent);
+}
+.key-notice {
+  display: block;
+  margin-top: 8rpx;
+  color: var(--zi-muted);
+  font-size: 22rpx;
+  line-height: 1.6;
+}
+.key-input {
+  width: 100%;
+  min-height: 88rpx;
+  margin-top: 16rpx;
+  padding: 0 20rpx;
+  box-sizing: border-box;
+  border: 2rpx solid var(--zi-line-strong);
+  border-radius: var(--zi-radius);
+  background: var(--zi-paper);
+  color: var(--zi-ink);
+  font-size: 26rpx;
+}
+.key-preview {
+  display: block;
+  margin-top: 8rpx;
+  color: var(--zi-muted);
+  font-size: 22rpx;
+  line-height: 1.5;
+  word-break: break-all;
+}
+.key-message {
+  display: block;
+  margin-top: 12rpx;
+  color: var(--zi-muted);
+  font-size: 24rpx;
+  line-height: 1.5;
+}
+.key-message.ok {
+  color: var(--zi-ok);
+}
+.key-message.error {
+  color: var(--zi-danger);
+}
+.key-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 12rpx;
+  margin-top: 20rpx;
+}
+.key-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 88rpx;
+  margin: 0;
+  padding: 10rpx 20rpx;
+  box-sizing: border-box;
+  border: 2rpx solid var(--zi-line-strong);
+  border-radius: var(--zi-button-radius);
+  background: transparent;
+  color: var(--zi-ink);
+  font-size: 26rpx;
+  font-weight: 800;
+  line-height: 1.25;
+  white-space: normal;
+}
+.key-btn.primary {
+  border-color: var(--zi-ink);
+  background: var(--zi-primary-bg);
+  color: var(--zi-primary-ink);
+}
+.key-btn.ghost {
+  color: var(--zi-muted);
+}
+
 .card {
   margin-bottom: 20rpx;
   padding: 26rpx;
@@ -664,6 +944,25 @@ function openDetail(id) {
   border-radius: 999rpx;
   background: var(--zi-soft);
   color: var(--zi-accent);
+}
+.zi-theme-classic .key-entry {
+  border: none;
+  background: var(--zi-soft);
+}
+.zi-theme-classic .key-btn {
+  border: none;
+  border-radius: 999rpx;
+  background: var(--zi-soft);
+  color: var(--zi-accent);
+  font-weight: 600;
+}
+.zi-theme-classic .key-btn.primary {
+  background: var(--zi-accent);
+  color: var(--zi-accent-ink);
+}
+.zi-theme-classic .key-btn.ghost {
+  background: var(--zi-soft-2);
+  color: var(--zi-muted);
 }
 .zi-theme-classic .theme-close {
   border: none;
