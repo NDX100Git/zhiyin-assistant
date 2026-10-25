@@ -69,6 +69,13 @@ def max_legal_order_amount_cents() -> int:
     return int(limits["max_page_count"]) * int(limits["max_copies"]) * max(prices)
 
 
+# 金额为零的提示。与「负数」共用一个码 40061（前端只把 40061 译成「不能为负数」），
+# 所以这句话必须把两种情形都说清：老师把 300 敲成 0 时看到的是这句，不是「不能为负数」。
+AMOUNT_NOT_POSITIVE_MESSAGE = (
+    "金额必须大于 0 分：不能填负数，也不能填 0；确需免单请改走作废流程"
+)
+
+
 def ensure_amount_allowed(amount_cents: int, system_amount_cents: int = 0) -> int:
     """校验改价/成交价：必须大于 0、有绝对上限、相对系统价有倍数上限。返回校验后的金额。
 
@@ -76,16 +83,18 @@ def ensure_amount_allowed(amount_cents: int, system_amount_cents: int = 0) -> in
     一律拒绝；确有免单需求时走作废流程，或者显式登记全额退款，不要用 0 元成交价
     伪造一单「免费」。
 
+    负数与 0 元事态不同，但对外都是 40061 一个码，文案由 AMOUNT_NOT_POSITIVE_MESSAGE
+    统一说清两种情形 —— 前端码表里 40061 的固定文案只写了「不能为负数」，填 0 时
+    会翻译错（已登记给前端轮次跟改）。
+
     倍数上限取「系统价 × 10」与「20 元」的较大者：1 页黑白单系统价只有 15 分，
     只用倍数会把「老师让价到 2 元」也拦掉，那不是护栏而是故障。
     """
     amount = int(amount_cents)
     if amount < 0:
-        raise BusinessError("金额不能为负数", code=40061)
+        raise BusinessError(AMOUNT_NOT_POSITIVE_MESSAGE, code=40061)
     if amount == 0:
-        raise BusinessError(
-            "金额必须大于 0 分；确需免单请走作废流程", code=40061
-        )
+        raise BusinessError(AMOUNT_NOT_POSITIVE_MESSAGE, code=40061)
     ceiling = max_legal_order_amount_cents()
     if amount > ceiling:
         raise BusinessError(

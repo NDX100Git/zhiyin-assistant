@@ -405,9 +405,10 @@ def conversion_slot(wait_seconds: float | None = None):
 def conversion_timeout_seconds() -> float:
     """这一次转换允许等多久：配置的单次超时，并且不超过表格渲染剩余的预算。
 
-    表格放宽横向页数时会重跑多轮转换，每一轮都占着同一个 AI 并发名额。
+    表格放宽横向页数时会重跑多轮转换，每一轮都占着同一个**转换车道**名额（表格请求已
+    不在 AI 名额里跑，见 ai_pool 的 lane 说明）。
     只在 spreadsheet.render_pdf 里数次数没用：一轮转换自己就能跑满 180 秒，
-    两轮就是 260 秒以上，排在后面的人只看到超时。所以预算必须一直传到
+    两轮就是 260 秒以上，同车道上排在后面的表格只看到超时。所以预算必须一直传到
     真正等 soffice 的这一层：额度用尽就按剩余时间等，杀进程、归还名额。
     """
     timeout = max(1.0, float(settings.soffice_timeout_seconds))

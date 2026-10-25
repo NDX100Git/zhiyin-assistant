@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 from app.config import get_ai_rules
 from app.services.doc_parser import get_cached_report, parse_document, save_report
 from app.services.format_rules_engine import sheet_count_info
-from app.services.llm import chat_json
+from app.services.llm import bind_key, chat_json
 from app.services.pricing import unit_price_cents
 from app.utils.exceptions import BusinessError
 from app.utils.filetype import normalize_ext
@@ -159,8 +159,18 @@ def calc_numbers(features: dict, recommend: dict, copies: int) -> dict:
     }
 
 
-def plan_print(db: Session, file_key: str, options: dict, force: bool = False) -> dict:
-    """生成打印方案（含省纸与省钱计算）。"""
+def plan_print(
+    db: Session,
+    file_key: str,
+    options: dict,
+    force: bool = False,
+    *,
+    api_key: str | None = None,
+) -> dict:
+    """生成打印方案（含省纸与省钱计算）。
+
+    api_key 是学生自带的模型密钥，只在本次方案的模型调用里用一次。
+    """
     if not file_key:
         raise BusinessError("缺少文件标识", code=40073)
 
@@ -184,7 +194,7 @@ def plan_print(db: Session, file_key: str, options: dict, force: bool = False) -
 
     if use_ai:
         try:
-            raw = chat_json(_messages(features, options))
+            raw = bind_key(chat_json, api_key)(_messages(features, options))
             recommend = raw.get("recommend") if isinstance(raw, dict) else None
             reason = str(raw.get("reason") or "") if isinstance(raw, dict) else ""
         except BusinessError as exc:

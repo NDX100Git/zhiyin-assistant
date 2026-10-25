@@ -211,11 +211,15 @@ CREATE TABLE IF NOT EXISTS `print_logs` (
 -- AI 体检报告缓存：中间结果缓存 7 天后清除
 CREATE TABLE IF NOT EXISTS `ai_reports` (
   `id`          BIGINT       NOT NULL AUTO_INCREMENT,
+  -- 报告归属账号。产品口径：各账号各存一份，互不共用；为空只出现在迁移前的老行上
+  `user_id`     BIGINT       DEFAULT NULL COMMENT '报告归属账号；为空表示迁移前的老行',
   `file_key`    VARCHAR(255) NOT NULL,
   `report_json` JSON         NOT NULL,
   `created_at`  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
-  KEY `idx_file_key` (`file_key`)
+  KEY `idx_file_key` (`file_key`),
+  -- 缓存键是「账号 + 文件」，读写那条路径必须走这个复合索引
+  KEY `idx_report_owner` (`user_id`, `file_key`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI 体检报告缓存';
 
 -- 待发消息记录：V1 只记录事件，V2 接入推送时直接补发

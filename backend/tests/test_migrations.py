@@ -542,3 +542,212 @@ def test_新库create_all建出来的名额标记列与迁移一致(mixed_collat
     assert column_type.lower() == "tinyint", column_type
     assert is_nullable == "NO", is_nullable
     assert default == "0", default
+
+
+# ---------------------------------------------------------------- 只用建表脚本建的库
+# `ai_reports.user_id` 曾经只存在于模型与迁移里，两份 schema.sql 都没有：走 create_all
+# 或跑过迁移的库一切正常，而「照 README 手工执行 schema.sql」建出来的库，第一次体检
+# 插入报告就 1054 Unknown column，接口直接 500。所以这里既断言脚本里有这一列，
+# 也真的按脚本建一个干净库、把体检与页数两个接口跑一遍。
+
+AI_REPORTS = "ai_reports"
+REPORT_OWNER_COLUMN = "user_id"
+REPORT_OWNER_INDEX = "idx_report_owner"
+
+
+def _ai_reports_block(path: Path) -> str:
+    text_sql = path.read_text(encoding="utf-8")
+    start = text_sql.find(f"CREATE TABLE IF NOT EXISTS `{AI_REPORTS}`")
+    assert start >= 0, f"{path} 里找不到 {AI_REPORTS} 建表语句"
+    return text_sql[start : text_sql.find(";", start)]
+
+
+@pytest.mark.parametrize("path", SCHEMA_FILES, ids=lambda p: p.name)
+def test_两份schema_sql都带报告归属列与索引(path: Path):
+    """新库按 schema.sql 建表也要带这一列与索引，不能只靠迁移兜底。"""
+    block = _ai_reports_block(path)
+    line = next(
+        (row for row in block.splitlines() if f"`{REPORT_OWNER_COLUMN}`" in row), ""
+    )
+    assert line, f"{path} 的 {AI_REPORTS} 缺 {REPORT_OWNER_COLUMN} 列"
+    assert "BIGINT" in line.upper(), line
+    assert "NOT NULL" not in line.upper(), "老库的历史行无从判断归属，必须允许为空"
+    assert f"`{REPORT_OWNER_INDEX}`" in block, f"{path} 缺 {REPORT_OWNER_INDEX} 索引"
+
+
+def split_sql_statements(sql_text: str) -> list[str]:
+    """把建表脚本切成一条条可执行语句。
+
+    跳过 `CREATE DATABASE` / `USE`：脚本里写的是固定库名，而用例要把它建在另一个
+    临时库里（照抄脚本原文会覆盖开发库）。
+    """
+    statements: list[str] = []
+    buffer: list[str] = []
+    quote: str | None = None
+    index = 0
+    length = len(sql_text)
+    while index < length:
+        char = sql_text[index]
+        if quote is not None:
+            buffer.append(char)
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+            buffer.append(char)
+            index += 1
+            continue
+        if char == "-" and sql_text.startswith("--", index):
+            newline = sql_text.find("\n", index)
+            index = length if newline == -1 else newline
+            continue
+        if char == "#":
+            newline = sql_text.find("\n", index)
+            index = length if newline == -1 else newline
+            continue
+        if char == ";":
+            statement = "".join(buffer).strip()
+            buffer = []
+            if statement:
+                statements.append(statement)
+            index += 1
+            continue
+        buffer.append(char)
+        index += 1
+    tail = "".join(buffer).strip()
+    if tail:
+        statements.append(tail)
+    return [
+        statement
+        for statement in statements
+        if not statement.upper().lstrip().startswith(("CREATE DATABASE", "USE "))
+    ]
+
+
+def _schema_only_engine(engine):
+    """只按 schema.sql 建库建表：不跑 create_all，也不跑迁移。"""
+    url = make_url(engine.url)
+    name = f"{url.database}_sqlonly"
+    assert len(name) <= 64, f"库名超过 MySQL 上限：{name}"
+
+    root = create_engine(url.set(database=None), pool_pre_ping=True)
+    try:
+        with root.begin() as conn:
+            conn.execute(text(f"DROP DATABASE IF EXISTS `{name}`"))
+            conn.execute(
+                text(
+                    f"CREATE DATABASE `{name}` DEFAULT CHARACTER SET utf8mb4 "
+                    "COLLATE utf8mb4_unicode_ci"
+                )
+            )
+    finally:
+        root.dispose()
+
+    scratch = create_engine(url.set(database=name), pool_pre_ping=True)
+    statements = split_sql_statements((BACKEND_DIR / "schema.sql").read_text(encoding="utf-8"))
+    assert statements, "schema.sql 里没解析出任何语句"
+    try:
+        with scratch.begin() as conn:
+            for statement in statements:
+                conn.execute(text(statement))
+        yield scratch
+    finally:
+        scratch.dispose()
+        root = create_engine(url.set(database=None), pool_pre_ping=True)
+        try:
+            with root.begin() as conn:
+                conn.execute(text(f"DROP DATABASE IF EXISTS `{name}`"))
+        finally:
+            root.dispose()
+
+
+@pytest.fixture
+def schema_only_engine(engine):
+    yield from _schema_only_engine(engine)
+
+
+def test_只按建表脚本建的库_report_owner_列真的存在(schema_only_engine):
+    with schema_only_engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT COLUMN_TYPE, IS_NULLABLE FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t AND COLUMN_NAME = :c"
+            ),
+            {"t": AI_REPORTS, "c": REPORT_OWNER_COLUMN},
+        ).one_or_none()
+        indexes = {
+            name
+            for (name,) in conn.execute(
+                text(
+                    "SELECT INDEX_NAME FROM information_schema.STATISTICS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t"
+                ),
+                {"t": AI_REPORTS},
+            ).all()
+        }
+    assert row is not None, "schema.sql 建出来的 ai_reports 缺 user_id 列"
+    column_type, is_nullable = row
+    assert column_type.lower() == "bigint", column_type
+    assert is_nullable == "YES", is_nullable
+    assert REPORT_OWNER_INDEX in indexes, indexes
+
+
+def test_只用建表脚本建的库体检与页数接口都能正常返回(
+    schema_only_engine, test_storage, tmp_path, monkeypatch
+):
+    """照 schema.sql 建出来的库，体检与取页数都得能用（这是学生最常点的两个接口）。"""
+    from fastapi.testclient import TestClient
+    from sqlalchemy.orm import sessionmaker
+
+    from app.database import get_db
+    from app.main import app
+
+    scratch = schema_only_engine
+    session_factory = sessionmaker(bind=scratch, autoflush=False, autocommit=False)
+    session = session_factory()
+
+    def override_get_db():
+        yield session
+
+    # 体检的模型调用换成固定返回，免得为了这两个接口去连真模型
+    monkeypatch.setattr(
+        "app.services.format_checker.chat_json", lambda messages, thinking=False: {"issues": []}
+    )
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        with TestClient(app) as client:
+            login = client.post("/api/auth/login", json={"device_id": "schema-only-owner"}).json()
+            assert login["code"] == 0, login
+            user_id = int(login["data"]["user"]["id"])
+            headers = {"Authorization": f"Bearer {login['data']['token']}"}
+
+            uploaded = client.post(
+                "/api/file/upload",
+                files={"file": ("论文.pdf", _pdf_bytes(tmp_path / "论文.pdf"), "application/pdf")},
+                headers=headers,
+            ).json()
+            assert uploaded["code"] == 0, uploaded
+            file_key = uploaded["data"]["file_key"]
+
+            counted = client.post(
+                "/api/file/page-count", json={"file_key": file_key}, headers=headers
+            ).json()
+            assert counted["code"] == 0, counted
+            assert counted["data"]["page_count"] == 1
+
+            checked = client.post(
+                "/api/ai/check", json={"file_key": file_key}, headers=headers
+            ).json()
+            assert checked["code"] == 0, checked
+            assert checked["data"]["page_count"] == 1
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        session.close()
+
+    with scratch.connect() as conn:
+        owners = conn.execute(text(f"SELECT `{REPORT_OWNER_COLUMN}` FROM `{AI_REPORTS}`")).all()
+    assert owners, "体检结果没有写进 ai_reports"
+    assert all(owner[0] == user_id for owner in owners), owners

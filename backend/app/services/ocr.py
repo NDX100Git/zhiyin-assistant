@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.config import BACKEND_DIR
 from app.services.doc_parser import get_cached_report, save_report
-from app.services.llm import chat
+from app.services.llm import bind_key, chat
 from app.services.storage import get_storage
 from app.utils.exceptions import BusinessError
 from app.utils.filetype import MIME_BY_EXT, normalize_ext
@@ -33,8 +33,17 @@ SYSTEM_PROMPT = (
 )
 
 
-def ocr_image(db: Session, file_key: str, force: bool = False) -> dict:
-    """把图片交给多模态模型识别文字。"""
+def ocr_image(
+    db: Session,
+    file_key: str,
+    force: bool = False,
+    *,
+    api_key: str | None = None,
+) -> dict:
+    """把图片交给多模态模型识别文字。
+
+    api_key 是学生自带的模型密钥，只在本次识别的模型调用里用一次。
+    """
     ext = normalize_ext(file_key)
     if ext not in ALLOWED_EXTS:
         raise BusinessError("OCR 只支持 jpg / jpeg / png 图片", code=40075)
@@ -68,7 +77,7 @@ def ocr_image(db: Session, file_key: str, force: bool = False) -> dict:
         },
     ]
 
-    text = chat(messages).strip()
+    text = bind_key(chat, api_key)(messages).strip()
     if not text:
         raise BusinessError("未能从图片中识别出文字", code=40077)
 

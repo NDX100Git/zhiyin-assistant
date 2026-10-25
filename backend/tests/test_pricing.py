@@ -79,9 +79,26 @@ def test_改价为零元被拒():
         ensure_amount_allowed(0, system_amount_cents=630)
     assert exc.value.code == 40061
     assert "大于 0" in exc.value.message
+    # 前端把 40061 译成「不能为负数」，而老师把 300 敲成 0 也会落到这个码上，
+    # 所以文案必须把两种情形都说清，不能只提负数。
+    assert "负数" in exc.value.message
+    assert "0" in exc.value.message
 
 
 def test_改价为负数仍然被拒():
     with pytest.raises(BusinessError) as exc:
         ensure_amount_allowed(-1, system_amount_cents=630)
     assert exc.value.code == 40061
+
+
+def test_零元与负数用同一句文案说清两种情形():
+    """两种事态共用一个码，文案就是学生/老师看到的唯一区别，不允许只提其中一种。"""
+    with pytest.raises(BusinessError) as zero:
+        ensure_amount_allowed(0)
+    with pytest.raises(BusinessError) as negative:
+        ensure_amount_allowed(-100)
+
+    assert zero.value.code == negative.value.code == 40061
+    assert zero.value.message == negative.value.message
+    assert "大于 0" in zero.value.message
+    assert "负数" in zero.value.message

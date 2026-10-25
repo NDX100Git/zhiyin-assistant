@@ -37,7 +37,7 @@ from app.utils.exceptions import BusinessError
 logger = logging.getLogger(__name__)
 
 # 一条表格请求允许花在「归一版式 + 转换」上的总时长（见 settings 里的同名配置）。
-# 每放宽一次横向页数，就要重跑一轮归一化 + 转换，期间全程占住一个 AI 并发名额。
+# 每放宽一次横向页数，就要重跑一轮归一化 + 转换，期间全程占住一个**转换车道**名额。
 #
 # 光限次数不够，只限总时间也不够，两个都是硬约束：
 # - 次数：横向页数 1..max_width_pages（默认 4），到上限就按当前结果出纸；
@@ -51,6 +51,10 @@ logger = logging.getLogger(__name__)
 # 额度必须传到真正等待 soffice 的那一层，预算耗尽即杀进程、归还名额。
 # 超预算就按已有结果出纸，并在体检报告里写明「因超时按前一次结果出纸」，
 # 让用户自己拆表 —— 不拿全站容量去碰运气。
+#
+# 但光把预算传到底还不够：240 秒的预算本身就比一次模型调用长一个量级，所以表格
+# 已经不在 AI 名额里跑了 —— 路由层按扩展名把它分到 ai_pool 的转换车道（独立线程池、
+# 独立名额、更小的上限）。那段更长的等待只影响别的表格，不会让点体检的人排队。
 RENDER_BUDGET_SECONDS_FALLBACK = 240.0
 # 单次转换的默认上限（settings.soffice_timeout_seconds 的兜底值）
 SINGLE_CONVERSION_SECONDS_FALLBACK = 180.0

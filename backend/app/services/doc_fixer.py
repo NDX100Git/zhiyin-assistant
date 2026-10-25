@@ -30,7 +30,7 @@ from app.models.user import User
 from app.services.converter import pdf_to_docx_file
 from app.services.doc_parser import get_cached_report, save_report
 from app.services.file_service import record_generated_upload
-from app.services.llm import chat_json
+from app.services.llm import bind_key, chat_json
 from app.services.storage import build_object_key, get_storage
 from app.utils.exceptions import BusinessError
 from app.utils.filetype import MIME_BY_EXT, normalize_ext
@@ -492,10 +492,12 @@ def fix_document(
     file_name: str | None = None,
     *,
     user: User | None = None,
+    api_key: str | None = None,
 ) -> dict:
     """按勾选的问题生成修复副本。
 
     传入 `user` 时把修复副本写进上传记录，归属当前用户；否则学生无法撤回它。
+    api_key 是学生自带的模型密钥，只在本次修复的模型调用里用一次。
     """
     if not file_key:
         raise BusinessError("缺少文件标识", code=40073)
@@ -516,7 +518,7 @@ def fix_document(
     skipped: list[dict] = []
     notes: list[str] = []
     try:
-        raw = chat_json(build_messages(issues, rules, ext))
+        raw = bind_key(chat_json, api_key)(build_messages(issues, rules, ext))
         actions, skipped = sanitize_actions(raw)
     except BusinessError as exc:
         notes.append(f"AI 未给出可用指令（{exc.message}），本次没有可执行的修复")

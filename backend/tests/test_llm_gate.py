@@ -405,3 +405,152 @@ def test_并发首次调用只创建一个同步客户端(monkeypatch) -> None:
 
 def test_并发首次调用只创建一个异步客户端(monkeypatch) -> None:
     _race_lazy_loader(monkeypatch, "AsyncOpenAI", "_async_client", llm.get_async_client)
+
+
+# ---------------------------------------------------------------- 两条车道：表格不许长期独占 AI 名额
+# 历史问题：一条表格请求的预算是 240 秒，而它和体检、看图识字共用同一份名额。
+# 一张大表就能把 4 个名额里的 1 个占住四分钟（名额少的时候直接占满），
+# 别人点体检只看到「当前使用 AI 的人较多」。改成按文件类型分车道后，
+# 表格的等待只影响别的表格。
+from app.services import ai_pool  # noqa: E402
+
+
+def test_表格文件走转换车道其余走模型车道() -> None:
+    assert ai_pool.lane_for_file("files/2026/10/汇总表.xlsx") == ai_pool.LANE_CONVERSION
+    assert ai_pool.lane_for_file("files/2026/10/老表格.xls") == ai_pool.LANE_CONVERSION
+    assert ai_pool.lane_for_file("files/2026/10/论文.pdf") == ai_pool.LANE_AI
+    assert ai_pool.lane_for_file("files/2026/10/论文.docx") == ai_pool.LANE_AI
+    assert ai_pool.lane_for_file("") == ai_pool.LANE_AI
+
+
+def test_转换车道认定的文件类型与解析层同口径() -> None:
+    """两处各写一份扩展名清单，漂移了就会有一类文件继续占 AI 名额。"""
+    from app.services.doc_parser import SPREADSHEET_EXTS
+
+    assert set(ai_pool.CONVERSION_EXTS) == set(SPREADSHEET_EXTS)
+
+
+def test_大表格进行中另一个AI请求几乎立刻拿到名额(monkeypatch) -> None:
+    """把两条车道都限到 1 个名额：转换车道被大表格占住时，模型车道必须照常放行。
+
+    这就是验收要的那个秒数：单车道时这里会等到大表格结束（下面故意把表格任务
+    设成 1.5 秒），分车道后等待应该在几十毫秒内。
+    """
+    monkeypatch.setattr(settings, "ai_max_workers", 1)
+    monkeypatch.setattr(settings, "conversion_max_workers", 1)
+    monkeypatch.setattr(settings, "ai_queue_wait_seconds", 5.0)
+    monkeypatch.setattr(settings, "conversion_queue_wait_seconds", 5.0)
+
+    holding = threading.Event()
+    release = threading.Event()
+
+    def big_table_render() -> None:
+        holding.set()
+        release.wait(10)
+
+    async def scenario() -> tuple[float, float]:
+        async def big_sheet() -> None:
+            async with ai_pool.job_lane(ai_pool.LANE_CONVERSION):
+                await ai_pool.run_ai_job(big_table_render, lane=ai_pool.LANE_CONVERSION)
+
+        table_task = asyncio.create_task(big_sheet())
+        await asyncio.to_thread(holding.wait, 5)
+
+        begin = time.monotonic()
+        async with ai_pool.job_lane(ai_pool.LANE_AI):
+            waited = time.monotonic() - begin
+
+        release.set()
+        await table_task
+        return waited, time.monotonic() - begin
+
+    waited, total = asyncio.run(scenario())
+
+    assert waited < 0.5, f"模型车道被表格挡了 {waited:.3f} 秒"
+    print(f"\n大表格进行中，另一个 AI 请求拿到名额用了 {waited * 1000:.1f} 毫秒")
+    assert total < 5.0
+
+
+def test_模型车道占满也不挡住表格(monkeypatch) -> None:
+    """反过来也一样：两条车道各算各的，谁也别拖谁。"""
+    monkeypatch.setattr(settings, "ai_max_workers", 1)
+    monkeypatch.setattr(settings, "conversion_max_workers", 1)
+    monkeypatch.setattr(settings, "ai_queue_wait_seconds", 5.0)
+    monkeypatch.setattr(settings, "conversion_queue_wait_seconds", 5.0)
+
+    holding = threading.Event()
+    release = threading.Event()
+
+    def slow_model_call() -> None:
+        holding.set()
+        release.wait(10)
+
+    async def scenario() -> float:
+        async def slow_job() -> None:
+            async with ai_pool.job_lane(ai_pool.LANE_AI):
+                await ai_pool.run_ai_job(slow_model_call)
+
+        model_task = asyncio.create_task(slow_job())
+        await asyncio.to_thread(holding.wait, 5)
+
+        begin = time.monotonic()
+        async with ai_pool.job_lane(ai_pool.LANE_CONVERSION):
+            waited = time.monotonic() - begin
+
+        release.set()
+        await model_task
+        return waited
+
+    assert asyncio.run(scenario()) < 0.5
+
+
+def test_转换车道的并发上限按配置卡住(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "conversion_max_workers", 2)
+    monkeypatch.setattr(settings, "conversion_queue_wait_seconds", 10.0)
+    state = {"active": 0, "peak": 0}
+    lock = threading.Lock()
+
+    def slow() -> None:
+        with lock:
+            state["active"] += 1
+            state["peak"] = max(state["peak"], state["active"])
+        time.sleep(0.12)
+        with lock:
+            state["active"] -= 1
+
+    async def one() -> None:
+        async with ai_pool.job_lane(ai_pool.LANE_CONVERSION):
+            await ai_pool.run_ai_job(slow, lane=ai_pool.LANE_CONVERSION)
+
+    async def scenario() -> None:
+        await asyncio.gather(*(one() for _ in range(5)))
+
+    asyncio.run(scenario())
+    assert state["peak"] <= 2, state
+
+
+def test_体检接口按文件类型选车道(client, monkeypatch) -> None:
+    """入口层的兑现：xlsx 进转换车道，pdf 进模型车道，且都把车道交给线程池。"""
+    used: list[str] = []
+
+    async def fake_run_ai_job(func, *args, lane: str = ai_pool.LANE_AI, **kwargs):
+        used.append(lane)
+        return {"file_key": "x", "page_count": 1, "issues": []}
+
+    monkeypatch.setattr("app.routers.ai.run_ai_job", fake_run_ai_job)
+    monkeypatch.setattr("app.routers.ai.ensure_files_owned_by", lambda db, user, keys: None)
+    monkeypatch.setattr("app.routers.ai.bind_report_owner", lambda db, user_id: None)
+
+    body = client.post("/api/auth/login", json={"device_id": "lane-router-owner"}).json()
+    assert body["code"] == 0, body
+    headers = {"Authorization": f"Bearer {body['data']['token']}"}
+
+    for file_key, expected in (
+        ("files/2026/10/汇总表.xlsx", ai_pool.LANE_CONVERSION),
+        ("files/2026/10/论文.pdf", ai_pool.LANE_AI),
+    ):
+        response = client.post(
+            "/api/ai/check", json={"file_key": file_key, "force": True}, headers=headers
+        ).json()
+        assert response["code"] == 0, response
+        assert used[-1] == expected, (file_key, used)
