@@ -67,10 +67,21 @@ app = FastAPI(
     openapi_url="/openapi.json",
 )
 
+# 通配符与凭据不能共存：allow_origins=["*"] + allow_credentials=True 时，
+# 浏览器规范下 Starlette 只能回显请求的 Origin，等于放行任意站点携带凭证调接口。
+# 本项目鉴权走 Authorization 头、不依赖 Cookie，通配时必须关掉 credentials。
+_cors_origins = settings.cors_origin_list
+_cors_allow_credentials = "*" not in _cors_origins
+if not _cors_allow_credentials:
+    logger.warning(
+        "CORS_ORIGINS 含 *，已自动关闭 allow_credentials；"
+        "生产环境请改成明确的前端域名列表"
+    )
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origin_list,
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=_cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )

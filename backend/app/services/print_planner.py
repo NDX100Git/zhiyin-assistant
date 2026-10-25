@@ -94,6 +94,19 @@ def fallback_recommend(features: dict) -> dict:
     }
 
 
+def _safe_int(value: Any, default: int) -> int:
+    """把模型返回值转成整数，转不了就退回默认值。
+
+    模型很爱把字段填成 "双面" / "A4" 这类字符串，直接 int() 会抛 ValueError，
+    而这个异常不在 BusinessError 的捕获范围内，会冒泡成 500「服务端开小差」，
+    明明有默认方案却不给用。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def sanitize_recommend(recommend: dict | None, features: dict) -> dict:
     """校验模型返回的方案，非法取值一律回退，颜色按文档实际情况兜底。"""
     allowed = get_ai_rules()["print_plan"]
@@ -101,11 +114,11 @@ def sanitize_recommend(recommend: dict | None, features: dict) -> dict:
     if not isinstance(recommend, dict):
         return base
 
-    print_side = int(recommend.get("print_side") or base["print_side"])
+    print_side = _safe_int(recommend.get("print_side"), base["print_side"])
     if print_side not in (1, 2):
         print_side = base["print_side"]
 
-    color_mode = int(recommend.get("color_mode") or base["color_mode"])
+    color_mode = _safe_int(recommend.get("color_mode"), base["color_mode"])
     if color_mode not in (0, 1):
         color_mode = base["color_mode"]
 
@@ -113,7 +126,7 @@ def sanitize_recommend(recommend: dict | None, features: dict) -> dict:
     if layout not in allowed["allowed_layouts"]:
         layout = base["layout"]
 
-    scale = int(recommend.get("scale") or base["scale"])
+    scale = _safe_int(recommend.get("scale"), base["scale"])
     if scale not in allowed["allowed_scales"]:
         scale = base["scale"]
 

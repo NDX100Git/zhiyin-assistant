@@ -136,16 +136,29 @@ def fail(task_id: str, error: str) -> None:
 
 
 def _purge_locked() -> None:
-    """清理过期任务，避免内存无限增长。"""
-    if len(_tasks) <= MAX_KEEP_TASKS:
-        return
+    """按 TTL 清理过期任务，总量超上限时再淘汰最久未更新的。
+
+    早期实现是「任务数还没超过 MAX_KEEP_TASKS 就直接 return，且过期判断还要
+    同时满足」——几十条任务的小规模下 TTL 等于没生效，已完成的任务带着
+    result（校对结果里有论文原文片段）一直驻留到进程重启。
+    """
     now = time.time()
-    expired = [
-        task_id
-        for task_id, task in _tasks.items()
+    for task_id in [
+        task_id for task_id, task in _tasks.items()
         if now - task.updated_at > TASK_TTL_SECONDS
-    ]
-    for task_id in expired:
+    ]:
+        _tasks.pop(task_id, None)
+
+    overflow = len(_tasks) - MAX_KEEP_TASKS
+    if overflow <= 0:
+        return
+    # 只淘汰已结束的任务，运行中的不动（它们的数量由并发上限约束）
+    idle = sorted(
+        (task.updated_at, task_id)
+        for task_id, task in _tasks.items()
+        if task.status in (STATUS_DONE, STATUS_FAILED)
+    )
+    for _, task_id in idle[:overflow]:
         _tasks.pop(task_id, None)
 
     if len(_tasks) > MAX_KEEP_TASKS:
