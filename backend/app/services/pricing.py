@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from app.config import get_pricing_config
+from app.config import get_order_rules, get_pricing_config
 from app.utils.exceptions import BusinessError
 
 
@@ -44,23 +44,61 @@ def calc_amount_cents(page_count: int, print_side: int, color_mode: int, copies:
 
 # 老师改价的护栏。只挡负数等于没挡：把 300 敲成 3000 元照样落库并现场收款，
 # 学生当场扫码就多付十倍；偏离系统价太多时一律要求重新核对。
-MAX_ORDER_AMOUNT_CENTS = 100_000  # 单笔绝对上限 1000 元
+#
+# 绝对上限不能写死一个数字：写死 1000 元时，系统允许的最大合法单（1000 页 × 50 份
+# × 彩色 80 分 = 4 万元）里的任何一单都会被 40062 挡在「完成打印」之外，改价、核销
+# 全走不通。上限跟着配置里的下单限制走，合法单才不会被护栏拦住。
 MAX_AMOUNT_RATIO = 10             # 相对系统价最多 10 倍
 MIN_ALLOWANCE_CENTS = 2_000       # 但至少给到 20 元的浮动空间
+PRICE_KEYS = ("bw_single", "bw_duplex", "color_single", "color_duplex")
+
+
+def max_legal_order_amount_cents() -> int:
+    """任何合法订单都不可能超过的金额（分），由下单限制与最高单价推出来。
+
+    整单合计页数上限（max_page_count）× 每份份数上限（max_copies）× 最高单价。
+    配置里页数上限是**整单合计**（见 order_file_service.normalize_file_items），
+    所以文件数不能再乘一遍，否则上限会被放大成几十万元，护栏形同虚设。
+    """
+    limits = get_order_rules().get("limits", {})
+    config = get_pricing_config()
+    units = [config.get(key) for key in PRICE_KEYS]
+    prices = [int(unit) for unit in units if isinstance(unit, int) and unit >= 0]
+    if not prices:
+        raise BusinessError("计费配置有误：没有任何可用的页单价", code=50010)
+    return int(limits["max_page_count"]) * int(limits["max_copies"]) * max(prices)
+
+
+# 金额为零的提示。与「负数」共用一个码 40061（前端只把 40061 译成「不能为负数」），
+# 所以这句话必须把两种情形都说清：老师把 300 敲成 0 时看到的是这句，不是「不能为负数」。
+AMOUNT_NOT_POSITIVE_MESSAGE = (
+    "金额必须大于 0 分：不能填负数，也不能填 0；确需免单请改走作废流程"
+)
 
 
 def ensure_amount_allowed(amount_cents: int, system_amount_cents: int = 0) -> int:
-    """校验改价/成交价：非负、有绝对上限、相对系统价有倍数上限。返回校验后的金额。
+    """校验改价/成交价：必须大于 0、有绝对上限、相对系统价有倍数上限。返回校验后的金额。
+
+    金额为 0 与已收款并存会让对账分叉（收了一笔钱，账上却是 0 元单），所以 0 元
+    一律拒绝；确有免单需求时走作废流程，或者显式登记全额退款，不要用 0 元成交价
+    伪造一单「免费」。
+
+    负数与 0 元事态不同，但对外都是 40061 一个码，文案由 AMOUNT_NOT_POSITIVE_MESSAGE
+    统一说清两种情形 —— 前端码表里 40061 的固定文案只写了「不能为负数」，填 0 时
+    会翻译错（已登记给前端轮次跟改）。
 
     倍数上限取「系统价 × 10」与「20 元」的较大者：1 页黑白单系统价只有 15 分，
     只用倍数会把「老师让价到 2 元」也拦掉，那不是护栏而是故障。
     """
     amount = int(amount_cents)
     if amount < 0:
-        raise BusinessError("金额不能为负数", code=40061)
-    if amount > MAX_ORDER_AMOUNT_CENTS:
+        raise BusinessError(AMOUNT_NOT_POSITIVE_MESSAGE, code=40061)
+    if amount == 0:
+        raise BusinessError(AMOUNT_NOT_POSITIVE_MESSAGE, code=40061)
+    ceiling = max_legal_order_amount_cents()
+    if amount > ceiling:
         raise BusinessError(
-            f"金额 {amount} 分超出单笔上限 {MAX_ORDER_AMOUNT_CENTS} 分，请核对后重新输入",
+            f"金额 {amount} 分超出单笔上限 {ceiling} 分，请核对后重新输入",
             code=40062,
         )
     if system_amount_cents > 0:

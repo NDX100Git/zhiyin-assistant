@@ -7,6 +7,16 @@
       </view>
     </view>
 
+    <!--
+      学生自己的密钥不可用：把原因和出口说清楚。
+      不静默退回学校密钥——在学生自己点「清除并改用学校共享」之前，AI 请求仍带这把钥匙。
+    -->
+    <view v-if="keyError" class="card key-error-card">
+      <text class="key-error-title">你的 AI 密钥不可用</text>
+      <text class="key-error-text">{{ keyError }}</text>
+      <text class="key-error-hint">去「我的」→「AI 密钥」可以清除后改用学校共享密钥。</text>
+    </view>
+
     <view class="card">
       <view class="card-head">
         <text class="card-title">1. 选择要打印的文件</text>
@@ -114,6 +124,8 @@
       <text class="ai-entry-desc">
         {{ aiChecked ? '已按体检结果更新打印方案，也可以重新体检。' : '检查结构、参考文献与版式，并可选择生成修复副本。不做体检也能直接下单。' }}
       </text>
+      <!-- 学生要知道自己在用哪把钥匙：学校共享还是自己填的那把 -->
+      <text class="ai-key-line" :class="{ own: keyOwn }">当前使用：{{ keyUsage }}</text>
       <view class="ai-actions">
         <button class="action ghost" :disabled="checking || preparing" @click="runCheck">
           {{ checking ? 'AI 正在体检…' : (aiChecked ? '重新体检' : '开始 AI 体检') }}
@@ -145,8 +157,8 @@
         <text class="tag">{{ severitySummary }}</text>
       </view>
       <text class="summary">{{ report.summary }}</text>
-      <view v-if="report.ai_errors && report.ai_errors.length" class="warn">
-        {{ report.ai_errors.join('；') }}
+      <view v-if="checkError" class="warn">
+        {{ checkError }}
       </view>
       <view class="ai-fix-row">
         <view class="ai-fix-text">
@@ -247,13 +259,36 @@
         </view>
       </view>
       <text v-if="quoteError" class="quote-error">
-        服务端报价失败：{{ quoteError }}；上面显示的是上一次服务端算出的金额，改参数后会自动重试。
+        服务端报价失败：{{ quoteError }}；上面显示的是上一次服务端算出的金额，点下面「重新报价」或改参数都会重新请求。
       </text>
+      <!--
+        自动重试用完后的手动出口：不加这个按钮，用户只能改参数才能重新报价，
+        下单按钮会被一直禁用，看起来像「页面坏了」。
+      -->
+      <button
+        v-if="quoteError"
+        class="action retry-quote"
+        :disabled="quoting"
+        @click="retryQuote"
+      >
+        {{ quoting ? '重新报价中…' : '重新报价' }}
+      </button>
       <text class="plan-reason">{{ singleFile ? 'AI 建议理由' : '方案估算依据' }}：{{ plan.reason }}</text>
+      <!--
+        打印方案出错时后端仍返回 success + 基础方案（有意的降级），错误文案在 plan.errors 里。
+        早先只看体检报告的 ai_errors，学生点打印方案时出错就看不到任何提示——
+        「你的密钥不可用，请去清除」就被吞掉了。这里用与体检错误同一个 .warn 样式。
+        正常无错时 planError 是空串，v-if 不显示。
+      -->
+      <view v-if="planError" class="warn">{{ planError }}</view>
+      <!--
+        收费按文档页数算，这里只是「预计张数」，不能写成「省多少张」当收费承诺：
+        学生把省张数当成该收的钱，实际收费按页数算，对不上就会投诉。
+        金额仍只取服务端报价（quoteAmount），页面不乘单价。
+      -->
       <view v-if="singleFile" class="savings">
-        <text>纸张 {{ plan.original_sheets }} → {{ plan.sheets_needed }} 张</text>
-        <text class="green">省 {{ plan.saved_sheets }} 张</text>
-        <text class="money">预计 {{ formatMoney(quoteAmount) }}</text>
+        <text class="savings-tip">纸张 {{ plan.original_sheets }} → {{ plan.sheets_needed }} 张是预计张数，实际以老师确认为准</text>
+        <text class="money">服务端报价 {{ formatMoney(quoteAmount) }}</text>
       </view>
       <view v-else class="savings">
         <text>{{ files.length }} 个文件 · 文档 {{ docPages }} 页 · 打印 {{ printPages === null ? '—' : printPages }} 页</text>
@@ -280,11 +315,14 @@
 
 <script setup>
 import { computed, onUnmounted, ref } from 'vue'
+import { onShow } from '@dcloudio/uni-app'
 import { deleteUploadedFile, quoteOrder, request, uploadFile } from '@/services/api'
 import { ensureLogin } from '@/services/auth'
 import { MAX_FILES_PER_PICK, chooseDocuments, chooseImage, loadDemoDocument } from '@/services/filePicker'
+import { isLlmKeyFailure, llmKeyFailureText, llmKeyUsageLabel } from '@/services/llmKey'
 import { PAPER_SIZES } from '@/services/orderFiles'
 import { notify, notifyError } from '@/services/notify'
+import { formatAiErrorList } from '@/utils/errors'
 import { useUiTheme } from '@/ui/theme'
 
 const { uiThemeClass, uiSchemeClass } = useUiTheme()
@@ -336,6 +374,45 @@ const ocrText = ref('')
 
 /** 只有一份文件时才有 AI 体检与修复：多文件的体检口径产品还没定。 */
 const singleFile = computed(() => files.value.length === 1)
+
+/* ---------- 学生自己的密钥：只影响提示，不影响请求（请求头由 services/api.js 统一带） ---------- */
+
+/** 「当前使用：学校共享 / 我的密钥」那一行。 */
+const keyUsage = ref(llmKeyUsageLabel())
+const keyOwn = computed(() => keyUsage.value === '我的密钥')
+/** 密钥不可用的原因：非空时页面顶部给一条横幅，不静默退回学校密钥。 */
+const keyError = ref('')
+
+/**
+ * AI 降级时模型出错的文案。
+ *
+ * `/api/ai/check` 与 `/api/ai/print-plan` 在 AI 出错时都**返回成功码 + 基础结果**
+ * （有意的降级：学生照样能看报告、能下单），错误文案分别在 `ai_errors` 与 `errors`
+ * 里。两条都要有出口：只看体检那一份，「你的密钥不可用，请去清除」在打印方案
+ * 这一步就又看不到了。两处用同一个 .warn 样式；没有错误时是空串，不显示。
+ */
+const checkError = computed(() => formatAiErrorList(report.value && report.value.ai_errors))
+const planError = computed(() => formatAiErrorList(plan.value && plan.value.errors))
+
+// 学生可能在「我的」页刚换过钥匙，每次回到本页重读
+onShow(() => {
+  keyUsage.value = llmKeyUsageLabel()
+})
+
+/**
+ * AI 请求失败时的统一出口。
+ *
+ * 密钥不可用就说清楚「你的密钥不可用 + 去哪儿清除」，其余错误照旧提示；
+ * 两种情况都不自动重试、不自动丢密钥（那就是静默回退了）。
+ */
+function reportAiError(error) {
+  if (isLlmKeyFailure(error)) {
+    keyError.value = llmKeyFailureText(error)
+    notify('你的密钥不可用，请到「我的」→「AI 密钥」清除后改用学校共享')
+    return
+  }
+  notifyError(error)
+}
 
 /** 订单总页数：清单里各文件页数之和，下单与计费都按它算。 */
 const totalPages = computed(() =>
@@ -467,6 +544,23 @@ async function refreshQuote(retry = 0) {
   } finally {
     if (seq === quoteSeq && !quoteTimer) quoting.value = false
   }
+}
+
+/**
+ * 手动重新报价。
+ *
+ * 自动重试 3 次用完后 quoteError 会一直留着，下单按钮随之永久禁用;
+ * 早期实现里用户只能改参数才能重新报价。这里给一个明确出口：
+ * 点一下立刻清掉错误（同时解锁下单按钮）并重新请求，失败会把错误写回来。
+ */
+async function retryQuote() {
+  if (quoting.value || !files.value.length) return
+  if (quoteTimer) {
+    clearTimeout(quoteTimer)
+    quoteTimer = null
+  }
+  quoteError.value = ''
+  await refreshQuote(0)
 }
 
 const severitySummary = computed(() => {
@@ -661,9 +755,10 @@ async function pickImage() {
       data: { file_key: uploaded.file_key },
     })
     ocrText.value = ocr.text
+    keyError.value = ''
     notify('识别完成', 'success')
   } catch (error) {
-    notifyError(error)
+    reportAiError(error)
   } finally {
     busy.value = false
   }
@@ -678,6 +773,7 @@ async function runCheck() {
       data: { file_key: primaryFile.value.file_key },
     })
     aiChecked.value = true
+    keyError.value = ''
     const checked = Math.max(1, Number(report.value.page_count) || 1)
     // 体检可能发现实际页数与 page-count 不一致，以体检为准
     primaryFile.value.page_count = checked
@@ -686,7 +782,7 @@ async function runCheck() {
     await loadPlan(true)
     scheduleQuote()
   } catch (error) {
-    notifyError(error)
+    reportAiError(error)
   } finally {
     checking.value = false
   }
@@ -713,12 +809,14 @@ async function loadPlan(useAi = false) {
       data: { file_key: primaryFile.value.file_key, options },
     })
     planUsesAi.value = useAi
+    // 方案拿到了 = 这把密钥这次没被拒，之前那条失效横幅已经过期
+    keyError.value = ''
     printSide.value = plan.value.recommend.print_side
     colorMode.value = plan.value.recommend.color_mode
     layout.value = plan.value.recommend.layout
     stepIndex.value = 2
   } catch (error) {
-    notifyError(error)
+    reportAiError(error)
   } finally {
     preparing.value = false
   }
@@ -796,7 +894,7 @@ async function generateFixed() {
     selectedIssues.value = []
     await runCheck()
   } catch (error) {
-    notifyError(error)
+    reportAiError(error)
   } finally {
     busy.value = false
   }
@@ -957,6 +1055,46 @@ onUnmounted(() => {
 }
 .ai-entry {
   border: 2rpx dashed var(--zi-line-strong);
+}
+/* 「当前使用：学校共享 / 我的密钥」一行小字 */
+.ai-key-line {
+  display: block;
+  margin-top: 10rpx;
+  color: var(--zi-muted);
+  font-size: 22rpx;
+  font-weight: 700;
+  line-height: 1.5;
+  word-break: break-all;
+}
+.ai-key-line.own {
+  color: var(--zi-accent);
+}
+/* 密钥不可用的横幅：说清原因与出口 */
+.key-error-card {
+  border-left: 6rpx solid var(--zi-danger);
+  background: var(--zi-danger-bg);
+}
+.key-error-title {
+  display: block;
+  color: var(--zi-danger);
+  font-size: 26rpx;
+  font-weight: 900;
+  line-height: 1.5;
+}
+.key-error-text {
+  display: block;
+  margin-top: 8rpx;
+  color: var(--zi-danger);
+  font-size: 24rpx;
+  line-height: 1.6;
+  word-break: break-all;
+}
+.key-error-hint {
+  display: block;
+  margin-top: 8rpx;
+  color: var(--zi-ink);
+  font-size: 22rpx;
+  line-height: 1.6;
 }
 .ai-entry-desc {
   display: block;
@@ -1395,6 +1533,16 @@ onUnmounted(() => {
   font-weight: 700;
   line-height: 1.6;
 }
+/* 手动重新报价：报价失败后唯一的出口，禁用时也不要看起来像主按钮 */
+.action.retry-quote {
+  width: 100%;
+  margin: 12rpx 0 0;
+  border-color: var(--zi-danger);
+  color: var(--zi-danger);
+}
+.action.retry-quote[disabled] {
+  opacity: 0.5;
+}
 /* 多文件时参数逐份设置，订单级只留版式 */
 .multi-tip {
   margin-top: 14rpx;
@@ -1421,9 +1569,10 @@ onUnmounted(() => {
   color: var(--zi-ink);
   font-size: 24rpx;
 }
-.savings .green {
-  color: var(--zi-ok);
-  font-weight: 700;
+/* 预计张数说明：一行读完，不再单独放大「省 N 张」 */
+.savings-tip {
+  flex: 1 1 auto;
+  line-height: 1.5;
 }
 .savings .money {
   color: var(--zi-ink);

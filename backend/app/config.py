@@ -25,6 +25,8 @@ CONFIG_DIR = BACKEND_DIR / "config"
 WEAK_CREDENTIALS = frozenset(
     {"", "change_me", "changeme", "admin", "123456", "password", "secret"}
 )
+MIN_JWT_SECRET_BYTES = 32
+MIN_ADMIN_PASSWORD_CHARS = 8
 
 
 logger = logging.getLogger(__name__)
@@ -91,10 +93,20 @@ class Settings(BaseSettings):
     llm_max_attempts: int = 2
     llm_max_concurrency: int = 4
     llm_queue_wait_seconds: float = 3.0
+    # 学生自带的 AI 密钥：前端在请求头 X-LLM-Api-Key 里带一次，后端只用这一次，
+    # 不落库、不落日志、不进 URL 与响应体。默认开启；运维把它关掉后，该请求头一律
+    # 忽略，仍按学校共享密钥调用（关掉是为了临时收口，不要指望它当权限控制）。
+    llm_user_key_enabled: bool = True
     # AI 任务专用线程池大小与排队上限。公共线程池只留给交易链路，
     # AI 再慢也只占这几个名额；排队等不到就早失败，不占线程。
     ai_max_workers: int = 4
     ai_queue_wait_seconds: float = 30.0
+    # 文档/表格转换车道。表格归一化 + LibreOffice 转换一条请求的预算默认 240 秒，
+    # 和「几十秒内结束」的模型调用不是一个量级：混在同一条车道上，一张大表就能把
+    # 全部 AI 名额占住四分钟，别人点体检只会看到「人较多」。所以另开一条车道，
+    # 自己一套线程与名额，并配一个更小的上限：转换慢，可以等，但不能拖住模型调用。
+    conversion_max_workers: int = 2
+    conversion_queue_wait_seconds: float = 10.0
 
     # 管理员（阶段 4 使用）
     admin_username: str = "admin"
@@ -133,6 +145,12 @@ class Settings(BaseSettings):
     # 填容器名即走 docker exec，容器内把后端的 runtime 目录挂成 soffice_container_dir。
     soffice_container: str = ""
     soffice_container_dir: str = "/workspace/runtime"
+    # 表格渲染（归一版式 + LibreOffice 转换）一条请求的总耗时预算，单位秒。
+    # 字太小会逐页放宽重试，每次重试都要重新转换一次，单次最长 soffice_timeout_seconds。
+    # 不设预算时最差四次串行＝十几分钟。这类请求走的是转换车道（conversion_max_workers），
+    # 不占 AI 名额，所以预算再长也只影响别的表格，不会让点体检的人排队。
+    # 超预算就按当前结果出纸，并在体检报告里提示列太多、字号偏小。
+    spreadsheet_render_budget_seconds: float = 240.0
 
     # 可扩展点：V1 用简化实现，V2 换实现只改环境变量
     auth_provider: str = "device"  # device | wechat | cas
@@ -177,18 +195,22 @@ class Settings(BaseSettings):
             )
             return self
 
-        weak = [
-            name
-            for name, value in (
-                ("JWT_SECRET", self.jwt_secret),
-                ("ADMIN_PASSWORD", self.admin_password),
-            )
-            if is_weak_credential(value)
-        ]
+        weak: list[str] = []
+        if (
+            is_weak_credential(self.jwt_secret)
+            or len(self.jwt_secret.encode("utf-8")) < MIN_JWT_SECRET_BYTES
+        ):
+            weak.append("JWT_SECRET")
+        if (
+            is_weak_credential(self.admin_password)
+            or len(self.admin_password) < MIN_ADMIN_PASSWORD_CHARS
+        ):
+            weak.append("ADMIN_PASSWORD")
         if weak:
             raise ValueError(
-                "以下配置仍是公开示例值，拒绝启动：" + "、".join(weak)
-                + "。请在 backend/.env 中改成随机值（JWT_SECRET 建议 32 字节以上）；"
+                "以下配置过弱，拒绝启动：" + "、".join(weak)
+                + f"。JWT_SECRET 至少 {MIN_JWT_SECRET_BYTES} 字节，"
+                f"ADMIN_PASSWORD 至少 {MIN_ADMIN_PASSWORD_CHARS} 个字符；"
                 "本机演示或跑单测可临时设 ALLOW_INSECURE_DEFAULTS=true。"
             )
         return self

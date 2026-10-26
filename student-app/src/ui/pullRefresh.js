@@ -29,7 +29,6 @@ export function usePullRefresh(task) {
 
   // #ifdef H5
   let startY = null
-  let tracking = false
   let mounted = false
 
   function atTop() {
@@ -44,7 +43,6 @@ export function usePullRefresh(task) {
     }
     const touch = event.touches && event.touches[0]
     startY = touch ? touch.clientY : null
-    tracking = false
   }
 
   function onTouchMove(event) {
@@ -56,16 +54,13 @@ export function usePullRefresh(task) {
       // 手指往上走：交回页面滚动，不要抢手势
       if (offset.value !== 0) offset.value = 0
       startY = touch.clientY
-      tracking = false
       return
     }
     if (!atTop()) {
       startY = null
-      tracking = false
       offset.value = 0
       return
     }
-    tracking = true
     offset.value = Math.min(MAX_OFFSET, delta * DAMPING)
     if (event.cancelable) event.preventDefault()
   }
@@ -75,7 +70,6 @@ export function usePullRefresh(task) {
     startY = null
     if (refreshing.value) return
     const pulled = offset.value
-    tracking = false
     if (pulled < PULL_THRESHOLD) {
       offset.value = 0
       return

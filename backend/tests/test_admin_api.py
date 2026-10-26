@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 from datetime import date
 
+import pytest
 from sqlalchemy import select
 
 from app.config import settings
@@ -20,6 +21,16 @@ _seq = itertools.count(1)
 def _full_code(tail: str, day: date | None = None) -> str:
     """取件码是日期前缀加当日短码，如 261017-A-01。"""
     return f"{(day or date.today()):%y%m%d}-{tail}"
+
+
+def _fullwidth_digits(text: str) -> str:
+    """把半角数字换成手机输入法打出的全角数字（０ 至 ９）。"""
+    return text.translate({ord(str(i)): chr(0xFF10 + i) for i in range(10)})
+
+
+def _with_dash(text: str, dash: str) -> str:
+    """把取件码里的半角短横换成指定样式的连接符。"""
+    return text.replace("-", dash)
 
 
 def _make_order(db_session, status: str = "queuing", pickup_code: str | None = None,
@@ -113,6 +124,47 @@ def test_队列按订单号排序且支持筛选与搜索(client, db_session):
     ).json()["data"]
     assert searched["total"] == 1
     assert searched["items"][0]["pickup_code"] == _full_code("B-12")
+
+
+def test_队列每页条数上限边界(client, db_session):
+    """page_size 的上下界是接口契约：老师端「加载更多」就靠它封顶 200。
+
+    之前 `backend/tests/` 对这个边界零覆盖，改坏 `Query(ge=1, le=200)` 也没人发现：
+    - 恰好 200：正常返回，page_size 回显 200（前端 QUEUE_PAGE_SIZE_MAX 照这个数写死）；
+    - 201 / 500：超过上限必须直接拒，否则一次轮询就把整个库拉回浏览器；
+    - 0 / -1：小于下界也必须拒（`limit(0)` 会平静地返回空列表，看起来像“队列空了”）。
+
+    被拒的要是统一响应格式里的 code 40001 + 可读原因（参数名 + 边界值），不是 500。
+    """
+    token = admin_token(client)
+    for index in range(3):
+        _make_order(db_session, status="queuing", pickup_code=f"C-{index + 1:02d}")
+
+    accepted = client.get(
+        "/api/admin/queue", params={"page": 1, "page_size": 200}, headers=auth(token)
+    ).json()
+    assert accepted["code"] == 0, accepted
+    assert accepted["data"]["page_size"] == 200
+    assert accepted["data"]["total"] == 3
+    assert len(accepted["data"]["items"]) == 3
+
+    rejected = (
+        (201, "less than or equal to 200"),
+        (500, "less than or equal to 200"),
+        (0, "greater than or equal to 1"),
+        (-1, "greater than or equal to 1"),
+    )
+    for page_size, reason in rejected:
+        response = client.get(
+            "/api/admin/queue", params={"page_size": page_size}, headers=auth(token)
+        )
+        assert response.status_code == 200, f"page_size={page_size} 应该是统一响应，不是 HTTP 错误"
+        body = response.json()
+        assert body["code"] == 40001, (page_size, body)
+        assert body["data"] is None, (page_size, body)
+        assert "参数校验失败" in body["message"], (page_size, body["message"])
+        assert "page_size" in body["message"], (page_size, body["message"])
+        assert reason in body["message"].lower(), (page_size, body["message"])
 
 
 def test_开始打印然后完成打印(client, db_session, test_storage):
@@ -274,6 +326,87 @@ def test_按取件码核销(client, db_session):
         "/api/admin/order/verify-code", json={"pickup_code": "Z-99"}, headers=auth(token)
     ).json()
     assert missing["code"] == 40401
+
+
+def _verify_by_code(client, token: str, pickup_code: str) -> dict:
+    return client.post(
+        "/api/admin/order/verify-code",
+        json={"pickup_code": pickup_code},
+        headers=auth(token),
+    ).json()
+
+
+def test_半角完整码核销_回归(client, db_session):
+    """回归：学生端展示与扫码用的半角完整码仍可核销。"""
+    token = admin_token(client)
+    order = _make_order(db_session, status="ready", pickup_code="M-31")
+    code = _full_code("M-31")
+
+    body = _verify_by_code(client, token, code)
+    assert body["code"] == 0, body
+    assert body["data"]["order"]["id"] == order.id
+    assert body["data"]["order"]["status"] == "completed"
+
+
+def test_全角短横的完整码能核销(client, db_session):
+    """真机问题：手机输入法给出全角短横「－」（U+FF0D）。"""
+    token = admin_token(client)
+    order = _make_order(db_session, status="ready", pickup_code="0-32")
+    typed = _with_dash(_full_code("0-32"), "－")
+    assert typed != _full_code("0-32")
+
+    body = _verify_by_code(client, token, typed)
+    assert body["code"] == 0, body
+    assert body["data"]["order"]["id"] == order.id
+
+    # 归一化只作用于输入，库里的取件码保持不变
+    db_session.expire_all()
+    assert db_session.get(Order, order.id).pickup_code == _full_code("0-32")
+
+
+def test_全角数字的完整码能核销(client, db_session):
+    token = admin_token(client)
+    order = _make_order(db_session, status="ready", pickup_code="H-07")
+    typed = _fullwidth_digits(_full_code("H-07"))
+
+    body = _verify_by_code(client, token, typed)
+    assert body["code"] == 0, body
+    assert body["data"]["order"]["id"] == order.id
+
+
+def test_中文破折号的完整码能核销(client, db_session):
+    """中文习惯的破折号样连接符也要归成半角短横。"""
+    token = admin_token(client)
+    order = _make_order(db_session, status="ready", pickup_code="N-58")
+    typed = _with_dash(_fullwidth_digits(_full_code("N-58")), "—")
+
+    body = _verify_by_code(client, token, typed)
+    assert body["code"] == 0, body
+    assert body["data"]["order"]["id"] == order.id
+
+
+def test_全角空格包裹的当天短码能核销(client, db_session):
+    """只输当天短码时按服务器当天补全日期，前后全角空格、全角数字与全角短横都要认。"""
+    token = admin_token(client)
+    order = _make_order(db_session, status="ready", pickup_code="F-05")
+    typed = "　" + _with_dash(_fullwidth_digits("f-05"), "－") + "　"
+
+    body = _verify_by_code(client, token, typed)
+    assert body["code"] == 0, body
+    assert body["data"]["order"]["id"] == order.id
+    assert body["data"]["order"]["pickup_code"] == _full_code("F-05")
+
+
+def test_不存在的码仍返回40401并回显原始输入(client, db_session):
+    """核销判定不放宽：查不到还是 40401，提示里带的是老师输入的那一份。"""
+    token = admin_token(client)
+    _make_order(db_session, status="ready", pickup_code="P-11")
+    typed = _with_dash(_fullwidth_digits("Z-99"), "－")
+
+    body = _verify_by_code(client, token, typed)
+    assert body["code"] == 40401
+    assert body["message"] == f"没有找到取件码 {typed} 对应的待取件订单"
+    assert "Z-99" not in body["message"]
 
 
 def test_异常_恢复_关闭三种处置(client, db_session):
@@ -445,3 +578,505 @@ def test_改价上调后核销只补收差额(client, db_session):
     )
     assert sorted(p.amount_cents for p in payments) == [75, 725]
     assert db_session.get(Order, order.id).paid == 1
+
+
+# ---------------------------------------------------------------- 退款（关闭已付款异常单）
+
+
+def _paid_order(db_session, amount_cents: int = 630, **kwargs) -> Order:
+    """造一张已在线支付的订单，并落一条对应的支付流水。"""
+    order = _make_order(db_session, status="queuing", paid=1, **kwargs)
+    db_session.add(
+        PaymentLog(
+            order_id=order.id,
+            amount_cents=amount_cents,
+            method="mock",
+            operator="student",
+            idempotency_key=f"pay:{order.id}",
+        )
+    )
+    db_session.commit()
+    return order
+
+
+def test_关闭已付款异常单登记退款并冲减当日收入(client, db_session):
+    """已收过钱的单关单必须登记退款，当日收入要把退款排除。"""
+    token = admin_token(client)
+    order = _paid_order(db_session, pickup_code="R-01")
+
+    before = client.get("/api/admin/summary", headers=auth(token)).json()["data"]
+    assert before["income_cents"] == 630
+
+    client.post(
+        f"/api/admin/order/{order.id}/abnormal", json={"reason": "缺墨"}, headers=auth(token)
+    )
+    closed = client.post(
+        f"/api/admin/order/{order.id}/cancel",
+        json={"reason": "缺墨，无法打印"},
+        headers=auth(token),
+    ).json()
+    assert closed["code"] == 0, closed
+    assert closed["data"]["status"] == "cancelled"
+    assert closed["data"]["refund_cents"] == 630  # 不传金额时按成交价全额退
+    assert closed["data"]["paid_total_cents"] == 630
+    assert "退款 630 分" in closed["data"]["cancel_reason"]
+
+    db_session.expire_all()
+    payments = list(
+        db_session.execute(select(PaymentLog).where(PaymentLog.order_id == order.id)).scalars()
+    )
+    assert sorted(p.amount_cents for p in payments) == [-630, 630]
+    refund = next(p for p in payments if p.method == "refund")
+    assert refund.idempotency_key == f"refund:{order.id}"
+    assert refund.operator == settings.admin_username
+
+    after = client.get("/api/admin/summary", headers=auth(token)).json()["data"]
+    assert after["income_cents"] == 0  # 退款已从当日收入里排除
+
+    transactions = client.get(
+        "/api/admin/transactions",
+        params={"date": date.today().isoformat()},
+        headers=auth(token),
+    ).json()["data"]
+    assert transactions["total_cents"] == 0
+    assert {item["method"] for item in transactions["items"]} == {"mock", "refund"}
+
+    logs = list(
+        db_session.execute(select(PrintLog).where(PrintLog.order_id == order.id)).scalars()
+    )
+    assert any(log.action == "refund" and "630" in (log.note or "") for log in logs)
+
+
+def test_可以指定部分退款金额(client, db_session):
+    """老师按实际情况退一部分：退款金额可传，当日收入只冲掉退掉的那部分。"""
+    from app.services import admin_service
+
+    token = admin_token(client)
+    order = _paid_order(db_session, pickup_code="R-02")
+    admin_service.mark_abnormal(db_session, order, "打印质量有问题", settings.admin_username)
+
+    result = admin_service.cancel_abnormal(
+        db_session, order, "打印质量有问题", settings.admin_username, refund_cents=200
+    )
+
+    assert result["refund_cents"] == 200
+    assert result["status"] == "cancelled"
+    summary = client.get("/api/admin/summary", headers=auth(token)).json()["data"]
+    assert summary["income_cents"] == 430
+
+
+def test_退款金额不能超过已收金额(client, db_session):
+    """退款上限是实际收到的钱：多退会把当日收入冲成负数。"""
+    from app.services import admin_service
+    from app.utils.exceptions import BusinessError
+
+    order = _paid_order(db_session, pickup_code="R-03")
+    admin_service.mark_abnormal(db_session, order, "学生有异议", settings.admin_username)
+
+    with pytest.raises(BusinessError) as exc:
+        admin_service.cancel_abnormal(
+            db_session, order, "学生有异议", settings.admin_username, refund_cents=700
+        )
+    assert exc.value.code == 40062
+    assert "630" in exc.value.message
+    db_session.rollback()
+
+    db_session.expire_all()
+    assert db_session.get(Order, order.id).status == "abnormal"
+    payments = list(
+        db_session.execute(select(PaymentLog).where(PaymentLog.order_id == order.id)).scalars()
+    )
+    assert [p.amount_cents for p in payments] == [630]  # 没有退款行落地
+
+
+def test_接口可以指定部分退款金额(client, db_session):
+    """老师按实际情况退一部分：refund_cents 从 HTTP 一路落到退款流水。"""
+    token = admin_token(client)
+    order = _paid_order(db_session, pickup_code="R-05")
+    client.post(
+        f"/api/admin/order/{order.id}/abnormal", json={"reason": "少印了几页"}, headers=auth(token)
+    )
+
+    closed = client.post(
+        f"/api/admin/order/{order.id}/cancel",
+        json={"reason": "少印了几页，退一半", "refund_cents": 200},
+        headers=auth(token),
+    ).json()
+
+    assert closed["code"] == 0, closed
+    assert closed["data"]["refund_cents"] == 200
+    assert closed["data"]["paid_total_cents"] == 630
+    db_session.expire_all()
+    payments = list(
+        db_session.execute(select(PaymentLog).where(PaymentLog.order_id == order.id)).scalars()
+    )
+    refund = next(p for p in payments if p.method == "refund")
+    assert refund.amount_cents == -200  # 只冲掉退掉的那部分
+    summary = client.get("/api/admin/summary", headers=auth(token)).json()["data"]
+    assert summary["income_cents"] == 430
+
+
+def test_接口拒绝超过已收金额的退款(client, db_session):
+    """上限是实际收到的钱：多退会把当日收入冲成负数，接口层直接拒。"""
+    token = admin_token(client)
+    order = _paid_order(db_session, pickup_code="R-06")
+    client.post(
+        f"/api/admin/order/{order.id}/abnormal", json={"reason": "学生有异议"}, headers=auth(token)
+    )
+
+    refused = client.post(
+        f"/api/admin/order/{order.id}/cancel",
+        json={"reason": "学生有异议", "refund_cents": 700},
+        headers=auth(token),
+    ).json()
+
+    assert refused["code"] == 40062, refused
+    assert "630" in refused["message"]
+    db_session.expire_all()
+    assert db_session.get(Order, order.id).status == "abnormal", "被拒后订单状态不能被改掉"
+    payments = list(
+        db_session.execute(select(PaymentLog).where(PaymentLog.order_id == order.id)).scalars()
+    )
+    assert [p.amount_cents for p in payments] == [630]  # 没有退款行落地
+
+
+def test_接口不传退款金额时按全额退且拒负数(client, db_session):
+    """不传 refund_cents 时按成交价全额退；传负数在参数校验这一层就被拦下。"""
+    token = admin_token(client)
+    order = _paid_order(db_session, pickup_code="R-07")
+    client.post(
+        f"/api/admin/order/{order.id}/abnormal", json={"reason": "缺墨"}, headers=auth(token)
+    )
+
+    negative = client.post(
+        f"/api/admin/order/{order.id}/cancel",
+        json={"reason": "缺墨", "refund_cents": -1},
+        headers=auth(token),
+    ).json()
+    assert negative["code"] == 40001, negative  # 参数校验失败，不进业务层
+    db_session.expire_all()
+    assert db_session.get(Order, order.id).status == "abnormal"
+
+    closed = client.post(
+        f"/api/admin/order/{order.id}/cancel", json={"reason": "缺墨"}, headers=auth(token)
+    ).json()
+    assert closed["code"] == 0, closed
+    assert closed["data"]["refund_cents"] == 630  # 不传时全额退
+    db_session.expire_all()
+    refunds = [
+        p
+        for p in db_session.execute(
+            select(PaymentLog).where(PaymentLog.order_id == order.id)
+        ).scalars()
+        if p.method == "refund"
+    ]
+    assert [p.amount_cents for p in refunds] == [-630]
+
+
+def test_未付款的异常单关单不产生退款流水(client, db_session):
+    token = admin_token(client)
+    order = _make_order(db_session, status="abnormal", paid=0, pickup_code="R-04")
+
+    closed = client.post(
+        f"/api/admin/order/{order.id}/cancel", json={"reason": "学生不要了"}, headers=auth(token)
+    ).json()
+
+    assert closed["code"] == 0, closed
+    assert closed["data"]["refund_cents"] == 0
+    assert list(
+        db_session.execute(select(PaymentLog).where(PaymentLog.order_id == order.id)).scalars()
+    ) == []
+
+
+# ---------------------------------------------------------------- 异常单重打回路
+
+
+def test_已打印的异常单恢复后不回打印队列(client, db_session, test_storage):
+    """已出纸的单只能恢复成待取件：不能再进打印队列，printed_at 也不能被覆盖。"""
+    token = admin_token(client)
+    order = _make_order(db_session, status="queuing", paid=1, pickup_code="Q-21")
+
+    client.post(f"/api/admin/order/{order.id}/start", headers=auth(token))
+    done = client.post(f"/api/admin/order/{order.id}/complete", headers=auth(token)).json()
+    printed_at = done["data"]["order"]["printed_at"]
+    assert printed_at
+
+    client.post(
+        f"/api/admin/order/{order.id}/abnormal", json={"reason": "学生有异议"}, headers=auth(token)
+    )
+    recovered = client.post(f"/api/admin/order/{order.id}/recover", headers=auth(token)).json()
+
+    assert recovered["code"] == 0, recovered
+    assert recovered["data"]["status"] == "ready"
+    assert recovered["data"]["printed_at"] == printed_at  # 原始打印时间保留
+    assert recovered["data"]["queue_position"] == 0
+
+    queuing = client.get(
+        "/api/admin/queue", params={"status": "queuing"}, headers=auth(token)
+    ).json()["data"]
+    assert queuing["total"] == 0  # 没有回到打印队列
+
+    again = client.post(f"/api/admin/order/{order.id}/start", headers=auth(token)).json()
+    assert again["code"] == 40900  # 状态机挡住重复打印
+    assert "不能变更" in again["message"]
+
+
+def test_未打印的异常单恢复后回到队列(client, db_session):
+    token = admin_token(client)
+    order = _make_order(db_session, status="queuing", pickup_code="Q-22")
+
+    client.post(
+        f"/api/admin/order/{order.id}/abnormal", json={"reason": "卡纸"}, headers=auth(token)
+    )
+    recovered = client.post(f"/api/admin/order/{order.id}/recover", headers=auth(token)).json()
+
+    assert recovered["data"]["status"] == "queuing"
+    assert recovered["data"]["printed_at"] is None
+
+
+# ---------------------------------------------------------------- 批量完成
+
+
+def test_批量完成中途非业务异常不中断整批(client, db_session, monkeypatch):
+    """一单抛运行时错误（断连、锁超时）时，其余单调照样完成，明细里只有那一单失败。"""
+    from app.services import admin_service
+
+    token = admin_token(client)
+    first = _make_order(db_session, status="printing", pickup_code="B-01")
+    broken = _make_order(db_session, status="printing", pickup_code="B-02")
+    last = _make_order(db_session, status="printing", pickup_code="B-03")
+
+    original = admin_service.complete_print
+
+    def flaky(db, order, operator, amount_cents=None):
+        if order.id == broken.id:
+            raise RuntimeError("模拟数据库连接断开")
+        return original(db, order, operator, amount_cents)
+
+    monkeypatch.setattr(admin_service, "complete_print", flaky)
+
+    body = client.post(
+        "/api/admin/order/batch-complete",
+        json={"order_ids": [first.id, broken.id, last.id]},
+        headers=auth(token),
+    ).json()
+
+    assert body["code"] == 0, body
+    assert [item["order_id"] for item in body["data"]["succeeded"]] == [first.id, last.id]
+    assert [item["order_id"] for item in body["data"]["failed"]] == [broken.id]
+    assert "请稍后重试" in body["data"]["failed"][0]["message"]
+
+    db_session.expire_all()
+    assert db_session.get(Order, first.id).status == "ready"
+    assert db_session.get(Order, last.id).status == "ready"
+    assert db_session.get(Order, broken.id).status == "printing"
+
+
+def test_批量完成重复订单号只处理一次(client, db_session):
+    """同一单传两次只处理一次，明细里不出现「第二次撞状态机」的假失败。"""
+    token = admin_token(client)
+    order = _make_order(db_session, status="printing", pickup_code="B-04")
+
+    body = client.post(
+        "/api/admin/order/batch-complete",
+        json={"order_ids": [order.id, order.id]},
+        headers=auth(token),
+    ).json()
+
+    assert body["code"] == 0, body
+    assert len(body["data"]["succeeded"]) == 1
+    assert body["data"]["failed"] == []
+    assert body["data"]["succeeded"][0]["order_id"] == order.id
+
+
+# ---------------------------------------------------------------- 队列搜索的通配符
+
+
+def test_队列搜索把下划线与百分号当普通字符(client, db_session):
+    """关键字里的 _ 与 % 不是通配需求：不转义会退化成全表匹配。"""
+    token = admin_token(client)
+
+    def with_name(tail: str, name: str) -> Order:
+        order = _make_order(db_session, status="queuing", pickup_code=tail)
+        order.file_name = name
+        db_session.commit()
+        return order
+
+    underscored = with_name("K-01", "论文_终稿.pdf")
+    with_name("K-02", "论文A终稿.pdf")
+    percent = with_name("K-03", "折扣100%.pdf")
+    with_name("K-04", "折扣1000.pdf")
+
+    by_underscore = client.get(
+        "/api/admin/queue", params={"keyword": "论文_终稿"}, headers=auth(token)
+    ).json()["data"]
+    assert by_underscore["total"] == 1
+    assert by_underscore["items"][0]["id"] == underscored.id
+
+    by_percent = client.get(
+        "/api/admin/queue", params={"keyword": "100%"}, headers=auth(token)
+    ).json()["data"]
+    assert by_percent["total"] == 1
+    assert by_percent["items"][0]["id"] == percent.id
+
+
+# ---------------------------------------------------------------- 全角字母
+
+
+def test_全角字母的完整码能核销(client, db_session):
+    """全角字母与全角数字一起出现时同样归一化成半角。"""
+    token = admin_token(client)
+    order = _make_order(db_session, status="ready", pickup_code="A-09")
+    typed = _with_dash(
+        _fullwidth_digits(_full_code("A-09")).translate(
+            {ord(ch): chr(0xFF21 + i) for i, ch in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ")}
+        ),
+        "－",
+    )
+    assert typed != _full_code("A-09")
+
+    body = _verify_by_code(client, token, typed)
+
+    assert body["code"] == 0, body
+    assert body["data"]["order"]["id"] == order.id
+    db_session.expire_all()
+    assert db_session.get(Order, order.id).pickup_code == _full_code("A-09")
+
+
+# ---------------------------------------------------------------- 下载链接
+
+
+def test_文件被清理后拒绝签发下载链接(client, db_session, test_storage, monkeypatch):
+    """对象存储里已经没有这个文件时，不能签出一个指向空对象的链接。"""
+    from app.services.storage.minio_store import MinioStorage
+
+    token = admin_token(client)
+    order = _make_order(db_session, status="queuing")
+
+    # 默认桩把 stat_modified 当「刚刚写入」，即对象还在
+    alive = client.get(f"/api/admin/order/{order.id}/download", headers=auth(token)).json()
+    assert alive["code"] == 0, alive
+    assert alive["data"]["signed_url"].startswith("http")
+
+    # 模拟定时清理已经把对象删掉：存储层查不到这个 key
+    monkeypatch.setattr(MinioStorage, "stat_modified", lambda self, key: None)
+    gone = client.get(f"/api/admin/order/{order.id}/download", headers=auth(token)).json()
+
+    assert gone["code"] == 40406, gone
+    assert "已过期清理" in gone["message"]
+    assert gone["data"] is None, "被拒时不能带出签名链接"
+
+
+# ---------------------------------------------------------------- 钱：上限与零元
+
+
+def _create_order_via_api(client, db_session, payload: dict) -> tuple[dict, str]:
+    """走真实下单接口造订单：参数、页数、文件归属都过一遍校验，才算「合法订单」。"""
+    from app.models.uploaded_file import UploadedFile
+    from app.utils.security import decode_token
+
+    token = student_token(client)
+    db_session.add(
+        UploadedFile(
+            user_id=int(decode_token(token)["sub"]),
+            file_key=payload["file_key"],
+            file_name=payload["file_name"],
+            size=0,
+            content_type="application/pdf",
+        )
+    )
+    db_session.commit()
+    body = client.post("/api/order/create", json=payload, headers=auth(token)).json()
+    assert body["code"] == 0, body
+    return body["data"], token
+
+
+def test_一千六百元的合法订单能完成改价与核销(client, db_session):
+    """护栏上限必须罩得住配置允许的最大单，否则合法单永远走不完闭环。
+
+    400 页 × 5 份 × 彩色 80 分 = 160_000 分（1600 元），完全合法：
+    页数 400 ≤ 1000，份数 5 ≤ 50。历史上绝对上限写死 1000 元，这一单在
+    「完成打印」那一步就被 40062 拒掉，改价与核销跟着全挂。
+    """
+    payload = {
+        "file_key": "files/2026/10/1600yuan00000000000000000000000.pdf",
+        "file_name": "开题报告.pdf",
+        "page_count": 400,
+        "print_side": 1,
+        "color_mode": 1,
+        "copies": 5,
+        "paper_size": "A4",
+    }
+    order, student = _create_order_via_api(client, db_session, payload)
+    assert order["amount_cents"] == 160_000
+
+    paid = client.post(f"/api/order/{order['id']}/pay", headers=auth(student)).json()
+    assert paid["code"] == 0, paid
+
+    token = admin_token(client)
+    started = client.post(f"/api/admin/order/{order['id']}/start", headers=auth(token)).json()
+    assert started["code"] == 0, started
+
+    # 改价：从 1600 元改到 1550 元，必须成功落库
+    done = client.post(
+        f"/api/admin/order/{order['id']}/complete",
+        json={"amount_cents": 155_000},
+        headers=auth(token),
+    ).json()
+    assert done["code"] == 0, done
+    assert done["data"]["order"]["status"] == "ready"
+    assert done["data"]["system_amount_cents"] == 160_000
+    assert done["data"]["amount_cents"] == 155_000
+    assert done["data"]["price_changed"] is True
+
+    verified = client.post(
+        f"/api/admin/order/{order['id']}/verify", headers=auth(token)
+    ).json()
+    assert verified["code"] == 0, verified
+    assert verified["data"]["order"]["status"] == "completed"
+
+    db_session.expire_all()
+    assert db_session.get(Order, order["id"]).amount_cents == 155_000
+
+
+def test_改价为零元被拒且金额不变(client, db_session):
+    """0 元成交价与已收款并存会让对账分叉，必须整单拒绝、库里的金额一动不动。"""
+    token = admin_token(client)
+    order = _make_order(db_session, status="printing")
+
+    body = client.post(
+        f"/api/admin/order/{order.id}/complete",
+        json={"amount_cents": 0},
+        headers=auth(token),
+    ).json()
+
+    assert body["code"] == 40061, body
+    assert "大于 0" in body["message"]
+    assert body["data"] is None
+
+    db_session.expire_all()
+    refreshed = db_session.get(Order, order.id)
+    assert refreshed.amount_cents == 630, "被拒时不能改动金额"
+    assert refreshed.status == "printing", "被拒时不能推进状态"
+
+
+def test_文件被清理后拒绝开始打印(client, db_session, test_storage, monkeypatch):
+    """开始打印也会签发下载链接，对象没了必须整单拒绝，不能把失效链接交给老师。
+
+    对象被定时清理后，`start_print` 若照签不误，老师拿到的是指向空对象的链接，
+    订单却已经推进到「打印中」：既打印不出东西，也没法回到队列。
+    """
+    from app.services.storage.minio_store import MinioStorage
+
+    token = admin_token(client)
+    order = _make_order(db_session, status="queuing")
+
+    monkeypatch.setattr(MinioStorage, "stat_modified", lambda self, key: None)
+    refused = client.post(f"/api/admin/order/{order.id}/start", headers=auth(token)).json()
+
+    assert refused["code"] == 40406, refused
+    assert "已过期清理" in refused["message"]
+    assert refused["data"] is None, "被拒时不能带出签名链接"
+
+    db_session.expire_all()
+    assert db_session.get(Order, order.id).status == "queuing", "被拒时不能推进状态"

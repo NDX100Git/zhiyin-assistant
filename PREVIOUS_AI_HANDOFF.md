@@ -23,7 +23,9 @@
 
 ## 新接手者必须自行安装的组件
 
-- Python 3.11+（推荐 3.11-3.14）
+- Python 3.12+（推荐 3.12-3.14）。**不能再装 3.11 及以下**：后端 `app/schemas/common.py` 用了
+  3.12 才有的 PEP 695 泛型写法 `class ApiResponse[T](BaseModel)`，3.11 上连 import 都会
+  SyntaxError；`backend/requirements.txt` 与 `backend/Dockerfile` 也都是 3.12 口径。
 - Node.js 18+
 - MySQL 8
 - MinIO

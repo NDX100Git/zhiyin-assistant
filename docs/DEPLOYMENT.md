@@ -81,6 +81,21 @@ npm run build
 
 > 前端 API 地址在构建时写入（`.env.production` / `.env.development`），改地址后需重新构建。
 
+两端的生产包**默认都不带域名**：`student-app/.env.production` 与 `teacher-web/.env.production`
+里的 `VITE_API_BASE_URL` 都留空，意思是“同源相对路径”——页面请求 `/api/...`，由下面的 Nginx
+把 `/api/` 反代到后端。这样换域名、换机器都不用重新出包。
+
+代码里没有任何回环地址兜底（以前老师端兜底写死 `http://127.0.0.1:8000`，生产包真带着它，
+上线就打到柜台机自己）。两端构建产物里都不许出现 `127.0.0.1` / `localhost:端口` / 内网网段，
+回归里的 `e2e/run.mjs` 会各打一次生产包扫一遍；老师端 `npm run build` 时也会自检
+`VITE_API_BASE_URL`，发现本机或内网地址会告警。
+
+只有当老师端与学生端**不同源**（比如前端挂 CDN）时才需要桥地址写进 `teacher-web/.env.production`：
+
+```ini
+VITE_API_BASE_URL=https://your-domain.com
+```
+
 ### 2.4 LibreOffice 转换
 
 当前 `doc_parser.convert_to_pdf` 通过 `SOFFICE_PATH` 调用本机可执行文件。

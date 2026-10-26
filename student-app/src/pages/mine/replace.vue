@@ -175,7 +175,6 @@ const immediate = computed(() => !!order.value && order.value.status === 'pendin
 const files = computed(() => orderFiles(order.value))
 const pagesTotal = computed(() => totalPages(order.value))
 const printPagesTotal = computed(() => totalPrintPages(order.value))
-const multiFile = computed(() => files.value.length > 1)
 /** 单文件订单不用选，直接就是那唯一一份；多文件必须选过（targetIndex 从 -1 起）。 */
 const hasTarget = computed(() => files.value.length > 0 && targetIndex.value >= 0)
 const targetFile = computed(() => files.value[targetIndex.value] || null)

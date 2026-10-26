@@ -96,7 +96,9 @@ V1 的"简化实现"**不等于可以写死**。
 【技术栈（硬性，不要擅自更换）】
 - 学生端：uni-app（Vue3 语法），编译目标为 Android APK
 - 老师端：Vue3 + Element Plus 的 Web 后台
-- 后端：Python 3.11 + FastAPI
+- 后端：Python 3.12+ + FastAPI（下界不是 3.11：`app/schemas/common.py` 用了 3.12 才有的
+  PEP 695 泛型写法 `class ApiResponse[T](BaseModel)`，3.11 下 import 就 SyntaxError；
+  `backend/requirements.txt` 与 `backend/Dockerfile` 也都是 3.12 口径）
 - 数据库：MySQL 8（ORM 用 SQLAlchemy）
 - 文件存储：本地 MinIO（开发期），接口设计需兼容云对象存储
 - 前端实时刷新：定时轮询（3-5 秒），不使用 WebSocket

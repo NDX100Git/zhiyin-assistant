@@ -1,9 +1,15 @@
 # ruff 静态检查配置（开发依赖，不影响运行）
-target-version = "py311"
+# target-version 跟依赖下界与镜像保持一致（见 requirements.txt 开头的说明与
+# Dockerfile 的 FROM python:3.12-slim）：写成 3.11 会让 3.12 起可用的语法被误报，
+# 也会让 UP 类规则按 3.11 给建议，与部署环境不是同一个口径。
+target-version = "py312"
 line-length = 100
 
 [lint]
 select = ["E", "F", "W", "I", "UP", "B", "RUF"]
 # B008：FastAPI 的 Depends/File 必须写在参数默认值里，属框架固定写法
 # RUF001/002/003：本项目注释与提示语使用中文全角标点，属正常写法
+# UP046/UP047（PEP 695 泛型语法）不再挂起：本单把 app/schemas/common.py 的
+#   ApiResponse 与 app/services/ai_pool.py 的 run_ai_job 改成了 `class C[T]` /
+#   `def f[T]()`，既然 target-version 是 py312，就按 3.12 的写法写，不再往 3.11 退。
 ignore = ["E501", "B008", "RUF001", "RUF002", "RUF003"]

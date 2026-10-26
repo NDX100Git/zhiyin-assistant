@@ -59,3 +59,7 @@ class Order(Base):
     pay_channel: Mapped[str | None] = mapped_column(String(16), nullable=True)
     external_pay_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     printer_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 下单时是否占到本时段名额：1=占到，取消/关单时才归还容量；0=没占到（截单或
+    # 满员时不加容量，取消也就不能减）。历史订单无法事后判断，默认 0 即「不归还」。
+    # 与 app/migrations.py 的同名列、两份 schema.sql 里的建表语句同口径。
+    slot_taken: Mapped[int] = mapped_column(TINYINT, nullable=False, default=0, server_default="0")

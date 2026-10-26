@@ -11,6 +11,7 @@ from datetime import date as date_type
 from datetime import datetime, timedelta
 
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import get_order_rules
@@ -51,6 +52,31 @@ logger = logging.getLogger(__name__)
 
 # 区分「调用方没传」与「明确没有待确认请求」：队列接口批量查到 None 时要传 None
 _UNSET = object()
+
+# 老师手输取件码的归一化表：手机输入法常给出全角数字与全角/中文破折号，
+# 不归成半角就查不到库里的值。只作用于人工输入这一条路径，库里的存储值不动。
+_PICKUP_INPUT_TRANSLATION: dict[int, str] = {
+    # 全角数字 ０ 至 ９ → 半角
+    **{0xFF10 + i: chr(ord("0") + i) for i in range(10)},
+    # 全角字母 → 半角（字母随后统一大写，与库里的取件码一致）
+    **{0xFF21 + i: chr(ord("A") + i) for i in range(26)},
+    **{0xFF41 + i: chr(ord("a") + i) for i in range(26)},
+    # 全角连字符与常见破折号变体，一律归成半角短横
+    **{ord(ch): "-" for ch in "－—–−‒―‐‑﹘﹣"},
+}
+
+
+def _normalize_pickup_input(raw: str) -> str:
+    """人工输入的取件码归一化：全角转半角、破折号归短横、去空白、字母大写。"""
+    text = (raw or "").translate(_PICKUP_INPUT_TRANSLATION)
+    # isspace() 覆盖全角空格 U+3000、制表符与首尾空白
+    return "".join(ch for ch in text if not ch.isspace()).upper()
+
+
+def _pickup_input_display(raw: str, fallback: str) -> str:
+    """错误提示里回显老师输入的那一份，不做归一化，只去首尾空白。"""
+    return (raw or "").strip() or fallback
+
 
 def _short_code_pattern() -> re.Pattern[str]:
     """老师手输的当天短码，如 0-01。按取件码配置生成，改进制与长度不用改这里。"""
@@ -167,10 +193,27 @@ def queue_list(db: Session, status: str | None = None, keyword: str | None = Non
     }
 
 
+def _ensure_objects_exist(storage, file_keys: list[str]) -> None:
+    """签发链接前确认对象还在。
+
+    订单完成后原文件会被定时清理（cleanup.py），而订单行与文件清单行还留着。
+    直接签名会给出一个指向空对象的链接：老师点开只看到 S3 的 XML 报错，
+    分不清是网络问题还是文件没了。所以这里先逐个探一次，缺一个就整单拒绝。
+
+    用 stat_modified 判存在性是存储接口里现成、且不抛异常的探测方法
+    （返回 None 就表示对象不存在），不必为此新增接口。
+    """
+    missing = [key for key in dict.fromkeys(file_keys) if storage.stat_modified(key) is None]
+    if missing:
+        logger.info("拒绝签发下载链接：对象已不存在 %s", missing)
+        raise BusinessError("该订单的文件已过期清理，请让学生重新上传", code=40406)
+
+
 def download_url(db: Session, order: Order, file_index: int | None = None) -> dict:
     """给老师发限时签名下载链接（私有桶，禁止公开读）。
 
     不传 file_index 时返回全部文件链接，同时保留顶层的首份文件链接作为旧接口兼容。
+    签发前先确认对象还在，已被清理的文件一律不给链接。
     """
     rows = ensure_files(db, order)
     if not rows:
@@ -185,16 +228,12 @@ def download_url(db: Session, order: Order, file_index: int | None = None) -> di
                 f"订单里没有第 {file_index} 份文件，请刷新后重试", code=40405
             )
     storage = get_storage()
-    items = [
-        {**file_to_dict(row, order), "signed_url": storage.signed_url(row.file_key)}
-        for row in rows
-    ]
-    if not items and order.file_key:
+    views = [file_to_dict(row, order) for row in rows]
+    if not views and order.file_key:
         # 老订单迁移未回填时，兜底给第 1 份文件的链接
-        for view in files_view(db, order):
-            items.append(
-                {**view, "signed_url": storage.signed_url(view["file_key"])}
-            )
+        views = files_view(db, order)
+    _ensure_objects_exist(storage, [view["file_key"] for view in views])
+    items = [{**view, "signed_url": storage.signed_url(view["file_key"])} for view in views]
     primary = next(
         (item for item in items if item["file_index"] == int(target.file_index)),
         items[0] if items else None,
@@ -214,11 +253,17 @@ def start_print(db: Session, order: Order, operator: str) -> dict:
 
     订单一旦进入打印中就不能再换文件，所以先把待确认请求置为失效，
     避免老师在打印后才看到一个无法执行的确认请求。
+
+    签发链接前必须先探活（与 download_url 同一道校验）：开始打印也会把链接交给
+    老师，文件已被定时清理时照签不误，等于把一条指向空对象的链接交出去，订单却
+    已经推进到「打印中」——既打不出东西，也回不到队列。探活要放在改状态之前，
+    被拒时订单状态一动不动。
     """
-    expire_pending_changes(db, order.id, "订单已开始打印，换文件请求失效", operator)
-    change_status(db, order, STATUS_PRINTING, operator=operator, note="老师开始打印")
     storage = get_storage()
     rows = files_view(db, order)
+    _ensure_objects_exist(storage, [row["file_key"] for row in rows])
+    expire_pending_changes(db, order.id, "订单已开始打印，换文件请求失效", operator)
+    change_status(db, order, STATUS_PRINTING, operator=operator, note="老师开始打印")
     file_links = [
         {**row, "signed_url": storage.signed_url(row["file_key"])} for row in rows
     ]
@@ -325,17 +370,22 @@ def batch_complete(db: Session, order_ids: list[int], operator: str) -> dict:
     return {"succeeded": succeeded, "failed": failed}
 
 
+def _paid_total(db: Session, order_id: int) -> int:
+    """该单已收到的净金额：收款流水与退款流水（负数）求和。"""
+    return int(
+        db.execute(
+            select(func.coalesce(func.sum(PaymentLog.amount_cents), 0)).where(
+                PaymentLog.order_id == order_id
+            )
+        ).scalar_one()
+    )
+
+
 def verify_pickup(db: Session, order: Order, operator: str) -> dict:
     """核销取件：ready -> completed；未付或改价差额在此现场收款。"""
     change_status(db, order, "completed", operator=operator, note="核销取件")
 
-    paid_total = int(
-        db.execute(
-            select(func.coalesce(func.sum(PaymentLog.amount_cents), 0)).where(
-                PaymentLog.order_id == order.id
-            )
-        ).scalar_one()
-    )
+    paid_total = _paid_total(db, order.id)
     owed = max(0, order.amount_cents - paid_total)
     collected = owed > 0
     if collected:
@@ -345,6 +395,7 @@ def verify_pickup(db: Session, order: Order, operator: str) -> dict:
                 amount_cents=owed,
                 method="onsite",
                 operator=operator,
+                idempotency_key=f"onsite:{order.id}",
             )
         )
         record_log(db, order, "note", note=f"取件时现场收款 {owed} 分", operator=operator)
@@ -357,7 +408,11 @@ def verify_pickup(db: Session, order: Order, operator: str) -> dict:
     if order.paid_at is None:
         order.paid_at = datetime.now()  # 服务端时间
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:  # 幂等键撞车：同一单重复现场收款
+        db.rollback()
+        raise BusinessError("该订单已登记过现场收款，请刷新后重试", code=40906) from exc
     db.refresh(order)
     return {
         "order": order_admin_view(db, order),
@@ -367,12 +422,13 @@ def verify_pickup(db: Session, order: Order, operator: str) -> dict:
 
 
 def _normalize_pickup_code(raw: str, now: datetime | None = None) -> str:
-    """规整取件码。
+    """规整取件码（只用于人工输入路径）。
 
     老师可只输当天的短码（A-01），这里按服务器当天补成完整码（261017-A-01）；
     扫码与学生端展示的都是完整码，原样匹配。跨天的遗留单只能用完整码。
+    手机输入法打出的全角数字、全角短横与中文破折号先归一化成半角，否则查不到库。
     """
-    code = "".join((raw or "").split()).upper()
+    code = _normalize_pickup_input(raw)
     if not code:
         return ""
     if PICKUP_SHORT_CODE_RE.fullmatch(code):
@@ -383,9 +439,12 @@ def _normalize_pickup_code(raw: str, now: datetime | None = None) -> str:
 
 def verify_by_code(db: Session, pickup_code: str, operator: str) -> dict:
     """按取件码核销（老师扫码或手动输入）。"""
-    code = _normalize_pickup_code(pickup_code)
+    raw_input = pickup_code or ""
+    code = _normalize_pickup_code(raw_input)
     if not code:
         raise BusinessError("请输入取件码", code=40001)
+    # 错误提示回显老师输入的那一份，不展示归一化结果，避免老师对不上自己打的码
+    shown = _pickup_input_display(raw_input, code)
 
     orders = list(
         db.execute(
@@ -396,11 +455,11 @@ def verify_by_code(db: Session, pickup_code: str, operator: str) -> dict:
         ).scalars()
     )
     if not orders:
-        raise BusinessError(f"没有找到取件码 {code} 对应的待取件订单", code=40401)
+        raise BusinessError(f"没有找到取件码 {shown} 对应的待取件订单", code=40401)
     if len(orders) > 1:
         # 唯一索引下不会发生；只有历史重码数据才会走到，宁可拒绝也不能核销错单
         raise BusinessError(
-            f"取件码 {code} 命中多张待取件单，请用完整取件码或订单号核销", code=40902
+            f"取件码 {shown} 命中多张待取件单，请用完整取件码或订单号核销", code=40902
         )
     return verify_pickup(db, orders[0], operator)
 
@@ -436,26 +495,75 @@ def recover_order(db: Session, order: Order, operator: str) -> dict:
     return order_admin_view(db, order)
 
 
-def cancel_abnormal(db: Session, order: Order, reason: str | None, operator: str) -> dict:
-    """老师关闭异常单（异常单的唯一取消入口）。"""
+def cancel_abnormal(db: Session, order: Order, reason: str | None, operator: str,
+                    refund_cents: int | None = None) -> dict:
+    """老师关闭异常单（异常单的唯一取消入口），已收过钱的单同时登记退款。
+
+    退款口径（与前端约定一致）：用一条**负数流水**表示退款，
+    method=refund、幂等键 refund:<订单 id>，不另建退款表，也不改学生的收款行。
+    这样当日收入、收款流水、订单对账全部是同一种算法：把流水加起来。
+    同一单最多退一次，重复调用会被 (order_id, idempotency_key) 唯一索引拦住。
+
+    refund_cents 不传时按订单成交价全额退，但不超过实际已收金额：
+    老师改价上调后学生只付了原价时，退的是真收到的钱，不是账面上的价。
+    """
     if order.status not in ADMIN_CANCELLABLE:
         raise BusinessError(
             f"只有异常订单可以由老师关闭，当前状态为「{status_label(order.status)}」",
             code=40903,
         )
+
+    paid_total = _paid_total(db, order.id)
+    if refund_cents is None:
+        refund = min(paid_total, int(order.amount_cents or 0))
+    else:
+        refund = int(refund_cents)
+        if refund < 0:
+            raise BusinessError("退款金额不能为负数", code=40061)
+        if refund > paid_total:
+            raise BusinessError(
+                f"退款金额不能超过已收的 {paid_total} 分", code=40062
+            )
+
     note = (reason or "").strip() or "老师关闭异常单"
     order.cancel_reason = note
     expire_pending_changes(db, order.id, "异常单已关闭，换文件请求失效", operator)
+    if refund > 0:
+        db.add(
+            PaymentLog(
+                order_id=order.id,
+                amount_cents=-refund,  # 负数行：退款从收入里冲掉
+                method="refund",
+                operator=operator,
+                idempotency_key=f"refund:{order.id}",
+            )
+        )
+        note = f"{note}；退款 {refund} 分（已收 {paid_total} 分）"
+        order.cancel_reason = note
     change_status(db, order, "cancelled", operator=operator, note=note)
-    # 异常单作废也不再消耗本时段产能，容量要还回去
-    release_session_slot(db, order.created_at or datetime.now())
-    db.commit()
+    if refund > 0:
+        record_log(
+            db, order, "refund",
+            note=f"老师关闭订单并登记退款 {refund} 分", operator=operator,
+        )
+    # 异常单作废也不再消耗本时段产能，容量要还回去；只还这一单确实占到的那一份
+    release_session_slot(db, order)
+    try:
+        db.commit()
+    except IntegrityError as exc:  # 幂等键撞车：同一单重复退
+        db.rollback()
+        raise BusinessError("该订单已登记过退款，请勿重复操作", code=40906) from exc
     db.refresh(order)
-    return order_admin_view(db, order)
+    return {**order_admin_view(db, order), "refund_cents": refund,
+            "paid_total_cents": paid_total}
 
 
 def today_summary(db: Session) -> dict:
-    """今日数据：接单数、收款额（分）、待取件数、异常单数。"""
+    """今日数据：接单数、收款额（分）、待取件数、异常单数。
+
+    收款额是当日**流水求和**：正向收款加、退款负数行减，所以已退款的订单
+    自动从当日收入里排除，不需要单独再减一遍。
+    """
     day_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
     order_count = db.execute(

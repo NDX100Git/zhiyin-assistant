@@ -14,7 +14,18 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.config import get_order_rules
+from app.models.order import Order
 from app.models.queue_session import QueueSession
+from app.utils.exceptions import BusinessError
+
+# `orders.slot_taken`：这一单下单时是否占到本时段名额。
+#
+# 模型（app/models/order.py）与两份 schema.sql 里都有这一列，新库由 create_all /
+# 建表脚本直接建出来，老库由 migrations.py 补；这里读写走原生 SQL（UPDATE 立即生效，
+# 不依赖会话 flush 时机），集中在本文件，别处不要再拼。
+SLOT_TAKEN_SELECT_SQL = text("SELECT `slot_taken` FROM `orders` WHERE id = :order_id")
+SLOT_TAKEN_MARK_SQL = text("UPDATE `orders` SET `slot_taken` = 1 WHERE id = :order_id")
+SLOT_TAKEN_CLEAR_SQL = text("UPDATE `orders` SET `slot_taken` = 0 WHERE id = :order_id")
 
 
 def _parse_hhmm(value: str) -> time:
@@ -35,14 +46,11 @@ def resolve_session_name(now: datetime) -> str | None:
     return None
 
 
-def get_or_create_session(db: Session, day: date_type, name: str) -> QueueSession:
-    """取当天某时段的设置行，不存在则按默认容量创建（默认开放）。
+def _insert_default_session(db: Session, day: date_type, name: str) -> None:
+    """行不存在时按默认容量建一行（默认开放）。
 
-    每天首批并发下单会同时发现“行不存在”，各自插同一行；(日期, 时段) 唯一键只允许一个
-    成功。用 `INSERT ... ON DUPLICATE KEY UPDATE` 变成幂等写入，没有异常可抛。
-
-    随后的读取必须加 `FOR UPDATE`：MySQL 默认 REPEATABLE READ，本请求早先查用户时已经把
-    读视图定住，普通 SELECT 看不到并发事务刚提交的那一行，会读成空。锁定读走的是最新数据。
+    每天首批并发请求会同时发现“行不存在”并各自插同一行；(日期, 时段) 唯一键只允许
+    一个成功。用 `INSERT ... ON DUPLICATE KEY UPDATE` 变成幂等写入，没有异常可抛。
     """
     default_capacity = int(get_order_rules()["session"].get("default_capacity", 30))
     db.execute(
@@ -53,6 +61,51 @@ def get_or_create_session(db: Session, day: date_type, name: str) -> QueueSessio
         ),
         {"date": day, "session": name, "capacity": default_capacity},
     )
+
+
+def get_session(db: Session, day: date_type, name: str) -> QueueSession | None:
+    """读当天某时段的设置行，**不加锁**，不存在返回 None。
+
+    首页概览、下单响应这类读为主的路径走这里：普通 SELECT 既不排锁、也不把
+    读接口变成写事务，不会与并发下单争同一行锁。
+    """
+    return db.execute(
+        select(QueueSession).where(
+            QueueSession.date == day, QueueSession.session == name
+        )
+    ).scalar_one_or_none()
+
+
+def ensure_session(db: Session, day: date_type, name: str) -> QueueSession:
+    """读优先、缺失才创建；**不持锁**，返回当天的时段行。
+
+    先普通读一次，命中就直接用；未命中才做一次幂等插入，再普通读一次。
+    创建后能读到自己的行：本事务内自己插入的行对自己可见，不需要锁定读
+    （锁定读只有在读别的并发事务刚提交的行时才有意义）。
+    并发首页请求最多各自做一次幂等插入（改一行后马上提交），
+    不会像原先那样在只读路径上执行「插入即更新 + `FOR UPDATE`」参与争锁。
+    """
+    row = get_session(db, day, name)
+    if row is not None:
+        return row
+    _insert_default_session(db, day, name)
+    row = get_session(db, day, name)
+    if row is None:  # 理论上不会发生：插入是幂等的
+        raise BusinessError(f"无法初始化 {day} {name} 时段设置", code=50021)
+    return row
+
+
+def get_or_create_session(db: Session, day: date_type, name: str) -> QueueSession:
+    """取当天某时段的设置行并在事务内锁定它，供**要改这一行**的路径使用。
+
+    行政端开关收单（switch_session）要读改写的行必须加 `FOR UPDATE`，否则两个
+    老师并发开关会丢一次修改。只读/只看 id 的路径一律用 ensure_session，
+    不要把一个行锁带进首页与下单响应的读事务里。
+
+    锁定读走的是最新数据：MySQL 默认 REPEATABLE READ，普通 SELECT 看不到并发
+    事务刚提交的那一行，而行政端本来就靠锁定读拿最新值。
+    """
+    _insert_default_session(db, day, name)
     return db.execute(
         select(QueueSession)
         .where(QueueSession.date == day, QueueSession.session == name)
@@ -60,15 +113,20 @@ def get_or_create_session(db: Session, day: date_type, name: str) -> QueueSessio
     ).scalar_one()
 
 
-def release_session_slot(db: Session, moment: datetime) -> bool:
-    """把某笔订单占用的时段容量还回去；时段行不存在或已归零时返回 False。
+def release_session_slot(db: Session, order: Order) -> bool:
+    """把订单占用的时段容量还回去；这一单当时没占到名额时什么都不动。
 
-    下单时只有「本时段收单中」才自增（见 order_service.create_order）。取消订单与
-    关闭异常单都意味着这单不再消耗产能，容量必须归还 —— 否则取消几单之后，该时段
-    会一直显示「已截单」，新订单全被排到下一时段，老师手动重开也救不回来。
+    下单时只有「本时段收单中且未满员」才自增容量（见 order_service.create_order），
+    而截单与满员时下的单**没有**自增。所以归还不能无条件做：不看凭证就减，
+    减掉的是别人占着的额度，紧接着放进来的新单就是超卖（实测已用数从 5 掉到 2）。
 
-    容量按订单创建时刻反推所属时段，减到 0 为止，不会减成负数。
+    凭证是订单行上的 `slot_taken`：下单自增成功才置 1；归还成功就清回 0，
+    同一单重复走到这里也只会减一次。容量按订单创建时刻反推所属时段，
+    减到 0 为止，不会减成负数。
     """
+    if slot_taken(db, order.id) != 1:
+        return False
+    moment = order.created_at or datetime.now()
     name = resolve_session_name(moment)
     if name is None:
         return False
@@ -80,7 +138,24 @@ def release_session_slot(db: Session, moment: datetime) -> bool:
     if row is None or row.used <= 0:
         return False
     row.used -= 1
+    _clear_slot_taken(db, order.id)
     return True
+
+
+def mark_session_slot_taken(db: Session, order_id: int) -> bool:
+    """标记这一单确实占到了本时段的名额（下单时容量自增成功后调用）。"""
+    result = db.execute(SLOT_TAKEN_MARK_SQL, {"order_id": int(order_id)})
+    return bool(int(result.rowcount or 0))
+
+
+def slot_taken(db: Session, order_id: int) -> int:
+    """这一单是否占到名额：1=占到，0=没占到（或已归还）。"""
+    value = db.execute(SLOT_TAKEN_SELECT_SQL, {"order_id": int(order_id)}).scalar_one_or_none()
+    return int(value or 0)
+
+
+def _clear_slot_taken(db: Session, order_id: int) -> None:
+    db.execute(SLOT_TAKEN_CLEAR_SQL, {"order_id": int(order_id)})
 
 
 def current_session_info(db: Session, now: datetime | None = None) -> dict:
@@ -107,7 +182,7 @@ def current_session_info(db: Session, now: datetime | None = None) -> dict:
             "hint": rules.get("outside_hint", "当前不在收单时段"),
         }
 
-    row = get_or_create_session(db, now.date(), name)
+    row = ensure_session(db, now.date(), name)
     is_open = bool(row.is_open) and row.used < row.capacity
     session_rules = rules.get(name, {})
     hint = "" if is_open else session_rules.get("closed_hint", "当前时段已截单，订单将排在下一个打印时段")

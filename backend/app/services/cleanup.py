@@ -9,6 +9,10 @@
    - 文件还在（含在途保护而留下的）就跟着留，不提前删；
    - 文件已不存在但报告残留（历史数据、人工删了文件）时，按
      report_expire_hours（即 file_expire_hours）兜底清掉，不留垃圾。
+3. 上传记录（uploaded_files）的僵尸行：对象已经不在、记录还留着。早期实现只在
+   「对象还列得到」时才删记录，对象删掉而记录没提交的那一轮之后，这行永远扫不到
+   （对象已不在 list 结果里），学生点预览、下单会一直拿到 40053。所以每轮按上传
+   记录反查对象是否存在，缺失就把记录连同它的报告一起删。
 
 对外入口是 run_cleanup(db, storage, now=None, dry_run=False)，纯函数式、便于单测；
 后台调度由 cleanup_loop() 负责，单轮异常只记日志，不让任务静默死掉。
@@ -59,6 +63,7 @@ class CleanupStats:
     failed: int = 0            # 删除失败的文件数，下一轮会重新扫到
     not_expired: int = 0       # 仍在保留期内、本轮不处理的文件数
     reports_deleted: int = 0   # 删除（或将会删除）的体检报告缓存行数，含随文件同删与残留兜底两块
+    records_deleted: int = 0   # 删除（或将会删除）的僵尸上传记录数（对象已不在）
     pending_protected: int = 0 # 因待老师确认的换文件请求而跳过的文件数
     dry_run: bool = False
 
@@ -71,6 +76,7 @@ class CleanupStats:
             "failed": self.failed,
             "not_expired": self.not_expired,
             "reports_deleted": self.reports_deleted,
+            "records_deleted": self.records_deleted,
             "pending_protected": self.pending_protected,
             "dry_run": self.dry_run,
         }
@@ -266,6 +272,68 @@ def _cleanup_files(
     return listed_keys
 
 
+def _cleanup_orphan_records(
+    db: Session,
+    storage: FileStorage,
+    dry_run: bool,
+    stats: CleanupStats,
+    listed_keys: set[str] | None,
+) -> None:
+    """清理「上传记录还在、对象已经不在」的僵尸行。
+
+    只在拿到完整对象清单时做：列不出对象就无法判断谁不在，贸然删记录会把文件其实
+    还在的上传记录删掉，学生下次下单反而被拒。名单之外的行再单独问一次对象存储
+    （stat_modified），避免列目录的延迟或前缀差异造成误删。
+    """
+    if listed_keys is None:
+        logger.info("对象存储未列出，本轮跳过僵尸上传记录清理")
+        return
+
+    missing: list[tuple[int, str]] = []
+    last_id = 0
+    while True:
+        rows = db.execute(
+            select(UploadedFile.id, UploadedFile.file_key)
+            .where(UploadedFile.id > last_id)
+            .order_by(UploadedFile.id)
+            .limit(ORDER_QUERY_CHUNK)
+        ).all()
+        if not rows:
+            break
+        last_id = int(rows[-1].id)
+        for row_id, file_key in rows:
+            if not file_key or file_key in listed_keys:
+                continue
+            try:
+                exists = storage.stat_modified(file_key) is not None
+            except Exception:
+                stats.failed += 1
+                logger.exception("查询对象是否存在失败，下一轮重试：%s", file_key)
+                continue
+            if not exists:
+                missing.append((int(row_id), file_key))
+
+    if not missing:
+        return
+
+    if dry_run:
+        stats.records_deleted += len(missing)
+        logger.info("[演练] 将删除 %d 条对象已不在的上传记录", len(missing))
+        return
+
+    for row_id, file_key in missing:
+        db.execute(
+            delete(UploadedFile)
+            .where(UploadedFile.id == row_id)
+            .execution_options(synchronize_session=False)
+        )
+        # 文件都没了，它的报告缓存也没有意义，同轮一起删
+        _delete_reports_of_file(db, file_key, dry_run=False, stats=stats)
+        db.commit()
+        stats.records_deleted += 1
+        logger.info("已删除僵尸上传记录 %s（对象已不在）", file_key)
+
+
 def _cleanup_reports(
     db: Session,
     now: datetime,
@@ -331,12 +399,15 @@ def run_cleanup(
     )
 
     listed_keys = _cleanup_files(db, storage, reference, dry_run, stats)
+    # 先补掉僵尸记录，再跑报告兜底：僵尸记录的报告同一轮就该跟着走
+    _cleanup_orphan_records(db, storage, dry_run, stats, listed_keys)
     _cleanup_reports(db, reference, dry_run, stats, listed_keys)
 
     logger.info(
-        "清理完成：删除文件 %d 个，删除体检报告 %d 条，%s",
+        "清理完成：删除文件 %d 个，删除体检报告 %d 条，删除僵尸上传记录 %d 条，%s",
         stats.deleted,
         stats.reports_deleted,
+        stats.records_deleted,
         stats.as_dict(),
     )
     return stats

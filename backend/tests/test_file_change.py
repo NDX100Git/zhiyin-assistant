@@ -367,6 +367,75 @@ def test_老师确认后替换文件_按确认价落库并排到队尾(client, d
     assert "order_file_change_approved" in set(events)
 
 
+class _SlowClock:
+    """应用进程时钟的替身：比真实墙钟慢 `behind`。
+
+    换文件服务里的 `datetime` 只被当作「取现在」的一个入口，所以提供 now() 即可。
+    写成模块级的小类而不是 fixture：用例要把它直接塞到业务模块的 `datetime` 名字上，
+    模拟「应用机时钟落后于数据库」。
+    """
+
+    def __init__(self, behind: timedelta):
+        self._behind = behind
+
+    def now(self, tz=None):
+        return datetime.now(tz) - self._behind
+
+
+def test_应用时钟慢于数据库_换文件后仍排到队尾(client, db_session, monkeypatch):
+    """应用时钟与数据库时钟不一致时，换完文件的单必须仍排在队尾。
+
+    怎么造出这种不一致：三张单的 created_at 由数据库 `CURRENT_TIMESTAMP` 落库，
+    走的是数据库时钟；这里把换文件服务取「现在」的那一处换成慢 3 小时的替身，
+    走的是应用时钟——正是「应用机比数据库慢」的现场。
+    若重排队时间取应用时钟，requeue_at 会早于三张单的 created_at，
+    队列（COALESCE(requeue_at, created_at) 升序）会把刚换完文件的单排到队首。
+    """
+    headers = student_headers(client, "file-change-clock-skew")
+    admin = admin_headers(client)
+
+    first = paid_order(client, headers, page_count=10)
+    second = paid_order(client, headers, page_count=8)
+    third = paid_order(client, headers, page_count=6)
+
+    from app.services import file_change_service
+
+    monkeypatch.setattr(
+        file_change_service, "datetime", _SlowClock(timedelta(hours=3))
+    )
+
+    assert replace_file(client, headers, first["id"], page_count=30)["code"] == 0
+    body = confirm(client, admin, first["id"], approve=True)
+    assert body["code"] == 0, body
+    order_view = body["data"]["order"]
+    assert order_view["requeue_at"] is not None
+    assert order_view["queue_position"] == 2
+
+    db_session.expire_all()
+    stored = {
+        order.id: order
+        for order in db_session.execute(
+            select(Order).where(
+                Order.id.in_([first["id"], second["id"], third["id"]])
+            )
+        ).scalars()
+    }
+    requeued = stored[first["id"]]
+    # 重排队时间与 created_at 同源（都用数据库时钟）：既不早于自己的下单时间，
+    # 也不早于另外两张单，所以排序上只能落在队尾
+    assert requeued.requeue_at >= requeued.created_at
+    assert requeued.requeue_at >= stored[second["id"]].created_at
+    assert requeued.requeue_at >= stored[third["id"]].created_at
+
+    queue = client.get(
+        "/api/admin/queue", params={"status": "queuing"}, headers=admin
+    ).json()["data"]
+    assert [row["id"] for row in queue["items"]][-1] == first["id"]
+    assert {row["id"] for row in queue["items"]} == {
+        first["id"], second["id"], third["id"]
+    }
+
+
 def test_重新排队后预计等待按新页数重算(client, db_session):
     headers = student_headers(client)
     admin = admin_headers(client)
@@ -606,12 +675,25 @@ def test_开始打印会让待确认请求失效(client):
     assert stored["file_change"] is None
 
 
-def test_取消订单会让待确认请求失效(client, db_session):
+def test_关单会让待确认请求失效(client, db_session):
+    """已付款订单学生不能自助取消，关单只能由老师走异常处置，待确认请求同样要失效。"""
     headers = student_headers(client)
+    admin = admin_headers(client)
     order = paid_order(client, headers)
     assert replace_file(client, headers, order["id"], page_count=20)["code"] == 0
 
-    assert client.post(f"/api/order/{order['id']}/cancel", headers=headers).json()["code"] == 0
+    marked = client.post(
+        f"/api/admin/order/{order['id']}/abnormal",
+        json={"reason": "学生不要了"},
+        headers=admin,
+    ).json()
+    assert marked["code"] == 0, marked
+    closed = client.post(
+        f"/api/admin/order/{order['id']}/cancel",
+        json={"reason": "学生不要了"},
+        headers=admin,
+    ).json()
+    assert closed["code"] == 0, closed
     change = db_session.execute(
         select(OrderFileChange).where(OrderFileChange.order_id == order["id"])
     ).scalar_one()
@@ -651,3 +733,75 @@ def test_迁移可重复执行并为老订单回填版本(db_session, engine):
         ).scalars()
     )
     assert len(again) == 1
+
+
+# ---------------------------------------------------------------- 老数据的页数回退语义
+
+
+def test_回退分支不把整单页数当成单文件页数(client, db_session):
+    """老待确认请求缺单文件页数时，用整单页数变化量推，不能拿整单总页数顶替。"""
+    from app.models.order_file import OrderFile
+
+    headers = student_headers(client, "file-change-legacy")
+    admin = admin_headers(client)
+    owner_id = int(decode_token(headers["Authorization"].split(" ", 1)[1])["sub"])
+
+    # 两份文件：5 页 + 10 页 = 整单 15 页
+    items = []
+    for pages, name in ((5, "第一部.pdf"), (10, "第二部.pdf")):
+        key = _file_key(name)
+        register_upload(key, name, owner_id)
+        items.append({"file_key": key, "file_name": name, "page_count": pages})
+    created = client.post(
+        "/api/order/create",
+        json={"files": items, "print_side": 2, "color_mode": 0, "copies": 1, "paper_size": "A4"},
+        headers=headers,
+    ).json()
+    assert created["code"] == 0, created
+    order = created["data"]
+    assert order["page_count"] == 15
+    pay_order(client, headers, order["id"])
+
+    # 换第 2 份：10 页 -> 8 页，整单 15 -> 13
+    payload = _replace_payload(page_count=8, file_name="第二部-修订.pdf")
+    payload["file_index"] = 2
+    register_upload(payload["file_key"], payload["file_name"], owner_id)
+    body = client.post(
+        f"/api/order/{order['id']}/replace-file", json=payload, headers=headers
+    ).json()
+    assert body["code"] == 0, body
+
+    change = db_session.execute(
+        select(OrderFileChange).where(OrderFileChange.order_id == order["id"])
+    ).scalar_one()
+    assert int(change.new_file_page_count) == 8
+    assert int(change.new_page_count) == 13
+
+    # 模拟老数据：这一列是后加的，历史行没有单文件页数
+    change.new_file_page_count = None
+    db_session.commit()
+
+    confirmed = confirm(client, admin, order["id"], approve=True)
+    assert confirmed["code"] == 0, confirmed
+
+    db_session.expire_all()
+    rows = {
+        int(row.file_index): row
+        for row in db_session.execute(
+            select(OrderFile).where(OrderFile.order_id == order["id"])
+        ).scalars()
+    }
+    assert int(rows[2].page_count) == 8  # 单文件页数
+    assert int(rows[2].page_count) != 13  # 不是整单总页数
+    assert int(rows[1].page_count) == 5  # 没换的那份不动
+    assert int(db_session.get(Order, order["id"]).page_count) == 13  # 整单页数
+
+    version = db_session.execute(
+        select(OrderFileVersion)
+        .where(
+            OrderFileVersion.order_id == order["id"],
+            OrderFileVersion.file_index == 2,
+        )
+        .order_by(OrderFileVersion.version_no.desc())
+    ).scalars().first()
+    assert int(version.page_count) == 8

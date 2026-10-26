@@ -98,10 +98,14 @@
 
       <view class="actions">
         <button v-if="order.status === 'pending_pay'" class="primary" @click="pay">模拟支付</button>
-        <button v-if="order.status === 'pending_pay' || order.status === 'queuing'" class="ghost" @click="cancel">取消订单</button>
+        <button v-if="canSelfCancel" class="ghost" @click="cancel">取消订单</button>
         <button class="ghost" :class="{ locked: !canReplace }" @click="onReplace">换文件</button>
         <button class="ghost" @click="goOrder">再来一单</button>
       </view>
+      <!-- 已付款的排队单不能自助取消（后端 40905），把出口写成“找老师” -->
+      <text v-if="teacherCancelOnly" class="cancel-hint">
+        已支付订单如需取消请联系文印室老师
+      </text>
     </template>
   </view>
 </template>
@@ -120,7 +124,6 @@ import { useUiTheme } from '@/ui/theme'
 const order = ref(null)
 const orderId = ref('')
 const { uiThemeClass, uiSchemeClass } = useUiTheme()
-let visible = false
 
 const isActive = computed(() => order.value && ['queuing', 'printing'].includes(order.value.status))
 
@@ -201,7 +204,6 @@ onLoad((options) => {
 })
 
 onShow(async () => {
-  visible = true
   try {
     await ensureLogin()
     poller.start()
@@ -211,7 +213,6 @@ onShow(async () => {
 })
 
 onHide(() => {
-  visible = false
   poller.stop()
 })
 onUnmounted(() => poller.stop())
@@ -225,6 +226,23 @@ async function pay() {
     notifyError(error)
   }
 }
+
+/**
+ * 学生能自助取消的只有「还没付钱」的订单。
+ *
+ * 已付款的排队单后端直接回 40905（钱已经收了，只能老师关单并登记退款），
+ * 界面上留一个必然失败的取消按钮只会让学生以为系统坏了。
+ */
+const canSelfCancel = computed(() => {
+  if (!order.value) return false
+  if (order.value.status === 'pending_pay') return true
+  return order.value.status === 'queuing' && !order.value.paid
+})
+
+/** 已付款且还在排队：按钮收起来，换成一句“找老师”的提示。 */
+const teacherCancelOnly = computed(
+  () => !!order.value && order.value.status === 'queuing' && Boolean(order.value.paid),
+)
 
 function cancel() {
   uni.showModal({
@@ -625,6 +643,15 @@ function goOrder() {
   flex-wrap: wrap;
   padding-bottom: 8rpx;
   gap: 16rpx;
+}
+
+/* 已付款排队单的取消出口提示：与操作区同一列排版，不抢按钮位 */
+.cancel-hint {
+  display: block;
+  margin: 0 0 16rpx;
+  color: var(--zi-muted);
+  font-size: 26rpx;
+  line-height: 1.5;
 }
 .primary,
 .ghost {

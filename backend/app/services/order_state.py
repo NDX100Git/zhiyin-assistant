@@ -48,8 +48,11 @@ TRANSITIONS: dict[str, set[str]] = {
     STATUS_CANCELLED: set(),
 }
 
-# 学生可以自己取消的状态
-STUDENT_CANCELLABLE = {STATUS_PENDING_PAY, STATUS_QUEUING}
+# 学生可以自己取消的状态。
+# 「排队中」意味着钱已经收了（支付才入队），学生不能自助取消：退款必须由老师在后台
+# 走关闭异常单的路径登记（见 admin_service.cancel_abnormal，会落一条负数退款流水）。
+# 待支付单还没有钱往来，学生可以随时取消。
+STUDENT_CANCELLABLE = {STATUS_PENDING_PAY}
 
 # 老师可以关闭的状态（异常单只能由老师关闭）
 ADMIN_CANCELLABLE = {STATUS_ABNORMAL}

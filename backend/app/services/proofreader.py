@@ -17,8 +17,13 @@ from typing import Any
 from app.config import get_ai_rules
 from app.database import SessionLocal
 from app.services import task_registry
-from app.services.doc_parser import get_cached_report, parse_document, save_report
-from app.services.llm import achat_json
+from app.services.doc_parser import (
+    bind_report_owner,
+    get_cached_report,
+    parse_document,
+    save_report,
+)
+from app.services.llm import achat_json, bind_key
 from app.utils.exceptions import BusinessError
 
 logger = logging.getLogger(__name__)
@@ -142,14 +147,18 @@ def merge_issues(chunk_results: list[list[dict]]) -> list[dict]:
     return merged
 
 
-async def _run_chunks(task_id: str, chunks: list[str]) -> list[list[dict]]:
+async def _run_chunks(
+    task_id: str, chunks: list[str], api_key: str | None = None
+) -> list[list[dict]]:
     rules = get_ai_rules()["proofread"]
     semaphore = asyncio.Semaphore(int(rules.get("max_concurrency", 2)))
+    # 学生自带的密钥只能活在本任务里：绑到调用上，用完随任务一起消失。
+    call = bind_key(achat_json, api_key)
 
     async def run_one(index: int, chunk: str) -> list[dict]:
         async with semaphore:
             try:
-                raw = await achat_json(build_messages(chunk))
+                raw = await call(build_messages(chunk))
                 return normalize_issues(raw, index)
             except BusinessError as exc:
                 logger.warning("第 %d 段校对失败：%s", index + 1, exc.message)
@@ -165,10 +174,33 @@ async def _run_chunks(task_id: str, chunks: list[str]) -> list[list[dict]]:
     return list(await asyncio.gather(*(run_one(i, chunk) for i, chunk in enumerate(chunks))))
 
 
-def _worker(task_id: str, file_key: str, session_factory=SessionLocal) -> None:
-    """后台线程执行：解析 → 分块 → 并发校对 → 写缓存。"""
+def _owner_id(raw: str) -> int | None:
+    """任务上的 owner 是 str(user.id)；空串或非法值一律视为「没有账号上下文」。"""
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _worker(
+    task_id: str,
+    file_key: str,
+    session_factory=SessionLocal,
+    api_key: str | None = None,
+) -> None:
+    """后台线程执行：解析 → 分块 → 并发校对 → 写缓存。
+
+    api_key 是学生自带的模型密钥（没带就是 None）：请求早返回了，模型调用才刚开始，
+    所以只能随任务一起交给这个线程。它不存进 task_registry，也不进任务结果与日志。
+    """
     db = session_factory()
     try:
+        # 后台线程用的是新会话，没有请求上下文，账号得从 task_registry 的 owner 取回来：
+        # 缓存行 user_id 留空会让缓存键退化成只按文件，两个账号碰到同一个 file_key
+        # （同传一份文件、以后要做的共享）时就会把 A 的校对结果发给 B。
+        # 发起人由路由层传给 start_proofread(owner=...)，与体检的缓存键保持同一口径。
+        running = task_registry.get_task(task_id)
+        bind_report_owner(db, _owner_id(running.owner) if running is not None else None)
         task_registry.update(task_id, status=task_registry.STATUS_RUNNING, message="正在解析文档…")
         cached = get_cached_report(db, file_key, "proofread")
         if cached is not None:
@@ -203,7 +235,7 @@ def _worker(task_id: str, file_key: str, session_factory=SessionLocal) -> None:
             return
 
         task_registry.update(task_id, total=len(chunks), message=f"共 {len(chunks)} 段待检查")
-        results = asyncio.run(_run_chunks(task_id, chunks))
+        results = asyncio.run(_run_chunks(task_id, chunks, api_key))
         issues = merge_issues(results)
         task = task_registry.get_task(task_id)
 
@@ -236,15 +268,22 @@ def _worker(task_id: str, file_key: str, session_factory=SessionLocal) -> None:
         db.close()
 
 
-def start_proofread(file_key: str, session_factory=SessionLocal, owner: str = "") -> dict:
+def start_proofread(
+    file_key: str,
+    session_factory=SessionLocal,
+    owner: str = "",
+    *,
+    api_key: str | None = None,
+) -> dict:
     """创建后台任务并立即返回 task_id，前端用轮询查看进度。
 
     owner 记下发起人用户 id：任务结果里是论文原文片段，轮询时只认本人。
+    api_key 是学生自带的模型密钥：交给后台线程用完即弃，不写进任务状态。
     """
     if not file_key:
         raise BusinessError("缺少文件标识", code=40073)
     task = task_registry.create_task("proofread", message="任务已创建", owner=owner)
-    _executor.submit(_worker, task.task_id, file_key, session_factory)
+    _executor.submit(_worker, task.task_id, file_key, session_factory, api_key)
     return task.to_dict(with_result=False)
 
 

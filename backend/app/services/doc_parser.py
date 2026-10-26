@@ -32,7 +32,7 @@ from sqlalchemy.orm import Session
 
 from app.config import BACKEND_DIR, settings
 from app.models.ai_report import AiReport
-from app.services.spreadsheet import render_pdf
+from app.services.spreadsheet import remaining_render_seconds, render_pdf
 from app.services.storage import get_storage
 from app.utils.exceptions import BusinessError
 from app.utils.filetype import normalize_ext
@@ -48,6 +48,17 @@ IMAGE_EXTS = {"jpg", "jpeg", "png"}
 
 # 章节识别：标准结构名 + “第X章 / 1.1” 式标题
 STRUCTURE_KEYWORDS = ("摘要", "关键词", "目录", "参考文献", "致谢", "Abstract", "Keywords")
+# 结构名必须出现在段落（行）起首，后面跟冒号、空白或直接结束，才算章节标题。
+# 早期实现用全文 find：正文里出现「本文的参考文献均按 GB/T 7714 著录」就会被当成
+# 章节标题，而且只取第一个匹配，真是标题的那一处反而看不到 —— 章节顺序、
+# 结构完整性、参考文献条目提取全被这一个误判带偏。
+# 用 [ \t]* 而不是 \s* 做行首缩进：\s 会跨过换行，等于又退回「全文任意位置匹配」。
+SECTION_KEYWORD_PATTERN = re.compile(
+    r"^[ \t]*(?P<name>"
+    + "|".join(re.escape(word) for word in sorted(STRUCTURE_KEYWORDS, key=len, reverse=True))
+    + r")(?=[ \t]*[:：]|[ \t]*$|[ \t])",
+    re.MULTILINE,
+)
 # 注意：必须开 MULTILINE，否则 ^ 只匹配整篇开头，章节标题会漏检
 CHAPTER_PATTERN = re.compile(
     r"^\s*(第[一二三四五六七八九十百]+章|[0-9]{1,2}(\.[0-9]{1,2})*\s+\S)", re.MULTILINE
@@ -72,24 +83,113 @@ SINGLE_LINE_FACTOR = 1.2
 
 
 # ---------------------------------------------------------------- 缓存
-def get_cached_report(db: Session, file_key: str, kind: str = "parse") -> dict | None:
-    """按 file_key 取缓存报告（报告类型用 report_json.kind 区分）。"""
-    row = db.execute(
+#
+# 产品口径：体检报告按账号各存一份，不同账号之间不共用缓存。所以缓存的键是
+# 「账号 + 文件」，而不是只看文件：报告里是整篇正文、问题清单与修改建议，
+# 只要两个人能拿到同一个 file_key（同传一份文件、移交、以后要做的共享），
+# 只看 file_key 的缓存就会把 A 的报告发给 B。
+#
+# 账号从会话上取，而不是从每个函数的签名上取：报告读写在 check_format、
+# ocr、proofread 等模块里都会被调用，逐个改签名会把同一个参数撒得到处都是，
+# 而它们手里的数据库会话本来就是「当前这个请求 / 这个任务」的那一个。
+# 路由层拿到当前用户后调 bind_report_owner() 打下标记，读写两侧自动对齐。
+REPORT_OWNER_KEY = "ai_report_owner"
+
+
+def bind_report_owner(db: Session, user_id: int | None) -> None:
+    """把「当前请求属于哪个账号」记在会话上，后续报告缓存读写据此隔离。
+
+    在 AI 路由里拿到当前用户后调用一次。不调用时（下单链路里的解析、
+    后台校对的独立会话）视为没有账号上下文，缓存行 user_id 留空，
+    行为与改造前一致。
+    """
+    db.info[REPORT_OWNER_KEY] = None if user_id is None else int(user_id)
+
+
+def report_owner(db: Session) -> int | None:
+    """取当前会话绑定的账号；没绑定过返回 None。"""
+    value = (db.info or {}).get(REPORT_OWNER_KEY)
+    return None if value is None else int(value)
+
+
+def get_cached_report(
+    db: Session, file_key: str, kind: str = "parse", user_id: int | None = None
+) -> dict | None:
+    """按「账号 + file_key + 报告类型」取缓存报告。
+
+    老行（user_id 为空）没有归属信息，只在本账号名下没有任何命中时才兜底取用，
+    并且当场改记到当前账号：否则两个账号会一直共用同一行老缓存，改了半天等于
+    没改。认领之后对方再来读就会命中不到，自己解析并写一行新的。
+    """
+    owner = report_owner(db) if user_id is None else int(user_id)
+    base = (
         select(AiReport)
         .where(AiReport.file_key == file_key)
         .where(AiReport.report_json["kind"].as_string() == kind)
+    )
+    conditions = (
+        AiReport.user_id == owner if owner is not None else AiReport.user_id.is_(None)
+    )
+    row = db.execute(
+        base.where(conditions).order_by(AiReport.id.desc()).limit(1)
+    ).scalar_one_or_none()
+    if row is not None:
+        return row.report_json
+
+    if owner is None:
+        return None
+    legacy = db.execute(
+        base.where(AiReport.user_id.is_(None)).order_by(AiReport.id.desc()).limit(1)
+    ).scalar_one_or_none()
+    if legacy is None:
+        return None
+
+    legacy.user_id = owner
+    db.commit()
+    logger.info("迁移前的老报告缓存已归属到账号 %s：%s", owner, file_key)
+    return legacy.report_json
+
+
+def save_report(
+    db: Session,
+    file_key: str,
+    payload: dict,
+    kind: str = "parse",
+    user_id: int | None = None,
+) -> dict:
+    """把报告写入 ai_reports 缓存表，写入时带上当前账号。"""
+    data = {**payload, "kind": kind}
+    owner = report_owner(db) if user_id is None else int(user_id)
+    db.add(AiReport(file_key=file_key, user_id=owner, report_json=data))
+    db.commit()
+    return data
+
+
+def get_cached_parse(db: Session, file_key: str) -> dict | None:
+    """取解析缓存：没有账号上下文的链路复用同一份解析结果。
+
+    解析结果只跟文件本身有关（页数、正文、版式事实），与账号无关。但老实现里
+    页数读取、下单、打印方案这三条链路没有账号上下文，只认 user_id 为空的那一行：
+    而体检链路带账号，写的是自己名下的行。于是一条「先体检、再读页数」的链路会
+    把整篇文档重新解析一遍，并在 ai_reports 里再留一行解析缓存；每多一条无账号
+    链路就多一行，表跟着膨胀。
+
+    所以没有账号上下文时直接复用这个文件已有的那一行：不重解析、不新写行、也不
+    改归属（老行的认领仍然只发生在带账号的链路里）。
+    带账号的链路仍按「账号 + 文件」取：体检、校对、修复报告是按账号隔离的。
+    """
+    cached = get_cached_report(db, file_key, "parse")
+    if cached is not None or report_owner(db) is not None:
+        return cached
+
+    row = db.execute(
+        select(AiReport)
+        .where(AiReport.file_key == file_key)
+        .where(AiReport.report_json["kind"].as_string() == "parse")
         .order_by(AiReport.id.desc())
         .limit(1)
     ).scalar_one_or_none()
-    return row.report_json if row else None
-
-
-def save_report(db: Session, file_key: str, payload: dict, kind: str = "parse") -> dict:
-    """把报告写入 ai_reports 缓存表。"""
-    data = {**payload, "kind": kind}
-    db.add(AiReport(file_key=file_key, report_json=data))
-    db.commit()
-    return data
+    return None if row is None else row.report_json
 
 
 # ---------------------------------------------------------------- 页数快读
@@ -272,10 +372,16 @@ class _ConversionGate:
             return self._slots, limit
 
     @contextmanager
-    def slot(self):
-        """占一个转换槽位；排队超时抛 50046。"""
+    def slot(self, wait_seconds: float | None = None):
+        """占一个转换槽位；排队超时抛 50046。
+
+        wait_seconds 为 None 时用配置值；表格渲染会传「剩余预算」进来，
+        排队也不能把一条请求的耗时推过预算。
+        """
         semaphore, limit = self._current()
         wait = max(0.0, float(settings.soffice_queue_wait_seconds))
+        if wait_seconds is not None:
+            wait = min(wait, max(0.0, float(wait_seconds)))
         if not semaphore.acquire(timeout=wait):
             raise BusinessError(
                 f"文档转换排队已满（同时最多 {limit} 个），等了 {wait:g} 秒仍没有空位，"
@@ -291,9 +397,25 @@ class _ConversionGate:
 _conversion_gate = _ConversionGate()
 
 
-def conversion_slot():
+def conversion_slot(wait_seconds: float | None = None):
     """转换槽位上下文管理器；测试与转换函数共用这一个入口。"""
-    return _conversion_gate.slot()
+    return _conversion_gate.slot(wait_seconds)
+
+
+def conversion_timeout_seconds() -> float:
+    """这一次转换允许等多久：配置的单次超时，并且不超过表格渲染剩余的预算。
+
+    表格放宽横向页数时会重跑多轮转换，每一轮都占着同一个**转换车道**名额（表格请求已
+    不在 AI 名额里跑，见 ai_pool 的 lane 说明）。
+    只在 spreadsheet.render_pdf 里数次数没用：一轮转换自己就能跑满 180 秒，
+    两轮就是 260 秒以上，同车道上排在后面的表格只看到超时。所以预算必须一直传到
+    真正等 soffice 的这一层：额度用尽就按剩余时间等，杀进程、归还名额。
+    """
+    timeout = max(1.0, float(settings.soffice_timeout_seconds))
+    remaining = remaining_render_seconds()
+    if remaining is None:
+        return timeout
+    return min(timeout, remaining)
 
 
 def _kill_process_tree(proc: subprocess.Popen) -> None:
@@ -325,14 +447,48 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
         logger.warning("转换进程 %s 在超时后仍未退出", proc.pid)
 
 
+# 传给转换子进程的环境变量白名单。
+# 后端进程的环境里有数据库口令、JWT 密钥、模型 API Key，这些跟排版毫无关系。
+# LibreOffice 会派生一串子进程，转换的又是学生上传的任意文档：宏、扩展、崩溃报告、
+# 诊断日志任何一处把环境打出来，密钥就跟着泄露了。所以只给跑起来必需的那几项，
+# 其余一律不传 —— 宁可转换偶发报错（有日志可查），也不能把密钥交给不可信输入。
+MINIMAL_CHILD_ENV_KEYS = (
+    "PATH",        # 找 soffice 与它调用的工具
+    "HOME",        # LibreOffice 的用户配置根目录
+    "USER",        # 部分发行版靠它决定配置目录
+    "LOGNAME",
+    "SHELL",
+    "LANG",        # 字符集与区域设置，中文文档靠它
+    "LC_ALL",
+    "LC_CTYPE",
+    "SYSTEMROOT",  # Windows 必需：缺了连系统 DLL 都找不到
+    "WINDIR",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "COMSPEC",
+    "PATHEXT",
+)
+
+
+def _child_env(out_dir: Path) -> dict[str, str]:
+    """构造转换子进程的环境变量：白名单 + 显式的 TMP/TEMP。"""
+    env = {key: os.environ[key] for key in MINIMAL_CHILD_ENV_KEYS if key in os.environ}
+    tmp_dir = str(_subprocess_temp_dir(out_dir))
+    env["TMP"] = env["TEMP"] = tmp_dir
+    if "HOME" not in env and "USERPROFILE" in env:
+        # 容器与精简镜像里常常只有 USERPROFILE，LibreOffice 找不到 HOME 会起不来
+        env["HOME"] = env["USERPROFILE"]
+    return env
+
+
 def _run_soffice(
     cmd: list[str], out_dir: Path, stdout_log: Path, stderr_log: Path
 ) -> None:
     """起一个 soffice 子进程并等它退出。调用方必须已持有转换槽位。"""
     # 注意：不能用 subprocess.PIPE 捕获输出。LibreOffice 会派生后台子进程并继承管道句柄，
     # 导致父进程已退出但管道不关闭、读取永久阻塞。改为重定向到日志文件。
-    child_env = {**os.environ}
-    child_env["TMP"] = child_env["TEMP"] = str(_subprocess_temp_dir(out_dir))
+    child_env = _child_env(out_dir)
     with stdout_log.open("wb") as stdout_fp, stderr_log.open("wb") as stderr_fp:
         proc = subprocess.Popen(
             cmd,
@@ -345,7 +501,7 @@ def _run_soffice(
             start_new_session=(os.name != "nt"),
         )
         try:
-            proc.wait(timeout=settings.soffice_timeout_seconds)
+            proc.wait(timeout=conversion_timeout_seconds())
         except subprocess.TimeoutExpired as exc:
             _kill_process_tree(proc)
             raise BusinessError("文档转换超时，请稍后重试", code=50041) from exc
@@ -360,7 +516,7 @@ def convert_document(input_path: Path, out_dir: Path, target: str = "pdf") -> Pa
     cmd = _soffice_command(input_path, out_dir, profile_dir, target)
     logger.info("调用 LibreOffice 转换：%s -> %s", input_path.name, target)
 
-    with conversion_slot():
+    with conversion_slot(remaining_render_seconds()):
         _run_soffice(cmd, out_dir, stdout_log, stderr_log)
 
     output = out_dir / f"{input_path.stem}.{target}"
@@ -465,13 +621,20 @@ def _page_images(pdf_page: fitz.Page) -> list[dict]:
     return images
 
 
+def heading_positions(full_text: str) -> dict[str, int]:
+    """各结构名作为**标题**出现的位置（首次出现）。
+
+    只认段落起首的写法：正文里顺口提到「参考文献」四个字不算标题。
+    """
+    positions: dict[str, int] = {}
+    for match in SECTION_KEYWORD_PATTERN.finditer(full_text):
+        positions.setdefault(match.group("name"), match.start())
+    return positions
+
+
 def detect_sections(full_text: str) -> list[str]:
     """识别论文章节（用于 5-B 的结构完整性与顺序校验）。"""
-    positions: dict[str, int] = {}
-    for keyword in STRUCTURE_KEYWORDS:
-        index = full_text.find(keyword)
-        if index >= 0:
-            positions[keyword] = index
+    positions = heading_positions(full_text)
 
     for match in CHAPTER_PATTERN.finditer(full_text):
         positions.setdefault("正文", match.start())
@@ -481,8 +644,12 @@ def detect_sections(full_text: str) -> list[str]:
 
 
 def extract_references(full_text: str) -> list[dict]:
-    """提取参考文献条目（以 [数字] 开头的连续段落）。"""
-    marker = full_text.find("参考文献")
+    """提取参考文献条目（以 [数字] 开头的连续段落）。
+
+    起点取「参考文献」作为标题出现的位置；正文里提到这四个字不算，
+    否则会把正文里 [1] 开头的编号列表误当成文献著录。
+    """
+    marker = heading_positions(full_text).get("参考文献", -1)
     body = full_text[marker:] if marker >= 0 else full_text
 
     items: list[dict] = []
@@ -642,7 +809,7 @@ def parse_document(db: Session, file_key: str, force: bool = False) -> dict:
     if not file_key:
         raise BusinessError("缺少文件标识", code=40073)
     if not force:
-        cached = get_cached_report(db, file_key, "parse")
+        cached = get_cached_parse(db, file_key)
         if cached is not None:
             logger.info("命中解析缓存：%s", file_key)
             return cached

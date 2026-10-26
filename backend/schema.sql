@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS `orders` (
   `pay_channel`    VARCHAR(16)  DEFAULT NULL COMMENT '预留：mock/wechat/card',
   `external_pay_id` VARCHAR(64) DEFAULT NULL COMMENT '预留：第三方支付流水号',
   `printer_id`     INT          DEFAULT NULL COMMENT '预留：指定打印机',
+  `slot_taken`     TINYINT      NOT NULL DEFAULT 0 COMMENT '下单时是否占到本时段名额：1=占到，取消时才归还容量',
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_orders_order_no` (`order_no`),
   KEY `idx_status_created` (`status`, `created_at`),
@@ -161,11 +162,13 @@ CREATE TABLE IF NOT EXISTS `payment_logs` (
   `id`           BIGINT      NOT NULL AUTO_INCREMENT,
   `order_id`     BIGINT      NOT NULL,
   `amount_cents` INT         NOT NULL COMMENT '单位：分',
-  `method`       VARCHAR(16) DEFAULT NULL COMMENT 'mock / onsite',
+  `method`       VARCHAR(16) DEFAULT NULL COMMENT 'mock / onsite / refund',
   `operator`     VARCHAR(64) DEFAULT NULL,
+  `idempotency_key` VARCHAR(64) DEFAULT NULL COMMENT '同一订单内唯一的幂等键：pay:/onsite:/refund: + 订单 id',
   `created_at`   DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
-  KEY `idx_payment_order` (`order_id`)
+  KEY `idx_payment_order` (`order_id`),
+  UNIQUE KEY `uq_payment_idem` (`order_id`, `idempotency_key`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='收款记录';
 
 -- 收单时段设置：关闭只影响新订单
@@ -208,11 +211,15 @@ CREATE TABLE IF NOT EXISTS `print_logs` (
 -- AI 体检报告缓存：中间结果缓存 7 天后清除
 CREATE TABLE IF NOT EXISTS `ai_reports` (
   `id`          BIGINT       NOT NULL AUTO_INCREMENT,
+  -- 报告归属账号。产品口径：各账号各存一份，互不共用；为空只出现在迁移前的老行上
+  `user_id`     BIGINT       DEFAULT NULL COMMENT '报告归属账号；为空表示迁移前的老行',
   `file_key`    VARCHAR(255) NOT NULL,
   `report_json` JSON         NOT NULL,
   `created_at`  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
-  KEY `idx_file_key` (`file_key`)
+  KEY `idx_file_key` (`file_key`),
+  -- 缓存键是「账号 + 文件」，读写那条路径必须走这个复合索引
+  KEY `idx_report_owner` (`user_id`, `file_key`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI 体检报告缓存';
 
 -- 待发消息记录：V1 只记录事件，V2 接入推送时直接补发

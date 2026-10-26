@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Generic, TypeVar
-
 from pydantic import BaseModel, Field
 
-T = TypeVar("T")
 
-
-class ApiResponse(BaseModel, Generic[T]):
+class ApiResponse[T](BaseModel):
     """所有接口的统一返回结构。"""
 
     code: int = Field(default=0, description="0 表示成功，非 0 表示业务错误")

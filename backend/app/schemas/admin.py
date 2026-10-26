@@ -24,6 +24,13 @@ class BatchCompleteRequest(BaseModel):
 
 class AbnormalRequest(BaseModel):
     reason: str | None = Field(default=None, description="异常原因，如卡纸、缺墨、学生有异议")
+    refund_cents: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "关闭异常单时的退款金额（分）：不传按成交价全额退，但不能超过实际已收金额"
+        ),
+    )
 
 
 class FileChangeConfirmRequest(BaseModel):

@@ -13,8 +13,8 @@
 1. 读本文件第 1-4 节，知道现在做到哪、哪些决策不能随便改。
 2. 按第 2 节启动 MySQL、MinIO、后端、学生端 H5。
 3. 打开 <http://127.0.0.1:8000/docs> 看接口，打开 <http://127.0.0.1:5173> 看学生端。
-4. 跑 `cd backend && python -m pytest -q`，确认 **271 passed / 2 skipped**（跳过的是需要
-   LibreOffice 与 Docker 的两条 Office 转换用例；其余全绿）。
+4. 跑 `cd backend && python -m pytest -q`，确认 **453 passed / 1 skipped**（跳过的是需要
+   LibreOffice 的那一条 Office 转换用例；其余全绿）。
 5. 要改哪个模块，先查 [ARCHITECTURE.md](ARCHITECTURE.md) 第 6 节的"关键文件职责"。
 6. 改完一个阶段：更新本文件 + 跑测试 + `git commit`（message 写清楚阶段和内容）。
 
@@ -25,17 +25,23 @@
 智印助手：学生上传论文 → AI 做格式与版式体检 → 给修复建议与打印方案 → 下单排队 →
 文印室老师打印 → 学生凭取件码取件并结清。
 
-**当前阶段：V1 核心闭环已跑通（后端全部业务 + 学生端 H5 四个页面），阶段 7 收尾中，阶段 8/9 未开始。**
+**当前阶段：V1 核心闭环已跑通（后端全部业务 + 学生端 H5 五个页面），阶段 7 收尾中，阶段 8/9 未开始。**
 
-最近一次验证（2026-10-25，本轮实测）：
+最近一次验证（2026-10-25，本轮重跑了后端）：
 
-- 后端 `pytest -q`：**271 passed / 2 skipped**（跳过 2 条需 LibreOffice/Docker 的 Office 转换用例）
+- 后端 `pytest -q`：**453 passed / 1 skipped**（跳过的是 `tests/test_doc_parser.py` 里需要
+  LibreOffice 的 Office 转换用例）
+- 同一套用例在三套时钟下数字一致：真实墙钟、`CLOCK_SHIFT_TIME=18:43`、`CLOCK_SHIFT_TIME=06:00`
+  （后两者用 `tests/clock_shift_plugin.py` 把应用侧时钟拨早，验证排队与过期判定不靠应用时钟）
 - 后端 `ruff check .`：All checks passed
-- 学生端 `npm run build:h5`：构建成功（23 秒）
-- 老师端 `npm run build`：构建成功（12 秒，主 chunk 1.06 MB，有 chunk 体积警告）
-- 浏览器端到端（`cd e2e && node run.mjs --start`）：**41 步 × 2 视口（390/1440）全部通过**，
+- 后端接口：`/openapi.json` 里 **44 条** `/api` 操作（`backend/app/routers/` 七个路由模块）
+- 学生端 `npm run build:h5`：构建成功（23 秒，本轮未重跑）
+- 老师端 `npm run build`：构建成功（12 秒，主 chunk 1.06 MB，有 chunk 体积警告，本轮未重跑）
+- 浏览器端到端（`cd e2e && node run.mjs --start`）：脚本现为 **56 步 × 2 视口（390/1440）**
+  （`e2e/run.mjs` 里 56 个 `step()` 调用）；本轮未重跑浏览器回归，上一次全通记录是 41 步时
+  的 [HANDOFF-2026-10-25.md](HANDOFF-2026-10-25.md)，
   覆盖单文件/多文件/四文件闭环、换文件确认、打印前拦截、两套皮肤、深色模式对比度抽查
-- 唯一未覆盖：Office 文档 → PDF 转换（本机无 LibreOffice / Docker）
+- 唯一未覆盖：Office 文档 → PDF 转换（本机无 LibreOffice）
 
 ---
 
@@ -43,7 +49,7 @@
 
 | 组件 | 位置 / 版本 | 说明 |
 |---|---|---|
-| Python | Python 3.11+（本机验证 3.14.7） | 用系统 Python 创建 `backend/.venv`，路径因机器而异 |
+| Python | Python 3.12+（本机验证 3.14.7） | 用系统 Python 创建 `backend/.venv`，路径因机器而异 |
 | 后端 venv | `backend/.venv` | 依赖版本见 `backend/requirements.txt`（已锁定） |
 | MySQL | `backend/.tools/mysql8`（可用 `ZHIYIN_MYSQL_ROOT` 覆盖） | 免安装版；数据目录在 `mysql8\data`；密码见 `backend/.env` |
 | MinIO | `backend/.tools/minio/minio.exe`（可用 `ZHIYIN_MINIO_EXE` 覆盖） | 数据目录 `backend/.data/minio`；9000 API / 9001 控制台 |
@@ -76,7 +82,7 @@ npm.cmd run dev:h5
 
 | 阶段 | 内容 | 属于 | 状态 | 关键产出 |
 |---|---|---|---|---|
-| 1 | 项目骨架、8 张表、统一返回格式、全局异常 | 后端 | ✅ | FastAPI 骨架、SQLAlchemy 模型、`schema.sql`、配置文件、compose、README |
+| 1 | 项目骨架、13 张表、统一返回格式、全局异常 | 后端 | ✅ | FastAPI 骨架、SQLAlchemy 模型、`schema.sql`、配置文件、compose、README |
 | 2 | 登录 + 上传 | 后端 | ✅ | `AuthProvider`（device）、`FileStorage`（MinIO）、文件头校验、签名 URL、上传需 token |
 | 3 | 订单核心 | 后端 | ✅ | 订单号/取件码、状态机、Mock 支付、排队估算、首页汇总、公告列表 |
 | 4 | 老师端接口 | 后端 | ✅ | 队列、下载、开始/完成（可改价留痕）、批量完成、核销（含按码）、异常/恢复/关闭、收单开关、统计、公告 |
@@ -86,7 +92,7 @@ npm.cmd run dev:h5
 | 5-D | OCR + PDF 转 Word | 后端 | ✅ | 多模态 OCR、pdf2docx 转换（不调大模型） |
 | 扩展 | 排版属性检查 | 后端 | ✅ | 从 PDF 提取正文常见字体/字号/行距，按 `common` 口径只出建议 |
 | 6 | 文档修复 | 后端 | ✅ | AI 出 actions、代码执行、序号保留、`⟨待补⟩` 占位、生成副本 |
-| 7 | 学生端 uni-app | 学生端 | 🔄 | 4 个页面 + auth/filePicker/notify 适配层；H5 冒烟通过；**体检/修复可选**，基础方案可直接下单；打印方案可手动改单双面/颜色/版式/份数；真机 plus.io 待验证 |
+| 7 | 学生端 uni-app | 学生端 | 🔄 | 5 个页面 + auth/filePicker/notify 适配层；H5 冒烟通过；**体检/修复可选**，基础方案可直接下单；打印方案可手动改单双面/颜色/版式/份数；真机 plus.io 待验证 |
 | 8 | 老师端 Vue3 后台 | 老师端 | ✅ | 登录、工作台（今日数据/队列/下载/开始/完成改价/核销/批量完成/异常处理）、收款流水、收单开关、公告发布；Edge E2E 通过 |
 | 9 | 打包与交付 | 文档/工程 | 🟡 | 已配置 appid 占位、包名、图标、权限、minSdk 26；已写打包/部署/安装说明；H5/小程序/App 资源构建通过；**APK 待用 HBuilderX 云打包** |
 
@@ -94,7 +100,9 @@ npm.cmd run dev:h5
 
 ## 4. 关键决策（都有原因，不要轻易推翻）
 
-1. **Python 用 3.14.7**：用户明确指定用本机版本，不额外装 3.11。代码保持 3.11 兼容写法（`from __future__ import annotations`、标准库类型）。
+1. **Python 用 3.14.7**：用户明确指定用本机版本，不额外装 3.11。代码按 3.12+ 写（下界不许退回 3.11）：
+   `app/schemas/common.py` 的 `class ApiResponse[T](BaseModel)` 是 3.12 才支持的 PEP 695 泛型语法，
+   3.11 下 import 就 SyntaxError；`backend/requirements.txt` 注释与 `backend/Dockerfile` 同样是 3.12 下界。
 2. **数据库建表双轨**：启动时 `create_all`（`AUTO_CREATE_TABLES=true`）+ 可执行 `schema.sql`，不引入 Alembic（V1 轻量）。
 3. **统一响应约定**：业务错误与参数校验错误返回 **HTTP 200 + 非 0 code**；未预期异常返回 HTTP 500 但响应体仍是 `{code,message,data}`。前端只解析 code。
 4. **金额一律「分」整数**：单价读 `config/pricing.json`；打印方案里模型只给推荐与理由，**纸张数/金额由服务端算**，不让模型算钱。
@@ -119,6 +127,7 @@ npm.cmd run dev:h5
 
 | 日期 | 问题 | 原因 | 修复 |
 |---|---|---|---|
+| 2026-10-25 | 换过文件的单在应用机慢于数据库时排到队首，而不是队尾 | 订单创建时间 `created_at` 取数据库 `CURRENT_TIMESTAMP`，重排队时间 `requeue_at` 取应用进程的 `datetime.now()`，两套时钟不同源 | `file_change_service.db_now()`：本模块写时间列一律读数据库时钟，队列排序只依赖一个时钟；补 `tests/test_file_change.py::test_应用时钟慢于数据库_换文件后仍排到队尾` 锁住语义 |
 | 2026-10-25 | 老师改价只挡负数，30 元误输成 300 元照样落库 | 只判断 `< 0` | `pricing.ensure_amount_allowed()`：单笔上限 1000 元 + 相对系统价 10 倍，且至少给 20 元浮动空间（小额单不至于被拦）；`complete_print` 与换文件确认价都接上，错误码 `40062` |
 | 2026-10-25 | 核销覆盖线上支付时间，对账口径错位 | `verify_pickup` 无条件写 `paid_at` | 只在 `paid_at` 为空时写入；补款金额照旧记 `PaymentLog` |
 | 2026-10-25 | 已打印的异常单恢复后被重新打印一遍 | `ready→abnormal→queuing` 回路，`recover_order` 无业务校验 | 已打印过的异常单恢复到 `ready`（状态机补 `ABNORMAL→READY`）；`printed_at` 改为只在首次进 `ready` 时写 |
@@ -153,7 +162,7 @@ npm.cmd run dev:h5
 | LLM 调用有成本 | 演示时反复体检会消耗额度 | 解析/体检/方案均有缓存；`force=true` 才会重算 |
 | 学生端只验证了 H5 | App/小程序端未实测 | H5 已用 Edge 冒烟（0 错误）；App 需 HBuilderX 真机运行 |
 | 后端容器已降权到 uid 10001，运行时目录改为命名卷 | 只做了配置层验证（YAML 可解析、卷名与挂载点一致） | **需在有 Docker 的机器上 `docker compose up -d --build` 实测一次**，确认容器能写 `/app/runtime/tmp` |
-| Office 文档 → PDF 转换未实测 | 本机无 LibreOffice、无 Docker，2 条用例被 skip | 上传 PDF 的链路是通测的；有 LibreOffice 的机器上跑 `pytest -k 转换` 补齐 |
+| Office 文档 → PDF 转换未实测 | 本机无 LibreOffice，1 条用例被 skip | 上传 PDF 的链路是通测的；有 LibreOffice 的机器上跑 `pytest -k 转换` 补齐 |
 | 已支付订单学生仍可一键取消（无退款、无反向流水） | `STUDENT_CANCELLABLE` 含 `queuing` | **待产品口径**：收紧为「付了不能自取消」，或允许取消但走退款 + 反向流水 |
 | 并发支付时真实扣款在状态保护之外 | mock 支付看不出 | **待产品口径**：`SELECT ... FOR UPDATE` 行锁 或 客户端幂等键 |
 | `ai_reports` 缓存没有 `user_id` 维度 | 路由层 `ensure_files_owned_by` 已拦住跨用户路径 | 属纵深防御；改动面约 8 个文件（加列 + 幂等迁移 + 5 个 service 签名） |
@@ -171,9 +180,9 @@ npm.cmd run dev:h5
 
 **可以直接做**
 
-4. **补跑 Office 转换的 2 条用例**（本机缺 LibreOffice/Docker 被 skip）。
-5. **把 `e2e/` 接进 CI**：2449 行全链路回归，目前完全不在 CI 里跑。
-6. **CI 补 lint**：两个前端 `package.json` 都没有 `lint`/`test` script，后端也没在 CI 里跑 ruff。
+4. **补跑 Office 转换的 1 条用例**（本机缺 LibreOffice 被 skip）。
+5. **把 `e2e/` 接进 CI**：`e2e/run.mjs` 4428 行 / 56 步全链路回归，已作为独立作业接入流水线（`.github/workflows/ci.yml` 的 browser-e2e）。
+6. **CI 补 lint**：两个前端都已具备 `lint` 与 `test` 脚本并接入流水线，后端 ruff 也在流水线里跑。
 7. **Docker 实测**：容器降权 + 命名卷需真机验证一次。
 8. **阶段 9 打包交付**：按 `docs/PACKAGING.md` 在 HBuilderX 云打包 APK（需替换 appid、选择 `src/static/app-icon.png`、配置签名证书）；部署按 `docs/DEPLOYMENT.md`，评委安装看 `docs/INSTALL.md`。
 9. **真机验证**：拿到 Android 手机后验证 `plus.io.chooseFile`，失败则继续用"载入示例论文"兜底。
@@ -188,7 +197,7 @@ npm.cmd run dev:h5
 ```powershell
 # 后端测试 + 静态检查（用虚拟环境里的 python；直接跑系统 python 也一样）
 cd backend
-.venv\Scripts\python.exe -m pytest -q      # 期望 271 passed, 2 skipped
+.venv\Scripts\python.exe -m pytest -q      # 期望 453 passed, 1 skipped
 .venv\Scripts\python.exe -m ruff check .   # 期望 All checks passed
 
 # 模型连通性

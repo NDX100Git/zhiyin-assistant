@@ -75,6 +75,18 @@ def _note(text: str) -> str:
     return text if len(text) <= 255 else text[:252] + "..."
 
 
+def db_now(db: Session) -> datetime:
+    """数据库时钟的「现在」，本模块写时间列一律用它。
+
+    为什么不能取应用进程的 `datetime.now()`：`orders.created_at` 由数据库
+    `CURRENT_TIMESTAMP` 落库，而队列按 `COALESCE(requeue_at, created_at)` 升序排。
+    重排队时间若取应用时钟，一旦应用机比数据库慢，`requeue_at` 就会早于已有的
+    `created_at`，刚换完文件的单被排到队首而不是队尾。两边统一取数据库时间，
+    排队位置只依赖一个时钟。
+    """
+    return db.execute(select(func.current_timestamp())).scalar_one()
+
+
 def file_system_amount_cents(order: Order, row, page_count: int | None = None) -> int:
     """按该份文件自己的打印参数算金额（分）。换文件重算一律用它，不再用订单级参数。"""
     return line_amount_cents(order, row, page_count)
@@ -316,7 +328,7 @@ def expire_pending_changes(
         .values(
             status=CHANGE_CANCELLED,
             pending_flag=None,
-            reviewed_at=datetime.now(),
+            reviewed_at=db_now(db),
             reviewed_by=operator,
             review_note=reason,
         )
@@ -401,7 +413,7 @@ def _apply_immediately(db: Session, order: Order, payload) -> dict:
     )
 
     # 文件变了，老师之前「看到」的状态作废，直到重新下载确认
-    now = datetime.now()
+    now = db_now(db)
     order.file_changed_at = now
     order.files_seen_at = None
 
@@ -568,7 +580,7 @@ def _paid_total(db: Session, order_id: int) -> int:
 
 
 def _reject_change(db: Session, order: Order, change: OrderFileChange, operator: str) -> dict:
-    now = datetime.now()
+    now = db_now(db)
     change.status = CHANGE_REJECTED
     change.pending_flag = None
     change.reviewed_at = now
@@ -598,6 +610,24 @@ def _reject_change(db: Session, order: Order, change: OrderFileChange, operator:
     return {"approved": False, "change": change}
 
 
+def _new_file_page_count(change: OrderFileChange, target: OrderFile) -> int:
+    """换进来的那一份文件自己的页数。
+
+    `new_file_page_count` 是这一份文件的页数，`new_page_count` 是整单总页数，
+    在多文件订单上两者不是一回事，不能互相回退。老的待确认请求没有单文件页数时，
+    只能用整单页数的变化量把这一份推出来：
+    该行原页数 + (新整单页数 - 老整单页数)。
+    直接回退到整单总页数，会把整单页数写进这一行，页数、行金额与打印页数全错位。
+    两个整单页数也缺时，保持该行原页数不变，不动比写错安全。
+    """
+    if change.new_file_page_count is not None:
+        return int(change.new_file_page_count)
+    own_pages = int(target.page_count or 0)
+    if change.old_page_count is None or change.new_page_count is None:
+        return own_pages
+    return max(0, own_pages + int(change.new_page_count) - int(change.old_page_count))
+
+
 def _approve_change(
     db: Session, order: Order, change: OrderFileChange, operator: str,
     amount_cents: int | None,
@@ -615,7 +645,7 @@ def _approve_change(
     )
 
     rows, target = resolve_file_row(db, order, change.file_index)
-    new_file_pages = int(change.new_file_page_count or change.new_page_count)
+    new_file_pages = _new_file_page_count(change, target)
     _ensure_total_pages(order, target, new_file_pages)
 
     old = {
@@ -653,7 +683,8 @@ def _approve_change(
 
     # 重新排到队尾：不改订单号与创建时间，只写重新排队时间。
     # 文件已替换，老师之前的「已看到」作废，等重新下载后再确认。
-    now = datetime.now()
+    # 「现在」取数据库时钟：created_at 也是数据库时间，两边不同源就会排错位置。
+    now = db_now(db)
     order.requeue_at = now
     order.file_changed_at = now
     order.files_seen_at = None

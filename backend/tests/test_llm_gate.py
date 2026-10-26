@@ -257,3 +257,300 @@ def test_取消排队中的异步调用不占死名额(monkeypatch) -> None:
         return await llm.achat(_messages())  # 名额已归还，这里必须成功
 
     assert asyncio.run(scenario()) == "好的"
+
+
+# ---------------------------------------------------------------- 必然失败的错误不重试
+_STATUS_TO_ERROR = {
+    400: "BadRequestError",
+    401: "AuthenticationError",
+    403: "PermissionDeniedError",
+    404: "NotFoundError",
+    422: "UnprocessableEntityError",
+}
+
+
+def _api_error(status: int) -> Exception:
+    """构造一个和真实 SDK 一样带 status_code 的异常，不真的发请求。"""
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "https://api.deepseek.com/chat/completions")
+    response = httpx.Response(status, request=request)
+    error_class = getattr(openai, _STATUS_TO_ERROR.get(status, "APIStatusError"))
+    return error_class("模拟必然失败", response=response, body=None)
+
+
+class _FailingCompletions:
+    """每次都抛指定异常，记录被调用了几次。"""
+
+    def __init__(self, error_factory) -> None:
+        self.error_factory = error_factory
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def create(self, **kwargs):
+        with self._lock:
+            self.calls += 1
+        raise self.error_factory()
+
+
+class _FailingAsyncCompletions(_FailingCompletions):
+    async def create(self, **kwargs):
+        with self._lock:
+            self.calls += 1
+        raise self.error_factory()
+
+
+@pytest.mark.parametrize("status", sorted(_STATUS_TO_ERROR))
+def test_必然失败的错误只调用一次(monkeypatch, status: int) -> None:
+    """鉴权失败、参数错误、模型不存在这类错，重试只会把同一个错再撞一遍。"""
+    completions = _FailingCompletions(lambda: _api_error(status))
+    monkeypatch.setattr(llm, "get_client", lambda: _FakeClient(completions))
+    monkeypatch.setattr(settings, "llm_max_attempts", 3)
+
+    with pytest.raises(BusinessError) as excinfo:
+        llm.chat(_messages())
+
+    assert completions.calls == 1, f"HTTP {status} 不该重试"
+    assert excinfo.value.code == 50031
+    assert "配置" in excinfo.value.message
+
+
+def test_服务端错误仍然按配置次数重试(monkeypatch) -> None:
+    """500 这类「等会儿可能就好」的失败该重试，别把临时故障当永久故障。"""
+    completions = _FailingCompletions(lambda: _api_error(500))
+    monkeypatch.setattr(llm, "get_client", lambda: _FakeClient(completions))
+    monkeypatch.setattr(settings, "llm_max_attempts", 3)
+
+    with pytest.raises(BusinessError):
+        llm.chat(_messages())
+
+    assert completions.calls == 3
+
+
+def test_鉴权失败一次就报错且提示配置(monkeypatch) -> None:
+    completions = _FailingCompletions(lambda: _api_error(401))
+    monkeypatch.setattr(llm, "get_client", lambda: _FakeClient(completions))
+    monkeypatch.setattr(settings, "llm_max_attempts", 5)
+
+    with pytest.raises(BusinessError) as excinfo:
+        llm.chat(_messages())
+
+    assert completions.calls == 1
+    assert "HTTP 401" in excinfo.value.message
+
+
+def test_异步调用同样不重试必然失败(monkeypatch) -> None:
+    completions = _FailingAsyncCompletions(lambda: _api_error(401))
+    monkeypatch.setattr(llm, "get_async_client", lambda: _FakeAsyncClient(completions))
+    monkeypatch.setattr(llm, "is_configured", lambda: True)
+    monkeypatch.setattr(settings, "llm_max_attempts", 3)
+    monkeypatch.setattr(settings, "llm_max_concurrency", 2)
+    monkeypatch.setattr(settings, "llm_queue_wait_seconds", 2.0)
+
+    async def scenario() -> None:
+        with pytest.raises(BusinessError) as excinfo:
+            await llm.achat(_messages())
+        assert excinfo.value.code == 50031
+
+    asyncio.run(scenario())
+    assert completions.calls == 1
+
+
+def test_可重试与不可重试的分流规则() -> None:
+    assert llm.is_permanent_error(_api_error(401)) is True
+    assert llm.is_permanent_error(_api_error(400)) is True
+    assert llm.is_permanent_error(_api_error(500)) is False
+    assert llm.is_permanent_error(RuntimeError("网络抖动")) is False
+
+
+# ---------------------------------------------------------------- 客户端的懒加载
+# 首次被并发调用时，几个线程同时看到 None，各建一个客户端，后建的把先建的覆盖掉。
+# 被覆盖的连接池没人关闭（AsyncOpenAI 还绑着事件循环），「第一次有人点体检」就是
+# 一个稳定的连接泄漏点。锁只包住创建那一段，模型请求一行都不能进锁。
+def _race_lazy_loader(monkeypatch, class_attr: str, cache_attr: str, getter) -> None:
+    created: list[object] = []
+    threads_count = 6
+    barrier = threading.Barrier(threads_count)
+
+    class _SlowClient:
+        def __init__(self, **kwargs) -> None:
+            time.sleep(0.02)  # 放大竞态窗口：没锁时几个线程都会各自建一个
+            created.append(self)
+
+    monkeypatch.setattr(llm, class_attr, _SlowClient)
+    monkeypatch.setattr(llm, cache_attr, None)
+    monkeypatch.setattr(settings, "llm_api_key", "sk-test-lazy-load")
+
+    clients: list[object] = []
+
+    def worker() -> None:
+        barrier.wait()
+        clients.append(getter())
+
+    threads = [threading.Thread(target=worker) for _ in range(threads_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(created) == 1, f"并发首次调用只该建一个客户端，实际 {len(created)} 个"
+    assert len(clients) == threads_count
+    assert all(client is created[0] for client in clients)
+
+
+def test_并发首次调用只创建一个同步客户端(monkeypatch) -> None:
+    _race_lazy_loader(monkeypatch, "OpenAI", "_client", llm.get_client)
+
+
+def test_并发首次调用只创建一个异步客户端(monkeypatch) -> None:
+    _race_lazy_loader(monkeypatch, "AsyncOpenAI", "_async_client", llm.get_async_client)
+
+
+# ---------------------------------------------------------------- 两条车道：表格不许长期独占 AI 名额
+# 历史问题：一条表格请求的预算是 240 秒，而它和体检、看图识字共用同一份名额。
+# 一张大表就能把 4 个名额里的 1 个占住四分钟（名额少的时候直接占满），
+# 别人点体检只看到「当前使用 AI 的人较多」。改成按文件类型分车道后，
+# 表格的等待只影响别的表格。
+from app.services import ai_pool  # noqa: E402
+
+
+def test_表格文件走转换车道其余走模型车道() -> None:
+    assert ai_pool.lane_for_file("files/2026/10/汇总表.xlsx") == ai_pool.LANE_CONVERSION
+    assert ai_pool.lane_for_file("files/2026/10/老表格.xls") == ai_pool.LANE_CONVERSION
+    assert ai_pool.lane_for_file("files/2026/10/论文.pdf") == ai_pool.LANE_AI
+    assert ai_pool.lane_for_file("files/2026/10/论文.docx") == ai_pool.LANE_AI
+    assert ai_pool.lane_for_file("") == ai_pool.LANE_AI
+
+
+def test_转换车道认定的文件类型与解析层同口径() -> None:
+    """两处各写一份扩展名清单，漂移了就会有一类文件继续占 AI 名额。"""
+    from app.services.doc_parser import SPREADSHEET_EXTS
+
+    assert set(ai_pool.CONVERSION_EXTS) == set(SPREADSHEET_EXTS)
+
+
+def test_大表格进行中另一个AI请求几乎立刻拿到名额(monkeypatch) -> None:
+    """把两条车道都限到 1 个名额：转换车道被大表格占住时，模型车道必须照常放行。
+
+    这就是验收要的那个秒数：单车道时这里会等到大表格结束（下面故意把表格任务
+    设成 1.5 秒），分车道后等待应该在几十毫秒内。
+    """
+    monkeypatch.setattr(settings, "ai_max_workers", 1)
+    monkeypatch.setattr(settings, "conversion_max_workers", 1)
+    monkeypatch.setattr(settings, "ai_queue_wait_seconds", 5.0)
+    monkeypatch.setattr(settings, "conversion_queue_wait_seconds", 5.0)
+
+    holding = threading.Event()
+    release = threading.Event()
+
+    def big_table_render() -> None:
+        holding.set()
+        release.wait(10)
+
+    async def scenario() -> tuple[float, float]:
+        async def big_sheet() -> None:
+            async with ai_pool.job_lane(ai_pool.LANE_CONVERSION):
+                await ai_pool.run_ai_job(big_table_render, lane=ai_pool.LANE_CONVERSION)
+
+        table_task = asyncio.create_task(big_sheet())
+        await asyncio.to_thread(holding.wait, 5)
+
+        begin = time.monotonic()
+        async with ai_pool.job_lane(ai_pool.LANE_AI):
+            waited = time.monotonic() - begin
+
+        release.set()
+        await table_task
+        return waited, time.monotonic() - begin
+
+    waited, total = asyncio.run(scenario())
+
+    assert waited < 0.5, f"模型车道被表格挡了 {waited:.3f} 秒"
+    print(f"\n大表格进行中，另一个 AI 请求拿到名额用了 {waited * 1000:.1f} 毫秒")
+    assert total < 5.0
+
+
+def test_模型车道占满也不挡住表格(monkeypatch) -> None:
+    """反过来也一样：两条车道各算各的，谁也别拖谁。"""
+    monkeypatch.setattr(settings, "ai_max_workers", 1)
+    monkeypatch.setattr(settings, "conversion_max_workers", 1)
+    monkeypatch.setattr(settings, "ai_queue_wait_seconds", 5.0)
+    monkeypatch.setattr(settings, "conversion_queue_wait_seconds", 5.0)
+
+    holding = threading.Event()
+    release = threading.Event()
+
+    def slow_model_call() -> None:
+        holding.set()
+        release.wait(10)
+
+    async def scenario() -> float:
+        async def slow_job() -> None:
+            async with ai_pool.job_lane(ai_pool.LANE_AI):
+                await ai_pool.run_ai_job(slow_model_call)
+
+        model_task = asyncio.create_task(slow_job())
+        await asyncio.to_thread(holding.wait, 5)
+
+        begin = time.monotonic()
+        async with ai_pool.job_lane(ai_pool.LANE_CONVERSION):
+            waited = time.monotonic() - begin
+
+        release.set()
+        await model_task
+        return waited
+
+    assert asyncio.run(scenario()) < 0.5
+
+
+def test_转换车道的并发上限按配置卡住(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "conversion_max_workers", 2)
+    monkeypatch.setattr(settings, "conversion_queue_wait_seconds", 10.0)
+    state = {"active": 0, "peak": 0}
+    lock = threading.Lock()
+
+    def slow() -> None:
+        with lock:
+            state["active"] += 1
+            state["peak"] = max(state["peak"], state["active"])
+        time.sleep(0.12)
+        with lock:
+            state["active"] -= 1
+
+    async def one() -> None:
+        async with ai_pool.job_lane(ai_pool.LANE_CONVERSION):
+            await ai_pool.run_ai_job(slow, lane=ai_pool.LANE_CONVERSION)
+
+    async def scenario() -> None:
+        await asyncio.gather(*(one() for _ in range(5)))
+
+    asyncio.run(scenario())
+    assert state["peak"] <= 2, state
+
+
+def test_体检接口按文件类型选车道(client, monkeypatch) -> None:
+    """入口层的兑现：xlsx 进转换车道，pdf 进模型车道，且都把车道交给线程池。"""
+    used: list[str] = []
+
+    async def fake_run_ai_job(func, *args, lane: str = ai_pool.LANE_AI, **kwargs):
+        used.append(lane)
+        return {"file_key": "x", "page_count": 1, "issues": []}
+
+    monkeypatch.setattr("app.routers.ai.run_ai_job", fake_run_ai_job)
+    monkeypatch.setattr("app.routers.ai.ensure_files_owned_by", lambda db, user, keys: None)
+    monkeypatch.setattr("app.routers.ai.bind_report_owner", lambda db, user_id: None)
+
+    body = client.post("/api/auth/login", json={"device_id": "lane-router-owner"}).json()
+    assert body["code"] == 0, body
+    headers = {"Authorization": f"Bearer {body['data']['token']}"}
+
+    for file_key, expected in (
+        ("files/2026/10/汇总表.xlsx", ai_pool.LANE_CONVERSION),
+        ("files/2026/10/论文.pdf", ai_pool.LANE_AI),
+    ):
+        response = client.post(
+            "/api/ai/check", json={"file_key": file_key, "force": True}, headers=headers
+        ).json()
+        assert response["code"] == 0, response
+        assert used[-1] == expected, (file_key, used)

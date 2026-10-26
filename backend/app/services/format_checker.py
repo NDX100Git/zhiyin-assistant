@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session
 from app.config import get_format_rules
 from app.services.doc_parser import get_cached_report, parse_document, save_report
 from app.services.format_rules_engine import collect_facts, sheet_count_info
-from app.services.llm import chat_json
+from app.services.llm import bind_key, chat_json
 from app.utils.exceptions import BusinessError
 from app.utils.filetype import normalize_ext
 
@@ -286,8 +286,17 @@ PROFILE_NOTES = {
 
 
 # ---------------------------------------------------------------- 对外入口
-def check_format(db: Session, file_key: str, force: bool = False) -> dict:
-    """对文档做格式与版式体检，返回结构化问题清单（只作建议）。"""
+def check_format(
+    db: Session,
+    file_key: str,
+    force: bool = False,
+    *,
+    api_key: str | None = None,
+) -> dict:
+    """对文档做格式与版式体检，返回结构化问题清单（只作建议）。
+
+    api_key 是学生自带的模型密钥：只在本次体检的模型调用里用，用完即弃（见 llm 模块）。
+    """
     if not file_key:
         raise BusinessError("缺少文件标识", code=40073)
     if not force:
@@ -303,6 +312,8 @@ def check_format(db: Session, file_key: str, force: bool = False) -> dict:
     facts = collect_facts(parsed, rules)
     ai_issues: list[dict] = []
     ai_errors: list[str] = []
+    # 没带学生密钥时 call 就是 chat_json 本身，签名与测试里的替身都不受影响
+    call = bind_key(chat_json, api_key)
 
     tasks = []
     if profile == "paper":
@@ -311,7 +322,7 @@ def check_format(db: Session, file_key: str, force: bool = False) -> dict:
         tasks.append(("版式问题诊断", build_layout_messages(rules, parsed, facts), "layout"))
     for task_name, messages, issue_type in tasks:
         try:
-            raw = chat_json(messages, thinking=True)
+            raw = call(messages, thinking=True)
             ai_issues.extend(normalize_ai_issues(raw, issue_type))
         except BusinessError as exc:
             # 模型不可用时降级：仍然返回规则引擎结果，不阻断学生查看报告

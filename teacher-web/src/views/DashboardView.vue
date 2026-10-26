@@ -48,8 +48,29 @@
 
     <div class="page-card table-card">
       <div class="table-head">
-        <div>接单队列 <span class="muted">（每 5 秒自动刷新，确认换文件后该单排到队尾）</span></div>
         <div>
+          接单队列 <span class="muted">（每 5 秒自动刷新；点过「加载更多」多显示的单不会缩回第一屏——点开始打印、打印完成、核销这些订单动作之后也不会，当前显示 {{ orders.length }} 单；统计每 15 秒刷一次；勾选的行与滚动位置保留；确认换文件后该单排到队尾；找某单请用搜索）</span>
+          <!-- 队列有单没显示时必须让老师知道“下面还有单”，不能默默截断。
+               封顶 200 条之后再说「点加载更多」就是骗人：按钮已经拉不出来，要说清楚
+               现在看到的是前 200 单，剩下的只能用搜索精确定位。 -->
+          <div v-if="queueAtCap" class="queue-more-note">
+            已显示前 {{ QUEUE_PAGE_SIZE_MAX }} 单（当前显示 {{ orders.length }} 单），请用搜索精确定位；还有 {{ queueHiddenCount }} 单未显示
+          </div>
+          <div v-else-if="queueHiddenCount > 0" class="queue-more-note">
+            当前显示 {{ orders.length }} 单，共 {{ queueTotal }} 单，还有 {{ queueHiddenCount }} 单未显示，可点右侧「加载更多」或搜索定位
+          </div>
+        </div>
+        <div>
+          <el-button
+            v-if="queueHiddenCount > 0 && !queueAtCap"
+            type="primary"
+            plain
+            :loading="loading"
+            class="queue-load-more"
+            @click="loadMoreQueue"
+          >
+            加载更多（再显示 {{ QUEUE_LOAD_MORE_STEP }} 单）
+          </el-button>
           <el-button
             type="warning"
             :disabled="selected.length === 0"
@@ -62,6 +83,7 @@
 
       <el-table
         v-if="!isMobile"
+        ref="queueTable"
         v-loading="loading"
         :data="orders"
         row-key="id"
@@ -175,7 +197,7 @@
             <el-button v-if="row.status === 'abnormal'" link type="primary" @click="recover(row)">
               恢复排队
             </el-button>
-            <el-button v-if="row.status === 'abnormal'" link type="danger" @click="closeAbnormal(row)">
+            <el-button v-if="row.status === 'abnormal'" link type="danger" @click="openCancelAbnormal(row)">
               关闭异常单
             </el-button>
           </template>
@@ -263,7 +285,7 @@
             <el-button v-if="row.status === 'abnormal'" size="large" type="primary" @click="recover(row)">
               恢复排队
             </el-button>
-            <el-button v-if="row.status === 'abnormal'" size="large" type="danger" @click="closeAbnormal(row)">
+            <el-button v-if="row.status === 'abnormal'" size="large" type="danger" @click="openCancelAbnormal(row)">
               关闭异常单
             </el-button>
           </div>
@@ -407,20 +429,33 @@
       <div v-if="completeDialog.order">
         <el-descriptions :column="1" size="small" border>
           <el-descriptions-item label="订单号">{{ completeDialog.order.order_no }}</el-descriptions-item>
+          <!--
+            预填用「当前成交价」：换文件确认价、老师之前改过的价都落在这里。
+            只拿系统价预填会把确认价抹回系统价（800 分变 60 分那种事故）。
+          -->
+          <el-descriptions-item label="当前成交价">
+            <span class="money">{{ yuan(completeDialog.currentCents) }}</span>
+          </el-descriptions-item>
           <el-descriptions-item label="系统报价">
             {{ yuan(completeDialog.systemCents) }}
+            <span v-if="completeDialog.currentCents !== completeDialog.systemCents" class="muted">
+              （仅作参考，不会覆盖上面的成交价）
+            </span>
           </el-descriptions-item>
           <el-descriptions-item label="页数/份数">
             {{ completeDialog.order.page_count }} 页 × {{ completeDialog.order.copies }} 份
           </el-descriptions-item>
         </el-descriptions>
-        <div class="dialog-tip">老师可按特殊情况修改金额（加急、装订、特殊纸张等）。</div>
+        <div class="dialog-tip">
+          默认按当前成交价提交；老师可按特殊情况修改金额（加急、装订、特殊纸张等）。
+        </div>
         <el-input-number
           v-model="completeDialog.yuan"
           :min="0"
           :precision="2"
           :step="0.5"
           style="width: 100%"
+          class="complete-amount-input"
         />
         <div class="dialog-tip">单位：元（提交时转换为分）</div>
       </div>
@@ -469,11 +504,64 @@
         </el-button>
       </template>
     </el-dialog>
+
+    <!--
+      关闭异常单（异常单唯一的关单入口）：已收过钱的单必须在这里登记退款，
+      没有退款入口就只能让学生自己想办法，账也对不上。
+    -->
+    <el-dialog
+      v-model="cancelDialog.visible"
+      title="关闭异常单"
+      class="cancel-abnormal-dialog"
+      :width="isMobile ? '92%' : '460px'"
+    >
+      <div v-if="cancelDialog.order">
+        <el-descriptions :column="1" size="small" border>
+          <el-descriptions-item label="订单号">{{ cancelDialog.order.order_no }}</el-descriptions-item>
+          <el-descriptions-item label="成交价">
+            {{ yuan(cancelDialog.order.amount_cents) }}
+          </el-descriptions-item>
+          <el-descriptions-item label="已收金额">
+            <span class="money">{{ yuan(cancelDialog.paidCents) }}</span>
+          </el-descriptions-item>
+        </el-descriptions>
+        <el-input
+          v-model="cancelDialog.reason"
+          type="textarea"
+          :rows="2"
+          class="cancel-reason-input"
+          placeholder="关闭原因，如：文件损坏，联系学生重传"
+        />
+        <div class="dialog-tip">
+          退款金额（元）：默认全额，可改成部分退款；只能退实际收到的钱，同一单只能退一次。
+        </div>
+        <el-input-number
+          v-model="cancelDialog.refundYuan"
+          :min="0"
+          :precision="2"
+          :step="1"
+          style="width: 100%"
+          class="cancel-refund-input"
+        />
+        <div v-if="cancelDialog.error" class="dialog-error">{{ cancelDialog.error }}</div>
+      </div>
+      <template #footer>
+        <el-button @click="cancelDialog.visible = false">取消</el-button>
+        <el-button
+          type="danger"
+          :loading="cancelDialog.loading"
+          class="cancel-abnormal-submit"
+          @click="submitCancelAbnormal"
+        >
+          确认关闭
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { useIsMobile } from '../composables/useIsMobile'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
@@ -503,6 +591,7 @@ import {
   totalPages,
   totalPrintPages,
 } from '../api/orderFiles'
+import { explainApiCode } from '../utils/errors'
 
 const statusOptions = [
   { label: '待支付', value: 'pending_pay' },
@@ -523,6 +612,39 @@ const stats = reactive({
 const isMobile = useIsMobile()
 const orders = ref([])
 
+/**
+ * 轮询与拉取条数（本轮从「每 5 秒 × 200 条」收敛而来）。
+ *
+ * 旧实现每次轮询都同时拉统计与 200 条队列，柜台机开着一天就是两万多次请求，
+ * 而且每次都把整张 200 单的表叠回去。现在拆成三件事：
+ * - 队列：仍然 5 秒，但只拉当前视口能看到的条数（第一屏 60 单）；
+ *   有筛选/关键词时手动查询走全量 200 条，搜索不受影响。
+ * - 统计：每 3 次轮询（约 15 秒）拉一次；换文件、打印完成这类关键动作之后
+ *   仍然立即刷新队列与统计，统计不会漏。
+ * - 页面隐藏时不轮询（原有行为不变）。
+ *
+ * 只拉一屏就必须把“没拉完”说出去：队列末尾写上当前显示多少单、还有多少单没显示，
+ * 多出的部分用「加载更多」分次拉（每次 +60，上限 200——后端 page_size 的上限）。
+ *
+ * **「加载更多」点出来的条数要留住**：老板已拍板，自动刷新不再把列表缩回第一屏。
+ * 老师按 120 条在看某一单，下一拍轮询把列表缩回 60 条，正在看的行会跳走，比多拉几条
+ * 难受得多。所以：
+ * - 轮询按「已加载条数」拉（60 + queueExtra，封顶 200），条数不缩水；
+ * - 轮询走 mergeOrders()：按订单 id 原地合并更新，不整体替换列表——行对象引用不变，
+ *   el-table 就不会重建行，滚动位置不跳；勾选由 restoreQueueSelection() 按 id 放回去；
+ * - **订单动作之后的刷新也不清零增量**（refreshAfterAction()）：点一次「开始打印」/
+ *   「打印完成」就回到第一屏的旧行为更隐蔽——动作那一瞬看着还是 120 条（动作后拉的是
+ *   200 条），下一拍轮询才缩回 60 条，老师几乎必然撞上。所以动作后按「已经显示的条数」
+ *   重拉，增量留在 queueExtra 里，下一页轮询也是同一个数；
+ * - 老师手点「查询」/「刷新」是“重新查一遍”，清零增量并按后端单页拉（既有行为）。
+ */
+const QUEUE_PAGE_SIZE_POLL = 60
+const QUEUE_PAGE_SIZE_FULL = 200
+const QUEUE_LOAD_MORE_STEP = 60
+/** 后端 /api/admin/queue 的 page_size 上限（Query(le=200)），超过直接 422。 */
+const QUEUE_PAGE_SIZE_MAX = 200
+const POLL_INTERVAL_MS = 5000
+const SUMMARY_POLL_TICKS = 3
 /** 桌面表格文件列最多显示几行，其余用「等 N 个文件」收口。 */
 const MAX_FILE_LINES = 3
 
@@ -574,19 +696,47 @@ function targetFile(row) {
 }
 
 const loading = ref(false)
+/** 桌面表格的实例：换数据后要靠它把勾选按订单 id 放回去。 */
+const queueTable = ref(null)
 const selected = ref([])
 const verifyCodeValue = ref('')
 const filters = reactive({ status: '', keyword: '' })
+/** 队列里一共多少单（后端 total）与本次实际拉到多少单，两者差就是“还没显示”的。 */
+const queueTotal = ref(0)
+/** 「加载更多」已经额外要了多少条（一次 +60，封顶 200）。 */
+const queueExtra = ref(0)
+
+const queueHiddenCount = computed(() => Math.max(queueTotal.value - orders.value.length, 0))
+/**
+ * 已经拉到后端单页上限（200）但库里还有单没显示。
+ *
+ * 这种情况不能再说“点加载更多”：page_size 已经顶到上限，再点也拉不到新单，
+ * 老师会以为按钮坏了或者已经没有更多的单。要说清楚「已显示前 200 单，请用搜索精确定位」。
+ */
+const queueAtCap = computed(
+  () => orders.value.length >= QUEUE_PAGE_SIZE_MAX && queueHiddenCount.value > 0,
+)
 
 const completeDialog = reactive({
   visible: false,
   order: null,
   systemCents: 0,
+  currentCents: 0,
   yuan: 0,
   loading: false,
 })
 const verifyDialog = reactive({ visible: false, order: null, loading: false })
 const abnormalDialog = reactive({ visible: false, order: null, reason: '', loading: false })
+/** 关闭异常单弹窗：reason 可空，refundYuan 默认全额（= 已收金额）。 */
+const cancelDialog = reactive({
+  visible: false,
+  order: null,
+  reason: '',
+  refundYuan: 0,
+  paidCents: 0,
+  error: '',
+  loading: false,
+})
 /** 换文件确认弹窗：change 是队列项里的 file_change，未确认前一直跟着订单走。 */
 const fileChangeDialog = reactive({
   visible: false,
@@ -673,14 +823,93 @@ async function loadSummary() {
   }
 }
 
-async function loadQueue() {
+/**
+ * 本次该拉多少条。
+ *
+ * 基数：没筛选时是第一屏 60，有筛选/关键词时是后端单页上限（搜索结果被截断比多拉
+ * 几条更难解释）；在这个基数上叠加「加载更多」已点出来的增量，封顶后端上限 200。
+ * 轮询也走这个函数：老师点过「加载更多」，自动刷新就按同样的条数拉，条数不缩水。
+ */
+function queuePageSize() {
+  const hasFilter = Boolean(filters.status || filters.keyword.trim())
+  const base = hasFilter ? QUEUE_PAGE_SIZE_FULL : QUEUE_PAGE_SIZE_POLL
+  return Math.min(base + queueExtra.value, QUEUE_PAGE_SIZE_MAX)
+}
+
+/**
+ * 订单动作之后该拉多少条：不低于「已经显示在屏上的条数」。
+ *
+ * queuePageSize() 是「轮询口径」（60 + 增量），这里再多看一眼当前列表长度：手点
+ * 「刷新」会一次拉满 200 条，紧接着做个动作不该在动作这一瞬缩回 60 条（缩到第一屏的
+ * 时机只有一个——下一拍轮询，那是既有行为）。两者取大，封顶后端单页上限。
+ */
+function queuePageSizeAfterAction() {
+  return Math.min(Math.max(queuePageSize(), orders.value.length), QUEUE_PAGE_SIZE_MAX)
+}
+
+/**
+ * 把新拉到的队列按订单 id 合并进现有列表，不整体替换。
+ *
+ * 已经显示过的行原地更新字段：行对象引用不变，el-table（row-key=id）不会重建这一行，
+ * 老师在看的行不会跳走。新出现的单才插进列表，已经在队列里消失的单（被完成、被取消）
+ * 从列表里摘掉。返回本次是不是真的换了数组（换了才需要重新恢复勾选）。
+ */
+function mergeOrders(items) {
+  const prev = orders.value
+  const prevById = new Map(prev.map((row) => [String(row.id), row]))
+  const merged = items.map((item) => {
+    const old = prevById.get(String(item.id))
+    if (!old) return item
+    // 原地更新：保住行对象引用，字段变化照常是响应式的
+    Object.assign(old, item)
+    return old
+  })
+  // 条数与顺序都没变时连数组引用都不换，避免整表重渲染把滚动位置推回顶部
+  const sameOrder = merged.length === prev.length && merged.every((row, i) => row === prev[i])
+  if (sameOrder) return false
+  orders.value = merged
+  return true
+}
+
+/**
+ * 换完数据后把勾选按订单 id 放回去。
+ *
+ * el-table 的 data 一换就会清空 selection（Element Plus 只在 reserve-selection 下按 row-key
+ * 保留），而 reserve-selection 又会把已经从队列里消失的单也留在选中里，批量完成就带上
+ * 了不该带的单。所以自己按“当前列表里还在的行”恢复：消失的单自然不在里面。
+ */
+function restoreQueueSelection(keepIds) {
+  const table = queueTable.value
+  if (!table) return
+  table.clearSelection()
+  if (!keepIds.size) return
+  for (const row of orders.value) {
+    if (keepIds.has(String(row.id))) table.toggleRowSelection(row, true)
+  }
+}
+
+async function loadQueue(pageSize = QUEUE_PAGE_SIZE_FULL, { merge = false } = {}) {
   loading.value = true
   try {
-    const params = { page: 1, page_size: 200 }
+    const params = { page: 1, page_size: pageSize }
     if (filters.status) params.status = filters.status
     if (filters.keyword) params.keyword = filters.keyword.trim()
     const data = await fetchQueue(params)
-    orders.value = data.items || []
+    const items = data.items || []
+    // 老师勾了哪几行：换完数据要按 id 放回去，不能因为一次刷新就丢掉
+    const keepIds = new Set(selected.value.map((row) => String(row.id)))
+    // 自动刷新走合并；手点查询/刷新是“重新查一遍”，整页替换才对
+    let replaced = true
+    if (merge) replaced = mergeOrders(items)
+    else orders.value = items
+    if (replaced && keepIds.size) {
+      // 等 el-table 把新数据渲染完再勾：直接 toggle 会勾在旧行对象上
+      await nextTick()
+      restoreQueueSelection(keepIds)
+    }
+    // total 是满足筛选条件的总条数：没给就按本页条数算，不能凭空报“还有 N 单”
+    const total = Number(data.total)
+    queueTotal.value = Number.isFinite(total) ? total : orders.value.length
   } catch (error) {
     /* 拦截器已提示 */
   } finally {
@@ -688,17 +917,48 @@ async function loadQueue() {
   }
 }
 
-async function refreshAll() {
-  await Promise.all([loadSummary(), loadQueue()])
+/** 「加载更多」：多要 60 条，拉完还是一屏就继续点。 */
+async function loadMoreQueue() {
+  queueExtra.value = Math.min(queueExtra.value + QUEUE_LOAD_MORE_STEP, QUEUE_PAGE_SIZE_MAX)
+  await loadQueue(queuePageSize())
 }
+
+/** 全量刷新：手点查询/刷新、以及页面重新可见时调，统计与队列一起拉最新。 */
+async function refreshAll() {
+  // 条件变了或重新查询时别把上一轮的“加载更多”带到新结果上
+  queueExtra.value = 0
+  await Promise.all([loadSummary(), loadQueue(QUEUE_PAGE_SIZE_FULL)])
+}
+
+/**
+ * 订单动作之后刷新队列与统计（开始打印、打印完成、核销、确认换文件、标记异常…）。
+ *
+ * 与 refreshAll() 只差一件事：**不清零「加载更多」的增量**。
+ * 旧实现在这里调 refreshAll()，增量被清零，动作那一瞬按 200 条拉看起来还好，
+ * 下一拍轮询按 60 条拉，列表当场缩回第一屏——页头写着不会缩回，行为却缩回了。
+ * 现在按「已经显示多少条就拉多少条」去拉，并用 merge 原地合并：条数不缩水，
+ * 勾选与滚动位置也一并保住（老师刚点完一个动作，正看着的那一行不该跳走）。
+ */
+async function refreshAfterAction() {
+  await Promise.all([
+    loadSummary(),
+    loadQueue(queuePageSizeAfterAction(), { merge: true }),
+  ])
+}
+
+let pollTicks = 0
 
 function startPolling() {
   stopPolling()
+  pollTicks = 0
   timer = setInterval(() => {
-    if (!document.hidden) {
-      refreshAll()
-    }
-  }, 5000)
+    if (document.hidden) return
+    pollTicks += 1
+    // 保留老师已经点出来的条数：不在这里复位 queueExtra，按已加载条数重拉（封顶 200）。
+    // 合并更新而不是整体替换，条数不缩水、勾选与滚动位置都不跳。
+    loadQueue(queuePageSize(), { merge: true })
+    if (pollTicks % SUMMARY_POLL_TICKS === 0) loadSummary()
+  }, POLL_INTERVAL_MS)
 }
 
 function stopPolling() {
@@ -751,7 +1011,7 @@ async function downloadOne(row, file) {
     await confirmFileSeen(row.id)
     markRowSeen(row)
     ElMessage.success('已确认看到新文件')
-    await refreshAll()
+    await refreshAfterAction()
   } catch (error) {
     /* 拦截器已提示 */
   }
@@ -791,7 +1051,7 @@ async function markSeen(row) {
     await confirmFileSeen(row.id)
     markRowSeen(row)
     ElMessage.success('已确认看到新文件')
-    await refreshAll()
+    await refreshAfterAction()
   } catch (error) {
     /* 拦截器已提示 */
   }
@@ -821,7 +1081,7 @@ async function start(row) {
     }
     await startPrint(row.id)
     ElMessage.success('已开始打印')
-    await refreshAll()
+    await refreshAfterAction()
     return
   }
   await ElMessageBox.confirm(`确认开始打印订单 ${row.order_no}？`, '开始打印', {
@@ -830,22 +1090,32 @@ async function start(row) {
   })
   await startPrint(row.id)
   ElMessage.success('已开始打印')
-  refreshAll()
+  refreshAfterAction()
 }
 
 async function openComplete(row) {
   const quote = await fetchQuote(row.id)
   completeDialog.order = row
-  completeDialog.systemCents = quote.system_amount_cents
-  completeDialog.yuan = quote.system_amount_cents / 100
+  completeDialog.systemCents = Number(quote.system_amount_cents) || 0
+  // 当前成交价才是学生实际要付的那笔钱（换文件确认价 / 之前改过的价）。
+  // 后端没给（老接口）时才退回系统价，不能反过来拿系统价盖掉成交价。
+  const current = quote.current_amount_cents
+  const hasCurrent =
+    current !== null && current !== undefined && Number.isFinite(Number(current))
+  completeDialog.currentCents = hasCurrent ? Number(current) : completeDialog.systemCents
+  completeDialog.yuan = completeDialog.currentCents / 100
   completeDialog.visible = true
 }
 
 async function submitComplete() {
   if (!completeDialog.order) return
+  const cents = Math.round(Number(completeDialog.yuan) * 100)
+  if (!Number.isFinite(cents) || cents < 0) {
+    ElMessage.warning(explainApiCode(40061))
+    return
+  }
   completeDialog.loading = true
   try {
-    const cents = Math.round(Number(completeDialog.yuan) * 100)
     const result = await completePrint(completeDialog.order.id, cents)
     ElMessage.success(
       result.price_changed
@@ -853,7 +1123,7 @@ async function submitComplete() {
         : `已完成，金额 ${yuan(result.amount_cents)}`,
     )
     completeDialog.visible = false
-    refreshAll()
+    refreshAfterAction()
   } finally {
     completeDialog.loading = false
   }
@@ -873,7 +1143,7 @@ async function submitVerify() {
       result.collected_onsite ? '已核销，并完成现场收款' : '已核销，订单完成',
     )
     verifyDialog.visible = false
-    refreshAll()
+    refreshAfterAction()
   } finally {
     verifyDialog.loading = false
   }
@@ -891,7 +1161,7 @@ async function submitVerifyCode() {
       : `已核销 ${result.order.order_no}`,
   )
   verifyCodeValue.value = ''
-  refreshAll()
+  refreshAfterAction()
 }
 
 function openAbnormal(row) {
@@ -907,7 +1177,7 @@ async function submitAbnormal() {
     await markAbnormal(abnormalDialog.order.id, abnormalDialog.reason)
     ElMessage.success('已标记异常')
     abnormalDialog.visible = false
-    refreshAll()
+    refreshAfterAction()
   } finally {
     abnormalDialog.loading = false
   }
@@ -919,18 +1189,57 @@ async function recover(row) {  await ElMessageBox.confirm('确认异常已处理
   })
   await recoverOrder(row.id)
   ElMessage.success('已恢复排队')
-  refreshAll()
+  refreshAfterAction()
 }
 
-async function closeAbnormal(row) {
-  const { value } = await ElMessageBox.prompt('请填写关闭原因', '关闭异常单', {
-    confirmButtonText: '关闭订单',
-    cancelButtonText: '取消',
-    inputValue: '文件损坏，联系学生重传',
-  })
-  await cancelAbnormalApi(row.id, value)
-  ElMessage.success('异常单已关闭')
-  refreshAll()
+/**
+ * 打开「关闭异常单」弹窗。
+ *
+ * 已收款才能退：默认把实际收到的钱全额退回去（队列里只有 amount_cents 与 paid，
+ * 没有逐笔流水，按成交价作为上限；后端还会再按真实已收校一次，超了回 40062）。
+ */
+function openCancelAbnormal(row) {
+  cancelDialog.order = row
+  cancelDialog.reason = ''
+  cancelDialog.paidCents = row.paid ? Number(row.amount_cents) || 0 : 0
+  cancelDialog.refundYuan = cancelDialog.paidCents / 100
+  cancelDialog.error = ''
+  cancelDialog.visible = true
+}
+
+async function submitCancelAbnormal() {
+  if (!cancelDialog.order) return
+  const refund = Math.round(Number(cancelDialog.refundYuan) * 100)
+  // 先在前端拦一道，文案与后端 40061/40062 同源，免得老师填完才被拒
+  if (!Number.isFinite(refund) || refund < 0) {
+    cancelDialog.error = explainApiCode(40061)
+    return
+  }
+  if (refund > cancelDialog.paidCents) {
+    cancelDialog.error = `${explainApiCode(40062)}（本单已收 ${yuan(cancelDialog.paidCents)}）`
+    return
+  }
+  cancelDialog.error = ''
+  cancelDialog.loading = true
+  try {
+    const result = await cancelAbnormalApi(
+      cancelDialog.order.id,
+      cancelDialog.reason,
+      refund,
+    )
+    const refunded = Number(result.refund_cents)
+    const amount = Number.isFinite(refunded) ? refunded : refund
+    ElMessage.success(
+      amount > 0 ? `已关闭异常单，已退款 ${yuan(amount)}` : '已关闭异常单，未收款无需退款',
+    )
+    cancelDialog.visible = false
+    await refreshAfterAction()
+  } catch (error) {
+    // 后端 40061/40062/40906 都在这里兜底显示成中文（40062 可能来自真实已收）
+    cancelDialog.error = error.message || '关闭异常单失败，请稍后重试'
+  } finally {
+    cancelDialog.loading = false
+  }
 }
 
 /** 打开确认弹窗：默认按系统重算价，老师可改最终价。 */
@@ -966,7 +1275,7 @@ async function submitFileChange(approve) {
     }
     fileChangeDialog.visible = false
     // 通过后该单会出现在队尾，重新拉队列与统计
-    await refreshAll()
+    await refreshAfterAction()
   } finally {
     fileChangeDialog.loading = false
   }
@@ -981,7 +1290,7 @@ async function submitBatchComplete() {
   )
   const result = await batchComplete(selected.value.map((item) => item.id))
   ElMessage.success(`完成 ${result.succeeded.length} 单，失败 ${result.failed.length} 单`)
-  refreshAll()
+  refreshAfterAction()
 }
 
 </script>
@@ -1364,6 +1673,25 @@ async function submitBatchComplete() {
   margin: 12px 0 8px;
   color: var(--zi-muted);
   font-size: 12px;
+}
+/* 队列未拉完的提示：不能与表头说明一样轻，否则等于没提示 */
+.queue-more-note {
+  margin-top: 4px;
+  color: var(--zi-warn);
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0;
+}
+/* 弹窗内联报错：负金额 / 超过已收 / 后端校验失败都写在这里 */
+.dialog-error {
+  margin-top: 8px;
+  color: var(--zi-danger);
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1.5;
+}
+.cancel-abnormal-dialog .cancel-reason-input {
+  margin-top: 12px;
 }
 
 /* 旧蓝白皮肤 */
