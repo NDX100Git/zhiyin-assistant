@@ -13,7 +13,7 @@
 1. 读本文件第 1-4 节，知道现在做到哪、哪些决策不能随便改。
 2. 按第 2 节启动 MySQL、MinIO、后端、学生端 H5。
 3. 打开 <http://127.0.0.1:8000/docs> 看接口，打开 <http://127.0.0.1:5173> 看学生端。
-4. 跑 `cd backend && python -m pytest -q`，确认 **451 passed / 1 skipped**（跳过的是需要
+4. 跑 `cd backend && python -m pytest -q`，确认 **453 passed / 1 skipped**（跳过的是需要
    LibreOffice 的那一条 Office 转换用例；其余全绿）。
 5. 要改哪个模块，先查 [ARCHITECTURE.md](ARCHITECTURE.md) 第 6 节的"关键文件职责"。
 6. 改完一个阶段：更新本文件 + 跑测试 + `git commit`（message 写清楚阶段和内容）。
@@ -29,7 +29,7 @@
 
 最近一次验证（2026-10-25，本轮重跑了后端）：
 
-- 后端 `pytest -q`：**451 passed / 1 skipped**（跳过的是 `tests/test_doc_parser.py` 里需要
+- 后端 `pytest -q`：**453 passed / 1 skipped**（跳过的是 `tests/test_doc_parser.py` 里需要
   LibreOffice 的 Office 转换用例）
 - 同一套用例在三套时钟下数字一致：真实墙钟、`CLOCK_SHIFT_TIME=18:43`、`CLOCK_SHIFT_TIME=06:00`
   （后两者用 `tests/clock_shift_plugin.py` 把应用侧时钟拨早，验证排队与过期判定不靠应用时钟）
@@ -197,7 +197,7 @@ npm.cmd run dev:h5
 ```powershell
 # 后端测试 + 静态检查（用虚拟环境里的 python；直接跑系统 python 也一样）
 cd backend
-.venv\Scripts\python.exe -m pytest -q      # 期望 451 passed, 1 skipped
+.venv\Scripts\python.exe -m pytest -q      # 期望 453 passed, 1 skipped
 .venv\Scripts\python.exe -m ruff check .   # 期望 All checks passed
 
 # 模型连通性
