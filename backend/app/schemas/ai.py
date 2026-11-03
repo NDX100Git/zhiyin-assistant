@@ -42,6 +42,13 @@ class ConvertRequest(BaseModel):
     file_name: str | None = Field(default=None, description="转换后展示的文件名")
 
 
+class FileConvertRequest(BaseModel):
+    """图片转 Word / Word 转 PDF 的入参：方向由接口路径决定，不需要 target。"""
+
+    file_key: str = Field(description="待转换文件的对象 key")
+    file_name: str | None = Field(default=None, description="转换后展示的文件名")
+
+
 class FixRequest(BaseModel):
     file_key: str = Field(description="待修复文件的对象 key（docx 或 pdf）")
     issue_ids: list[str] = Field(min_length=1, description="用户勾选要修复的问题 id")

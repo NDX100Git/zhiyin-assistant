@@ -39,6 +39,12 @@
       "style": {
         "navigationBarTitleText": "换文件"
       }
+    },
+    {
+      "path": "pages/tools/tools",
+      "style": {
+        "navigationBarTitleText": "文档转换"
+      }
     }
   ],
   "tabBar": {

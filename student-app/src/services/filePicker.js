@@ -3,7 +3,7 @@
  *
  * - 微信小程序：wx.chooseMessageFile（从聊天记录里选，小程序没有文件管理器）
  * - H5：uni.chooseFile（浏览器弹文件选择框，可多选）
- * - App：优先尝试 5+ 的 plus.io.chooseFile，不可用时明确报错
+ * - App：反射调用 Android 系统文件选择器（ACTION_GET_CONTENT），见 chooseWithPlus
  * - 图片/拍照：uni.chooseImage（全端支持）
  * - 任何平台都有「载入示例论文」兜底（服务端直接返回已上传的示例文档）
  *
@@ -130,31 +130,135 @@ function chooseWithUniFile(count) {
   })
 }
 
+/**
+ * 把系统文件选择器返回的 content:// URI 解析成可上传的信息。
+ *
+ * 为什么不能直接用 URI：Android 4.4 之后选择器给的是 content:// 授权地址，
+ * 不是磁盘路径，plus.io 与后端都不认。可上传的真实路径要从 ContentResolver
+ * 的 _data 列取；Android 10 的分区存储下这列可能为空（云端文件、部分 ROM），
+ * 这时退一步把 content:// 原样交给 uni.uploadFile —— 它在 App 端能读这类 URI。
+ * 两条都走不通才报错，提示改用示例论文，不让用户卡在一个没有出路的死胡同里。
+ *
+ * uri 是原生对象，必须先 importClass 才能调它的 Java 方法（toString 等），
+ * 不导入就只能拿到一个看不见内部属性的空壳。
+ */
+function resolveAndroidDocument(main, uri) {
+  plus.android.importClass(uri)
+
+  let name = ''
+  let dataPath = ''
+  let size = 0
+
+  // query 可能因为 provider 不支持某列而抛异常，失败不该让整个选择流程崩掉：
+  // 拿不到元数据还有 URI 兜底，后面照样能传。
+  try {
+    const resolver = main.getContentResolver()
+    plus.android.importClass(resolver)
+    const cursor = resolver.query(uri, null, null, null, null)
+    if (cursor) {
+      plus.android.importClass(cursor)
+      try {
+        if (cursor.moveToFirst()) {
+          const nameIndex = cursor.getColumnIndex('_display_name')
+          if (nameIndex >= 0) name = String(cursor.getString(nameIndex) || '')
+          const dataIndex = cursor.getColumnIndex('_data')
+          if (dataIndex >= 0) {
+            const raw = cursor.getString(dataIndex)
+            if (raw) dataPath = String(raw)
+          }
+          const sizeIndex = cursor.getColumnIndex('_size')
+          if (sizeIndex >= 0) size = Number(cursor.getLong(sizeIndex)) || 0
+        }
+      } finally {
+        cursor.close()
+      }
+    }
+  } catch (error) {
+    name = ''
+  }
+
+  const uriText = String(uri.toString())
+
+  if (!name) {
+    // provider 没给显示名时从 URI 末段猜一个，至少保证扩展名校验有东西可查
+    const tail = uriText.split('/').pop() || ''
+    try {
+      name = decodeURIComponent(tail)
+    } catch (error) {
+      name = tail
+    }
+  }
+  if (!name) name = 'document'
+
+  if (dataPath) return { path: dataPath, name, size }
+
+  if (uriText.indexOf('content://') === 0 || uriText.indexOf('file://') === 0) {
+    return { path: uriText, name, size }
+  }
+
+  throw new Error('无法读取该文件的路径，请换一份文件，或使用「载入示例论文」')
+}
+
+/**
+ * App 端选文档。
+ *
+ * 不能用 plus.io.chooseFile —— 这个 API 从来就不存在，plus.io 只做文件系统读写。
+ * 也不能用 uni.chooseFile —— 它在 Android 上走媒体库，选不到 PDF 与 Office 文档。
+ * 所以直接反射调系统选择器：ACTION_GET_CONTENT + CATEGORY_OPENABLE。
+ * CATEGORY_OPENABLE 必须加，否则华为等部分 ROM 根本不出文件列表。
+ *
+ * 关键：取结果只能靠 main.onActivityResult 这个属性。
+ * plus 的 startActivityForResult 没有回调参数，写成第三个参数会被直接忽略，
+ * 结果就是点了选文件毫无反应、Promise 永远挂着（这个坑踩过一次）。
+ */
 function chooseWithPlus() {
   return new Promise((resolve, reject) => {
-    if (typeof plus === 'undefined' || !plus.io || typeof plus.io.chooseFile !== 'function') {
+    if (typeof plus === 'undefined' || !plus.android) {
       reject(new Error('当前 App 环境不支持选择文档，请使用「载入示例论文」或拍照上传'))
       return
     }
 
+    const REQUEST_CODE = 10087
+
+    // 回调可能因为用户一直不选而不触发，这里的 Promise 不能设超时：
+    // 设了就会在用户还在文件管理器里翻目录时先把请求判失败。
     try {
-      plus.io.chooseFile({
-        success(result) {
-          const list = result.files || (Array.isArray(result) ? result : [result])
-          const file = list[0] || {}
-          const path = file.path || file.fullPath
-          if (!path) {
-            reject(new Error('未取得文件路径，请改用示例论文'))
+      const main = plus.android.runtimeMainActivity()
+      const Intent = plus.android.importClass('android.content.Intent')
+      const Activity = plus.android.importClass('android.app.Activity')
+      const intent = new Intent(Intent.ACTION_GET_CONTENT)
+      intent.setType('*/*')
+      intent.addCategory(Intent.CATEGORY_OPENABLE)
+      // 只给本地文件：避免选中网盘里还没下载的条目，那种文件读出来是空的
+      intent.putExtra('android.intent.extra.LOCAL_ONLY', true)
+
+      // 先挂回调再启动：启动是异步的，但先挂上不存在时序风险。
+      // 不匹配的请求码直接放行，不影响 App 里其它调起原生界面的地方。
+      main.onActivityResult = (requestCode, resultCode, data) => {
+        if (requestCode !== REQUEST_CODE) return
+
+        if (resultCode !== Activity.RESULT_OK || !data) {
+          // 用户按了返回键：抛带 canceled 标记的错误，页面会静默处理不弹提示
+          reject(canceledError())
+          return
+        }
+        try {
+          const uri = data.getData()
+          if (!uri) {
+            reject(new Error('没有取得文件，请重新选择'))
             return
           }
-          resolve([{ path, name: file.name || path.split('/').pop() || 'document.pdf', size: 0 }])
-        },
-        fail(error) {
-          reject(new Error((error && error.message) || '选择文档失败，请改用示例论文'))
-        },
-      })
+          const picked = resolveAndroidDocument(main, uri)
+          checkExtension(picked.name)
+          resolve([picked])
+        } catch (error) {
+          reject(error instanceof Error ? error : new Error('读取文件失败，请改用「载入示例论文」'))
+        }
+      }
+
+      main.startActivityForResult(intent, REQUEST_CODE)
     } catch (error) {
-      reject(new Error('选择文档异常，请改用示例论文'))
+      reject(new Error('打开系统文件选择器失败，请改用「载入示例论文」或拍照上传'))
     }
   })
 }

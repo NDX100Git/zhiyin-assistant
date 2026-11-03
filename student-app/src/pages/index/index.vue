@@ -40,6 +40,16 @@
     <!-- 体检是可选步骤：入口不能再只写 AI，跳过体检一样能直接下单 -->
     <button class="primary block" @click="goOrder">上传文件，跳过体检直接下单</button>
     <button class="ghost block" @click="goOrder">先做 AI 体检（可选）</button>
+
+    <!-- 文档转换与打印下单无关，是独立工具：做成普通卡片而不是第三个大按钮 -->
+    <view class="card">
+      <view class="card-title">文档转换</view>
+      <text class="tools-desc">
+        PDF 转 Word、图片转 Word、Word 转 PDF。独立工具，跟打印下单互不影响。
+      </text>
+      <button class="ghost block" @click="goTools">进入文档转换</button>
+    </view>
+
     <view class="footnote">AI 体检是可选项，跳过它不影响下单、排队与打印。</view>
     <view class="footnote">仅用取件码作为取件凭据，不收集学号等敏感信息。</view>
   </view>
@@ -96,6 +106,11 @@ onUnmounted(() => poller.stop())
 
 function goOrder() {
   uni.switchTab({ url: '/pages/order/order' })
+}
+
+/** 文档转换不是 tabBar 页，只能用 navigateTo，switchTab 会直接失败 */
+function goTools() {
+  uni.navigateTo({ url: '/pages/tools/tools' })
 }
 </script>
 
@@ -290,6 +305,15 @@ function goOrder() {
   color: var(--zi-muted);
   font-size: 22rpx;
   text-align: center;
+}
+
+/* 工具卡的说明文字：不属于警告提示，别用 .hint 的红色左边框 */
+.tools-desc {
+  display: block;
+  margin-top: 16rpx;
+  color: var(--zi-muted);
+  font-size: 24rpx;
+  line-height: 1.7;
 }
 
 /* 旧蓝白皮肤：保留原来的轻量圆角观感 */

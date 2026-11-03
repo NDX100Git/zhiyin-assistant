@@ -30,6 +30,7 @@ from app.models.user import User
 from app.schemas.ai import (
     AiCheckRequest,
     ConvertRequest,
+    FileConvertRequest,
     FixRequest,
     OcrRequest,
     PrintPlanRequest,
@@ -37,7 +38,11 @@ from app.schemas.ai import (
 )
 from app.services import ai_pool
 from app.services.ai_pool import LANE_CONVERSION, ai_slot, run_ai_job
-from app.services.converter import convert_pdf_to_docx
+from app.services.converter import (
+    convert_docx_to_pdf,
+    convert_image_to_docx,
+    convert_pdf_to_docx,
+)
 from app.services.doc_fixer import fix_document
 from app.services.doc_parser import bind_report_owner
 from app.services.file_service import ensure_files_owned_by
@@ -225,6 +230,56 @@ async def ai_convert(
     return ok(
         await run_ai_job(
             convert_pdf_to_docx,
+            db,
+            payload.file_key,
+            payload.file_name,
+            user=user,
+            lane=lane,
+        )
+    )
+
+
+@router.post("/image-to-word", summary="图片转 Word（需登录）", response_model=None)
+async def ai_image_to_word(
+    payload: FileConvertRequest,
+    lane: str = Depends(conversion_lane),
+    api_key: str | None = Depends(user_llm_key),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """把图片里的文字识别出来后直接生成 Word。
+
+    识别这一步走多模态模型（用学生自己的密钥），生成 Word 由服务端本地完成。
+    生成的文件记在当前账号名下，学生才能在「移除」时把对象一起删掉。
+    """
+    ensure_files_owned_by(db, user, [payload.file_key])
+    bind_report_owner(db, user.id)
+    return ok(
+        await run_ai_job(
+            convert_image_to_docx,
+            db,
+            payload.file_key,
+            payload.file_name,
+            user=user,
+            api_key=api_key,
+            lane=lane,
+        )
+    )
+
+
+@router.post("/to-pdf", summary="Word 转 PDF（需登录）", response_model=None)
+async def ai_docx_to_pdf(
+    payload: FileConvertRequest,
+    lane: str = Depends(conversion_lane),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """把 Word 转成 PDF，方便直接打印。纯格式转换，不调用大模型。"""
+    ensure_files_owned_by(db, user, [payload.file_key])
+    bind_report_owner(db, user.id)
+    return ok(
+        await run_ai_job(
+            convert_docx_to_pdf,
             db,
             payload.file_key,
             payload.file_name,

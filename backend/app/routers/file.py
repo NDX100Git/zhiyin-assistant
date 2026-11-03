@@ -6,7 +6,10 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from urllib.parse import quote
+
+from fastapi import APIRouter, Depends, File, Query, UploadFile
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -20,10 +23,47 @@ from app.services.file_service import (
     load_demo_document,
     store_upload,
 )
+from app.services.storage import get_storage
+from app.utils.filetype import MIME_BY_EXT, normalize_ext
 from app.utils.response import ok
 from app.utils.security import get_current_user
 
 router = APIRouter()
+
+
+@router.get("/download", summary="下载文件（需登录，手机端用）", response_model=None)
+def download(
+    file_key: str = Query(description="对象 key，来自上传或转换接口的返回"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    """把对象以附件形式回给客户端。
+
+    为什么手机不直接用预签名地址：签名地址里的 host 是存储服务本身
+    （配置里是 127.0.0.1:9000），手机拿到这个地址只会连到手机自己，必然失败。
+    走这个接口则始终是后端的 8000 端口，手机只要能打开页面就能下载，
+    也不必把存储服务的端口对外暴露。
+
+    顺带补上归属校验：预签名地址一旦发出去，任何拿到链接的人在有效期内都能下载；
+    这个接口要求登录，并且只能下载自己的文件。
+    """
+    ensure_files_owned_by(db, user, [file_key])
+
+    ext = normalize_ext(file_key)
+    media_type = MIME_BY_EXT.get(ext, "application/octet-stream")
+    # 直接把对象 key 里的随机串当文件名太难认，用「下载.<扩展名>」更直观
+    filename = f"zhuyin-{file_key.rsplit('/', 1)[-1]}" if file_key else f"download.{ext}"
+
+    data = get_storage().read_bytes(file_key)
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={
+            # filename* 用 RFC 5987 编码，中文名在安卓下载器里才不会变成乱码
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
+            "Content-Length": str(len(data)),
+        },
+    )
 
 
 @router.post("/upload", summary="上传文件（需登录）", response_model=None)

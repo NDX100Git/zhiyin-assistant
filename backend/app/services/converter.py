@@ -13,6 +13,8 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
+from docx import Document
+
 from app.config import BACKEND_DIR, settings
 from app.models.user import User
 from app.services.file_service import record_generated_upload
@@ -75,6 +77,140 @@ def convert_pdf_to_docx(
         "signed_url": signed_url,
         "source_file_key": file_key,
         "note": "由服务端用 pdf2docx 转换，未调用大模型",
+    }
+
+
+def _rename_to(name: str | None, ext: str, fallback: str) -> str:
+    """把展示名换成目标扩展名。
+
+    build_object_key 是按文件名的扩展名定对象 key 的，如果传进去的名字还带着
+    原扩展名（论文.docx 转出来叫 论文.docx），桶里就会存一个扩展名与内容不符的对象，
+    下游按扩展名选解析器时会直接判错。
+    """
+    base = (name or "").strip()
+    if not base:
+        return fallback
+    stem = base.rsplit(".", 1)[0] if "." in base else base
+    stem = stem.strip() or fallback.rsplit(".", 1)[0]
+    return f"{stem}.{ext}"
+
+
+def convert_image_to_docx(
+    db: Session,
+    file_key: str,
+    file_name: str | None = None,
+    *,
+    user: User | None = None,
+    api_key: str | None = None,
+) -> dict:
+    """图片 → Word：先用多模态模型识别文字，再把文字组装成 docx。
+
+    识别是唯一用到大模型的一步；组装 Word 是纯本地操作。
+    学生没配模型密钥时走不通，错误会从 ocr_image 直接冒上来，
+    上层据此提示去填密钥，而不是含糊地说转换失败。
+    """
+    ext = normalize_ext(file_key)
+    if ext not in {"jpg", "jpeg", "png"}:
+        raise BusinessError("图片转 Word 只支持 jpg / jpeg / png", code=40080)
+
+    # 延迟导入：ocr 依赖 llm 与 doc_parser，放模块顶部容易绕成循环
+    from app.services.ocr import ocr_image
+
+    report = ocr_image(db, file_key, api_key=api_key)
+    text = str(report.get("text") or "").strip()
+    if not text:
+        raise BusinessError("未能从图片中识别出文字", code=40077)
+
+    RUNTIME_TMP_DIR.mkdir(parents=True, exist_ok=True)
+    storage = get_storage()
+    with tempfile.TemporaryDirectory(prefix="ocr-docx-", dir=RUNTIME_TMP_DIR) as tmp:
+        docx_path = Path(tmp) / "ocr.docx"
+        document = Document()
+        # 一行一段：识别结果里的换行就是原来的段落边界。
+        # 全部塞进一个段落会让生成的文件整篇黏成一坨，学生拿到手还得重排。
+        for line in text.splitlines():
+            document.add_paragraph(line.rstrip())
+        document.save(str(docx_path))
+
+        target_name = _rename_to(file_name, "docx", "识别结果.docx")
+        new_key = build_object_key(target_name)
+        size = docx_path.stat().st_size
+        with docx_path.open("rb") as fp:
+            storage.upload(new_key, fp, size, MIME_BY_EXT["docx"])
+        signed_url = storage.signed_url(new_key)
+
+    if user is not None:
+        record_generated_upload(
+            db,
+            user,
+            file_key=new_key,
+            file_name=target_name,
+            size=size,
+            content_type=MIME_BY_EXT["docx"],
+        )
+
+    logger.info("图片转 Word 完成：%s -> %s（%d 字）", file_key, new_key, len(text))
+    return {
+        "file_key": new_key,
+        "file_name": target_name,
+        "size": size,
+        "content_type": MIME_BY_EXT["docx"],
+        "signed_url": signed_url,
+        "source_file_key": file_key,
+        "text": text,
+        "char_count": len(text),
+        "note": "文字由多模态模型识别，Word 由服务端本地生成",
+    }
+
+
+def convert_docx_to_pdf(
+    db: Session,
+    file_key: str,
+    file_name: str | None = None,
+    *,
+    user: User | None = None,
+) -> dict:
+    """Word → PDF：LibreOffice headless 转换，纯格式转换，不碰大模型。"""
+    ext = normalize_ext(file_key)
+    if ext not in {"doc", "docx"}:
+        raise BusinessError("Word 转 PDF 目前只支持 doc / docx", code=40081)
+
+    # 延迟导入：doc_parser 体量大，且它本身也被其它模块共享
+    from app.services.doc_parser import convert_to_pdf
+
+    RUNTIME_TMP_DIR.mkdir(parents=True, exist_ok=True)
+    storage = get_storage()
+    with tempfile.TemporaryDirectory(prefix="topdf-", dir=RUNTIME_TMP_DIR) as tmp:
+        work_dir = Path(tmp)
+        source_path = storage.download_to_file(file_key, work_dir / f"source.{ext}")
+        pdf_path = convert_to_pdf(source_path, work_dir)
+
+        target_name = _rename_to(file_name, "pdf", f"{pdf_path.stem}.pdf")
+        new_key = build_object_key(target_name)
+        size = pdf_path.stat().st_size
+        with pdf_path.open("rb") as fp:
+            storage.upload(new_key, fp, size, MIME_BY_EXT["pdf"])
+        signed_url = storage.signed_url(new_key)
+
+    if user is not None:
+        record_generated_upload(
+            db,
+            user,
+            file_key=new_key,
+            file_name=target_name,
+            size=size,
+            content_type=MIME_BY_EXT["pdf"],
+        )
+
+    logger.info("Word 转 PDF 完成：%s -> %s", file_key, new_key)
+    return {
+        "file_key": new_key,
+        "file_name": target_name,
+        "size": size,
+        "content_type": MIME_BY_EXT["pdf"],
+        "signed_url": signed_url,
+        "source_file_key": file_key,
+        "note": "由服务端用 LibreOffice 转换，未调用大模型",
     }
 
 
