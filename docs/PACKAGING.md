@@ -122,7 +122,9 @@ npm.cmd run build:mp-weixin
    （已 gitignore）。两处都没配时产物是游客身份包（`appid` = `touristappid`），构建日志会点名告警。
 3. 开发者工具中勾选「不校验合法域名」（开发期），生产环境需在微信后台配置 request/uploadFile 合法域名。
 
-小程序端 `uni.chooseFile` 可用；App 端走 `plus.io.chooseFile`，失败时使用「载入示例论文」。
+小程序端 `uni.chooseFile` 可用；App 端反射调用系统 `ACTION_GET_CONTENT` 选择器
+（`plus.io.chooseFile` 并不存在，`plus.io` 只做文件系统读写），结果通过
+`main.onActivityResult` 取回，选完再走 `uni.uploadFile` 上传。
 
 ---
 

@@ -45,7 +45,7 @@ netsh advfirewall firewall add rule name="ZhiYin API 8000" dir=in action=allow p
 | 问题 | 处理 |
 |---|---|
 | 打开 App 提示网络错误 | 检查手机与电脑同一 Wi-Fi；确认 `.env.production` 的 API 地址是电脑 IP；确认后端与防火墙 |
-| 选择文档没有反应 | 使用「载入示例论文」；或在老师/开发同学协助下确认 App 端 `plus.io.chooseFile` 支持情况 |
+| 选择文档没有反应 | 先确认系统允许该应用访问文件；若是旧安装包请更新到最新版——早期版本调用了并不存在的 `plus.io.chooseFile`，现已改为系统文件选择器 |
 | AI 体检很久没结果 | 点体检才会调用 AI；基础方案不依赖 AI。网络慢时稍等或重试 |
 | 拍照识别无结果 | 确认图片清晰、有文字；OCR 依赖后端大模型 |
 | 取件码核销失败 | 确认订单状态为「待取件」，取件码输入正确（如 A-01） |
