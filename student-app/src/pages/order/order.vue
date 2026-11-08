@@ -1154,25 +1154,22 @@ async function changeCopies(delta) {
   scheduleQuote()
 }
 
+/**
+ * createOrder 被挡住时的具体原因。
+ *
+ * 早退不能静默：按钮看着能点、点下去什么都不发生，用户只会认为它坏了。
+ */
+function orderBlockedMessage() {
+  if (busy.value) return '上一次操作还在处理中，请稍候'
+  return '这一单已经下过了，不能重复提交'
+}
+
 async function createOrder() {
-  // created 非空表示这一单已经下过了：不清空 files/plan 的情况下连点会出第二张订单。
-  // 每种挡住下单的原因都要说出来，静默 return 会让按钮看起来是坏的。
-  if (busy.value) {
-    notify('上一次操作还在处理中，请稍候')
-    return
-  }
-  if (created.value) {
-    notify('这一单已经下过了，不能重复提交')
-    return
-  }
-  if (files.value.length === 0) {
-    notify('请先选择要打印的文件')
-    return
-  }
-  if (!plan.value) {
-    notify('打印方案还没准备好，请稍候再试', 'error')
-    return
-  }
+  // busy 与 created 必须在同一条早退里：不清空清单的情况下连点会出第二张订单。
+  // 单测锁的也是这一点，别拆成两段 if。
+  if (busy.value || created.value) return notify(orderBlockedMessage())
+  if (files.value.length === 0) return notify('请先选择要打印的文件')
+  if (!plan.value) return notify('打印方案还没准备好，请稍候再试', 'error')
   busy.value = true
   try {
     // 文件清单是权威字段；逐份参数随清单一起交给服务端（与报价接口同一份参数）

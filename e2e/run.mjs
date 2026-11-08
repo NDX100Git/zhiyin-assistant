@@ -1622,7 +1622,8 @@ async function runViewport(browser, viewport) {
     await step('上传第一份 PDF 并等待基础方案', async () => {
       await pickFile(student, '选择文档', FIXTURES.v1)
       await waitBody(student, '3. 打印方案', 90000)
-      await waitBody(student, '跳过体检，直接下单', 30000)
+      // 原来的「跳过体检，直接下单」按钮已随下单页改版删除（与底部「确认下单」重复），
+      // 这里不再等它；方案出来后直接等底部的主按钮
       await waitBody(student, '确认下单')
     })
 

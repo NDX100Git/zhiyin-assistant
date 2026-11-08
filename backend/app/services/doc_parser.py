@@ -19,7 +19,6 @@ import signal
 import subprocess
 import tempfile
 import threading
-import threading
 import zipfile
 from collections import Counter
 from contextlib import contextmanager

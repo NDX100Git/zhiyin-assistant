@@ -11,9 +11,8 @@ import tempfile
 import threading
 from pathlib import Path
 
-from sqlalchemy.orm import Session
-
 from docx import Document
+from sqlalchemy.orm import Session
 
 from app.config import BACKEND_DIR, settings
 from app.models.user import User
