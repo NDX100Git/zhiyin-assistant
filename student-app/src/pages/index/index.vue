@@ -56,7 +56,7 @@
 </template>
 
 <script setup>
-import { onHide, onShow } from '@dcloudio/uni-app'
+import { onHide, onPullDownRefresh, onShow } from '@dcloudio/uni-app'
 import { onUnmounted, reactive, ref } from 'vue'
 import { POLL_INTERVAL } from '@/config'
 import { request } from '@/services/api'
@@ -103,6 +103,24 @@ onShow(async () => {
 })
 onHide(() => poller.stop())
 onUnmounted(() => poller.stop())
+
+/**
+ * 下拉刷新：老师刚发的公告，学生不切页面也能看到。
+ *
+ * 轮询间隔是 30 秒，等不及的人会习惯性下拉，之前下拉没反应像坏了。
+ * stopPullDownRefresh 必须放在 finally：失败了也要把转圈收起来，否则一直在转。
+ */
+onPullDownRefresh(async () => {
+  try {
+    await ensureLogin()
+    await load()
+    notify('已刷新', 'success')
+  } catch (error) {
+    notifyError(error)
+  } finally {
+    uni.stopPullDownRefresh()
+  }
+})
 
 function goOrder() {
   uni.switchTab({ url: '/pages/order/order' })

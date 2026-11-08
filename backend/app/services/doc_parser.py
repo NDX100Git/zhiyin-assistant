@@ -19,6 +19,7 @@ import signal
 import subprocess
 import tempfile
 import threading
+import threading
 import zipfile
 from collections import Counter
 from contextlib import contextmanager
@@ -805,11 +806,57 @@ def normalize_font_name(raw_name: str) -> str:
 
 # ---------------------------------------------------------------- 对外入口
 def parse_document(db: Session, file_key: str, force: bool = False) -> dict:
-    """解析文档（带缓存）。file_key 由上传接口返回。"""
+    """解析文档（带缓存）。file_key 由上传接口返回。
+
+    同一份文件的解析串行执行。上传后的后台预热与用户紧接着点的「读页数」会
+    同时到达，不串行的话两边各起一个 LibreOffice 进程，耗时翻倍还白占转换名额。
+    后到的请求在锁上等，拿到锁时缓存已经写好，直接命中返回。
+
+    锁不回收：每个文件一个小对象，几百份文件也就几十 KB。相比解析一次几十秒，
+    这点内存可以接受；真要清理得处理「有人正在等锁」的时序，不值得为此冒险。
+    """
     if not file_key:
         raise BusinessError("缺少文件标识", code=40073)
+    lock = _parse_lock(file_key)
+    with lock:
+        return _parse_locked(db, file_key, force)
+
+
+_PARSE_LOCKS: dict[str, threading.Lock] = {}
+_PARSE_LOCKS_GUARD = threading.Lock()
+
+
+def _parse_lock(file_key: str) -> threading.Lock:
+    with _PARSE_LOCKS_GUARD:
+        return _PARSE_LOCKS.setdefault(file_key, threading.Lock())
+
+
+def _cached_parse_fresh(file_key: str) -> dict | None:
+    """用独立会话读解析缓存，绕开当前请求的事务快照。
+
+    只读会话，用完即关；晚导入 SessionLocal 是为了避免模块级循环依赖。
+    """
+    from app.database import SessionLocal
+
+    fresh = SessionLocal()
+    try:
+        return get_cached_parse(fresh, file_key)
+    except Exception:
+        logger.warning("读取解析缓存失败：%s", file_key, exc_info=True)
+        return None
+    finally:
+        fresh.close()
+
+
+def _parse_locked(db: Session, file_key: str, force: bool) -> dict:
     if not force:
         cached = get_cached_parse(db, file_key)
+        if cached is None:
+            # 当前会话的事务快照可能建立在上传那一刻：后台预热在这之后才把结果
+            # 提交进去，本会话看不到（MySQL 默认 REPEATABLE READ），于是同一个
+            # 文件被反复转换——实测一份 5 页的 docx 被转了 4 次。
+            # 再开一个会话读一次才能读到最新提交；这里只读，不碰请求自己的事务。
+            cached = _cached_parse_fresh(file_key)
         if cached is not None:
             logger.info("命中解析缓存：%s", file_key)
             return cached

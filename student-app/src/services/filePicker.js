@@ -207,9 +207,17 @@ function resolveAndroidDocument(main, uri) {
  * 所以直接反射调系统选择器：ACTION_GET_CONTENT + CATEGORY_OPENABLE。
  * CATEGORY_OPENABLE 必须加，否则华为等部分 ROM 根本不出文件列表。
  *
- * 关键：取结果只能靠 main.onActivityResult 这个属性。
- * plus 的 startActivityForResult 没有回调参数，写成第三个参数会被直接忽略，
- * 结果就是点了选文件毫无反应、Promise 永远挂着（这个坑踩过一次）。
+ * 取结果只能靠 main.onActivityResult。这里有两处历史坑：
+ *
+ * 1. plus 的 startActivityForResult 没有回调参数，写成第三个参数会被直接忽略，
+ *    Promise 永远挂着，表现是「点了选文件毫无反应」。
+ * 2. 回调里的 resultCode 不能用 plus.android.importClass('android.app.Activity').RESULT_OK
+ *    去比对：反射取静态常量并不可靠，取不到就是 undefined，于是「选了文件」被判成
+ *    「用户取消」，而取消走的是静默分支——界面上什么都不显示，症状同样是「没反应」。
+ *    Android 规范里 RESULT_OK 恒为 -1、RESULT_CANCELED 恒为 0，直接写死更安全。
+ *
+ * 回调既用属性赋值挂一次，也用 setAttribute 挂一次：不同 HBuilderX 运行时版本
+ * 对 Native.js 属性映射的支持不一致，两条都试，重复触发由 settled 挡掉。
  */
 function chooseWithPlus() {
   return new Promise((resolve, reject) => {
@@ -219,46 +227,75 @@ function chooseWithPlus() {
     }
 
     const REQUEST_CODE = 10087
+    const RESULT_OK = -1
+    const RESULT_CANCELED = 0
+
+    // 回调可能被挂两次，也可能因为用户反复进出选择器而触发多次，只认第一次结果
+    let settled = false
+    const finish = (fn, value) => {
+      if (settled) return
+      settled = true
+      fn(value)
+    }
 
     // 回调可能因为用户一直不选而不触发，这里的 Promise 不能设超时：
     // 设了就会在用户还在文件管理器里翻目录时先把请求判失败。
     try {
       const main = plus.android.runtimeMainActivity()
       const Intent = plus.android.importClass('android.content.Intent')
-      const Activity = plus.android.importClass('android.app.Activity')
       const intent = new Intent(Intent.ACTION_GET_CONTENT)
       intent.setType('*/*')
       intent.addCategory(Intent.CATEGORY_OPENABLE)
       // 只给本地文件：避免选中网盘里还没下载的条目，那种文件读出来是空的
       intent.putExtra('android.intent.extra.LOCAL_ONLY', true)
 
-      // 先挂回调再启动：启动是异步的，但先挂上不存在时序风险。
-      // 不匹配的请求码直接放行，不影响 App 里其它调起原生界面的地方。
-      main.onActivityResult = (requestCode, resultCode, data) => {
+      const handler = (requestCode, resultCode, data) => {
+        console.log('[filePicker] onActivityResult', requestCode, resultCode, !!data)
         if (requestCode !== REQUEST_CODE) return
 
-        if (resultCode !== Activity.RESULT_OK || !data) {
-          // 用户按了返回键：抛带 canceled 标记的错误，页面会静默处理不弹提示
-          reject(canceledError())
+        if (resultCode === RESULT_CANCELED) {
+          finish(reject, canceledError())
+          return
+        }
+        // 既不是成功也不是取消：把真实结果码带出来，别再静默吞掉
+        if (resultCode !== RESULT_OK || !data) {
+          finish(
+            reject,
+            new Error(`没有取到文件（返回码 ${resultCode}），请重试或改用「载入示例论文」`)
+          )
           return
         }
         try {
           const uri = data.getData()
           if (!uri) {
-            reject(new Error('没有取得文件，请重新选择'))
+            finish(reject, new Error('没有取得文件，请重新选择'))
             return
           }
           const picked = resolveAndroidDocument(main, uri)
           checkExtension(picked.name)
-          resolve([picked])
+          finish(resolve, [picked])
         } catch (error) {
-          reject(error instanceof Error ? error : new Error('读取文件失败，请改用「载入示例论文」'))
+          finish(
+            reject,
+            error instanceof Error ? error : new Error('读取文件失败，请改用「载入示例论文」')
+          )
         }
+      }
+
+      try {
+        main.onActivityResult = handler
+      } catch (error) {
+        console.warn('[filePicker] 属性赋值挂回调失败，改用 setAttribute')
+      }
+      try {
+        plus.android.setAttribute(main, 'onActivityResult', handler)
+      } catch (error) {
+        console.warn('[filePicker] setAttribute 挂回调失败', error)
       }
 
       main.startActivityForResult(intent, REQUEST_CODE)
     } catch (error) {
-      reject(new Error('打开系统文件选择器失败，请改用「载入示例论文」或拍照上传'))
+      finish(reject, new Error('打开系统文件选择器失败，请改用「载入示例论文」或拍照上传'))
     }
   })
 }

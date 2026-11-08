@@ -97,7 +97,11 @@
           </view>
         </view>
       </view>
-      <view v-if="uploading" class="preparing">正在上传 {{ uploadingName }}…</view>
+      <view v-if="uploading" class="preparing">
+        <text>正在上传 {{ uploadingName }} · {{ uploadPercent }}%</text>
+        <!-- 上传大文件时网络慢下来很常见，必须给一个退出的口子 -->
+        <text class="preparing-cancel" @click="cancelUpload">取消上传</text>
+      </view>
       <view v-else-if="!files.length" class="empty">
         支持 PDF / Word / PPT / Excel，单个文件不超过 50MB；一次可选多份，合成一单只付一次
       </view>
@@ -108,7 +112,7 @@
         </button>
         <button class="action" :disabled="busy" @click="pickImage">拍照 / 相册</button>
       </view>
-      <button class="action demo" :disabled="busy" @click="useDemo">载入示例论文（演示兜底）</button>
+      <button class="action demo" :disabled="busy" @click="useDemo">载入示例论文</button>
       <view v-if="ocrText" class="ocr-box">
         <text class="ocr-title">图片识别结果</text>
         <text class="ocr-text">{{ ocrText }}</text>
@@ -126,12 +130,13 @@
       </text>
       <!-- 学生要知道自己在用哪把钥匙：学校共享还是自己填的那把 -->
       <text class="ai-key-line" :class="{ own: keyOwn }">当前使用：{{ keyUsage }}</text>
+      <!-- 原来这里还有一个「跳过体检，直接下单」，与底部的确认下单重复：
+           两个入口做同一件事，而且这个还带 !plan 的禁用条件，
+           方案没加载出来时按钮是灰的，更容易让人以为坏了。
+           上面的说明文字已经把「体检可选」讲清楚，按钮可以去掉。 -->
       <view class="ai-actions">
         <button class="action ghost" :disabled="checking || preparing" @click="runCheck">
           {{ checking ? 'AI 正在体检…' : (aiChecked ? '重新体检' : '开始 AI 体检') }}
-        </button>
-        <button class="action skip" :disabled="busy || preparing || !plan" @click="skipCheckAndOrder">
-          跳过体检，直接下单
         </button>
       </view>
     </view>
@@ -149,6 +154,9 @@
     <view v-if="checking && !report" class="card center">
       <text class="loading-text">AI 正在体检论文格式…</text>
       <text class="loading-sub">解析版式、检查结构与参考文献</text>
+      <!-- 后端同步返回，没有真实百分比，只能把已等待时间亮出来，让人知道没死 -->
+      <text class="loading-sub">已等待 {{ checkSeconds }} 秒，通常需要 10–40 秒</text>
+      <button class="action demo" @click="abortCheck">不想等了</button>
     </view>
 
     <view v-if="report && singleFile" class="card">
@@ -251,7 +259,12 @@
         </view>
         <view class="quote-row">
           <text class="quote-k">打印页数</text>
-          <text class="quote-v">{{ printPages === null ? '读取中…' : `${printPages} 页` }}</text>
+          <text class="quote-v">
+            {{ printPages === null ? '读取中…' : `${printPages} 页` }}
+            <!-- 双面时把张数点出来：页数不变容易让人以为切了没生效，
+                 实际变的是用纸张数，单面 5 页要 5 张，双面只要 3 张 -->
+            <text v-if="sheetHint" class="quote-sub">{{ sheetHint }}</text>
+          </text>
         </view>
         <view class="quote-row">
           <text class="quote-k">应付金额</text>
@@ -336,6 +349,42 @@ const steps = [
 const stepIndex = ref(0)
 const busy = ref(false)
 const checking = ref(false)
+/** 体检已等待的秒数。后端是同步返回，没有真实进度，只能用时间让用户知道还活着。 */
+const checkSeconds = ref(0)
+/**
+ * 用户点了「不想等了」。
+ *
+ * 请求本身撤不回来（服务端会一直跑到结束），所以这里只是前端不再等：
+ * 结果回来也不再往页面上灌，避免用户已经离开体检状态又被突然改掉。
+ */
+const checkAborted = ref(false)
+let checkTimer = null
+let checkSeq = 0
+
+function startCheckTimer() {
+  stopCheckTimer()
+  checkSeconds.value = 0
+  checkTimer = setInterval(() => {
+    checkSeconds.value += 1
+  }, 1000)
+}
+
+function stopCheckTimer() {
+  if (checkTimer) {
+    clearInterval(checkTimer)
+    checkTimer = null
+  }
+}
+
+function abortCheck() {
+  if (!checking.value) return
+  checkAborted.value = true
+  // 让还在飞的那一轮结果作废，否则它回来会把状态又改一遍
+  checkSeq += 1
+  stopCheckTimer()
+  checking.value = false
+  notify('已停止等待。服务端仍在处理，稍后重新点体检可能直接拿到结果')
+}
 
 /**
  * 本轮要打印的文件清单（多文件合成一单）。
@@ -347,6 +396,14 @@ const checking = ref(false)
 const files = ref([])
 const uploading = ref(false)
 const uploadingName = ref('')
+/** 当前这一份的上传百分比，来自 uni.uploadFile 的进度回调。 */
+const uploadPercent = ref(0)
+/**
+ * 正在上传的那一份的句柄（带 abort）。
+ *
+ * 放普通变量不放 ref：它是个带方法的 Promise，不需要响应式，也不该被 Vue 代理。
+ */
+let currentUploadTask = null
 const removingUid = ref('')
 const uidSeq = ref(0)
 
@@ -394,9 +451,40 @@ const keyError = ref('')
 const checkError = computed(() => formatAiErrorList(report.value && report.value.ai_errors))
 const planError = computed(() => formatAiErrorList(plan.value && plan.value.errors))
 
+/** 「再来一单」跨页传的标记：tabBar 页不会重建实例，得靠它通知本页清状态。 */
+const NEW_ORDER_FLAG = 'zhiyin_start_new_order'
+
+/**
+ * 清空上一单的全部状态，回到刚进页面的样子。
+ *
+ * order 是 tabBar 页，switchTab 复用的是已有实例，上一单的 created、报价与
+ * 文件清单全都还在。下单按钮的禁用条件里有 !!created，所以从订单详情点
+ * 「再来一单」进来，按钮是灰的、点不动。
+ */
+function startNewOrder() {
+  if (quoteTimer) {
+    clearTimeout(quoteTimer)
+    quoteTimer = null
+  }
+  files.value = []
+  resetCheck()
+  plan.value = null
+  quote.value = null
+  quoteError.value = ''
+  created.value = null
+  stepIndex.value = 0
+  printSide.value = null
+  colorMode.value = null
+  layout.value = ''
+}
+
 // 学生可能在「我的」页刚换过钥匙，每次回到本页重读
 onShow(() => {
   keyUsage.value = llmKeyUsageLabel()
+  if (uni.getStorageSync(NEW_ORDER_FLAG)) {
+    uni.removeStorageSync(NEW_ORDER_FLAG)
+    startNewOrder()
+  }
 })
 
 /**
@@ -463,6 +551,43 @@ const printPages = computed(() =>
 )
 
 /**
+ * 读页数时的等待提示。
+ *
+ * Word/PDF 只要转一次 PDF；表格更麻烦：先归一版式，再渲染成 PDF，列多的还要
+ * 放宽横向页数重来一轮，实测能到一分半。以前只写「请稍候」，学生看到转圈没动静
+ * 会以为卡死，把文件删掉重传，等于白等。
+ */
+const pageCountHint = computed(() => {
+  const target = primaryFile.value
+  const name = (target && target.file_name) || ''
+  const ext = name.split('.').pop().toLowerCase()
+  if (ext === 'xls') {
+    return '这是 .xls 老格式，要先转成新格式才能算页数，通常要一分半；另存为 .xlsx 可省约 30 秒'
+  }
+  if (ext === 'xlsx') {
+    return '表格要先渲染成 PDF 才能数清页数，宽表格可能要一两分钟，请不要删掉文件'
+  }
+  return '正在读取文件页数，通常十几秒；长时间没结果再删掉重传'
+})
+
+/**
+ * 双面时的用纸提示。
+ *
+ * 「打印页数」是打印面数：5 页的文档，单面印 5 个面、双面也印 5 个面，这个数本来
+ * 就不该变。变的是用纸张数（单面 5 张、双面 3 张）。学生切了单双面发现页数没动，
+ * 会以为设置没生效，所以把张数直接摆在页数旁边。
+ */
+const sheetHint = computed(() => {
+  const current = plan.value
+  if (!current) return ''
+  const duplexSheets = Number(current.sheets_needed)
+  const singleSheets = Number(current.original_sheets)
+  if (!Number.isFinite(duplexSheets) || !Number.isFinite(singleSheets)) return ''
+  if (duplexSheets >= singleSheets) return ''
+  return `（双面 ${duplexSheets} 张纸，单面要 ${singleSheets} 张）`
+})
+
+/**
  * 报价请求体：与下单完全同一份。
  *
  * 单文件不传逐份参数，由订单级参数继承（旧流程不变）；多文件逐份传自己的四项。
@@ -518,7 +643,7 @@ async function refreshQuote(retry = 0) {
   // 前端这个 1 页兜底不会真的少付钱。
   if (files.value.some((item) => !(Number(item.page_count) >= 1))) {
     quote.value = null
-    quoteError.value = '正在读取文件页数，请稍候；长时间没有结果请删掉该文件重新上传'
+    quoteError.value = pageCountHint.value
     quoting.value = false
     return
   }
@@ -639,22 +764,30 @@ function pushFile(data) {
 
 /** 逐份补页数：页数来自 page-count 接口，不调模型。 */
 async function fillPageCounts() {
-  for (const item of files.value) {
-    if (item.page_count) continue
-    try {
-      const result = await request('/api/file/page-count', {
-        method: 'POST',
-        data: { file_key: item.file_key },
-      })
-      const pages = Number(result.page_count)
-      // 不用「1 页」兜底：解析失败时假装 1 页，报价就按 1 页算，
-      // 学生以为很便宜、下单后被后端按真实页数驳回。留 0 让报价停在
-      // 「正在读取页数」的提示上，用户能看出是文件的问题
-      item.page_count = pages >= 1 ? Math.floor(pages) : 0
-    } catch (error) {
-      notifyError(error)
-    }
-  }
+  const pending = files.value.filter((item) => !item.page_count)
+  if (!pending.length) return
+
+  // 并行而不是逐个 await：每个文件第一次解析都要几十秒（LibreOffice 转换），
+  // 串行会把等待时间直接相加，三份文件就是一分钟以上，用户以为卡死了。
+  // 并行后总耗时约等于最慢的那一份。
+  await Promise.all(
+    pending.map(async (item) => {
+      try {
+        const result = await request('/api/file/page-count', {
+          method: 'POST',
+          data: { file_key: item.file_key },
+        })
+        const pages = Number(result.page_count)
+        // 不用「1 页」兜底：解析失败时假装 1 页，报价就按 1 页算，
+        // 学生以为很便宜、下单后被后端按真实页数驳回。留 0 让报价停在
+        // 「正在读取页数」的提示上，用户能看出是文件的问题
+        item.page_count = pages >= 1 ? Math.floor(pages) : 0
+      } catch (error) {
+        // 单份失败不影响其它份，这条保持 0，报价会把它指出来
+        notifyError(error)
+      }
+    })
+  )
 }
 
 /** 清单变了：体检结果作废，重新按当前参数出基础方案，并重新报价。 */
@@ -675,6 +808,8 @@ async function afterFilesChanged() {
 
 async function pickDocuments() {
   if (busy.value) return
+
+  let picked = []
   try {
     await ensureLogin()
     const remaining = MAX_ORDER_FILES - files.value.length
@@ -682,22 +817,64 @@ async function pickDocuments() {
       notify(`一单最多 ${MAX_ORDER_FILES} 个文件，请先移除再选`)
       return
     }
-    const picked = await chooseDocuments(Math.min(MAX_FILES_PER_PICK, remaining))
+    picked = await chooseDocuments(Math.min(MAX_FILES_PER_PICK, remaining))
+    // .xls 老格式要多跑一次 LibreOffice 转换（实测约 30 秒），当场说清有更快的做法。
+    // 只提示、不拦：用户手上可能只有 .xls，照样得能传。
+    if (picked.some((item) => /\.xls$/i.test(String((item && item.name) || '')))) {
+      notify('检测到 .xls 老格式，解析会多花约 30 秒；建议另存为 .xlsx 后再上传')
+    }
+  } catch (error) {
+    // 用户在系统选择器里按了返回，notifyError 会静默处理
+    notifyError(error)
+    return
+  }
+
+  let done = 0
+  try {
     busy.value = true
     uploading.value = true
     for (const item of picked) {
       uploadingName.value = item.name
-      const uploaded = await uploadFile(item.path, item.name)
+      uploadPercent.value = 0
+      const task = uploadFile(item.path, item.name, {
+        onProgress: (event) => {
+          const value = Number(event && event.progress)
+          uploadPercent.value = Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0
+        },
+      })
+      currentUploadTask = task
+      const uploaded = await task
+      currentUploadTask = null
       pushFile(uploaded)
+      done += 1
     }
-    notify(`已添加 ${picked.length} 个文件`, 'success')
-    await afterFilesChanged()
+    notify(`已添加 ${done} 个文件`, 'success')
   } catch (error) {
-    notifyError(error)
+    // 主动取消不算错误，不弹红字
+    if (!(error && error.aborted)) notifyError(error)
+    if (done) notify(`已添加 ${done} 个文件，其余已取消`, 'success')
   } finally {
-    busy.value = false
+    currentUploadTask = null
     uploading.value = false
+    uploadingName.value = ''
+    uploadPercent.value = 0
+    // 上传这一段结束就解锁。
+    // 以前是把上传和 afterFilesChanged 一起 await，后面的页数解析、出方案、
+    // 报价全算在「正在上传」里，用户要干等几十秒，期间所有按钮都是灰的、退不出来。
+    busy.value = false
   }
+
+  if (!files.value.length) return
+  // 不 await：文件已经进清单了，让用户马上能操作，页数与金额在后台补齐
+  afterFilesChanged().catch(notifyError)
+}
+
+/** 取消正在上传的那一份。已经传完的保留在清单里，不会退掉。 */
+function cancelUpload() {
+  if (!currentUploadTask) return
+  currentUploadTask.abort()
+  currentUploadTask = null
+  notify('已取消上传')
 }
 
 /**
@@ -766,12 +943,18 @@ async function pickImage() {
 
 async function runCheck() {
   if (checking.value || !singleFile.value || !primaryFile.value) return
+  const seq = ++checkSeq
   checking.value = true
+  checkAborted.value = false
+  startCheckTimer()
   try {
-    report.value = await request('/api/ai/check', {
+    const data = await request('/api/ai/check', {
       method: 'POST',
       data: { file_key: primaryFile.value.file_key },
     })
+    // 用户已经点了「不想等了」，或者又发起了新一轮：这轮结果直接丢弃
+    if (checkAborted.value || seq !== checkSeq) return
+    report.value = data
     aiChecked.value = true
     keyError.value = ''
     const checked = Math.max(1, Number(report.value.page_count) || 1)
@@ -782,17 +965,13 @@ async function runCheck() {
     await loadPlan(true)
     scheduleQuote()
   } catch (error) {
-    reportAiError(error)
+    if (!checkAborted.value && seq === checkSeq) reportAiError(error)
   } finally {
-    checking.value = false
+    if (seq === checkSeq) {
+      stopCheckTimer()
+      checking.value = false
+    }
   }
-}
-
-/** 明示的「跳过体检，直接下单」：不做任何体检，按基础方案下单。 */
-async function skipCheckAndOrder() {
-  if (busy.value || checking.value) return
-  if (!plan.value) await loadPlan(false)
-  if (plan.value) await createOrder()
 }
 
 async function loadPlan(useAi = false) {
@@ -909,8 +1088,24 @@ async function changeCopies(delta) {
 }
 
 async function createOrder() {
-  // created 非空表示这一单已经下过了：不清空 files/plan 的情况下连点会出第二张订单
-  if (busy.value || !plan.value || files.value.length === 0 || created.value) return
+  // created 非空表示这一单已经下过了：不清空 files/plan 的情况下连点会出第二张订单。
+  // 每种挡住下单的原因都要说出来，静默 return 会让按钮看起来是坏的。
+  if (busy.value) {
+    notify('上一次操作还在处理中，请稍候')
+    return
+  }
+  if (created.value) {
+    notify('这一单已经下过了，不能重复提交')
+    return
+  }
+  if (files.value.length === 0) {
+    notify('请先选择要打印的文件')
+    return
+  }
+  if (!plan.value) {
+    notify('打印方案还没准备好，请稍候再试', 'error')
+    return
+  }
   busy.value = true
   try {
     // 文件清单是权威字段；逐份参数随清单一起交给服务端（与报价接口同一份参数）
@@ -952,6 +1147,7 @@ function goMine() {
 onUnmounted(() => {
   if (quoteTimer) clearTimeout(quoteTimer)
   quoteTimer = null
+  stopCheckTimer()
 })
 </script>
 
@@ -1047,11 +1243,20 @@ onUnmounted(() => {
   font-size: 26rpx;
 }
 .preparing {
-  display: block;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   margin-top: 12rpx;
   color: var(--zi-accent);
   font-size: 24rpx;
   font-weight: 700;
+}
+/* 取消入口刻意做小：它是兜底，不该比主操作更显眼 */
+.preparing-cancel {
+  padding: 6rpx 20rpx;
+  border: 2rpx solid var(--zi-accent);
+  border-radius: var(--zi-pill-radius);
+  font-size: 22rpx;
 }
 .ai-entry {
   border: 2rpx dashed var(--zi-line-strong);
@@ -1307,13 +1512,6 @@ onUnmounted(() => {
   color: var(--zi-warn);
 }
 /* 明示的「跳过体检，直接下单」：与体检按钮并排但用实心主色，不能再靠读者意会 */
-.action.skip {
-  width: 100%;
-  margin: 16rpx 0 0;
-  border-color: var(--zi-accent);
-  background: var(--zi-accent);
-  color: var(--zi-accent-ink);
-}
 .ai-actions {
   display: flex;
   flex-direction: column;
@@ -1525,6 +1723,13 @@ onUnmounted(() => {
 .quote-v.money {
   font-size: 32rpx;
 }
+/* 双面用纸提示：跟数字同一行，但不能抢「打印页数」本身的视觉重量 */
+.quote-sub {
+  margin-left: 8rpx;
+  color: var(--zi-muted);
+  font-size: 22rpx;
+  font-weight: 600;
+}
 .quote-error {
   display: block;
   margin-top: 12rpx;
@@ -1719,10 +1924,6 @@ onUnmounted(() => {
 .zi-theme-classic .action.ghost {
   background: var(--zi-warn-bg);
   color: var(--zi-warn);
-}
-.zi-theme-classic .action.skip {
-  background: var(--zi-accent);
-  color: var(--zi-accent-ink);
 }
 .zi-theme-classic .file-remove {
   border: none;

@@ -162,9 +162,11 @@ export function request(path, options = {}) {
 }
 
 /** 上传本地文件（路径由 filePicker 适配层提供）。 */
-export function uploadFile(filePath, fileName) {
-  return new Promise((resolve, reject) => {
-    uni.uploadFile({
+export function uploadFile(filePath, fileName, options = {}) {
+  const { onProgress } = options
+  let task = null
+  const promise = new Promise((resolve, reject) => {
+    task = uni.uploadFile({
       url: `${API_BASE_URL}/api/file/upload`,
       filePath,
       name: 'file',
@@ -190,10 +192,24 @@ export function uploadFile(filePath, fileName) {
         reject(new Error('上传失败'))
       },
       fail(error) {
-        reject(new Error(error.errMsg || '上传失败'))
+        // 用户点了取消也走这里，errMsg 里带 abort。
+        // 打上标记让上层区分「主动取消」和「真的失败」：取消不该弹错误提示。
+        const message = (error && error.errMsg) || '上传失败'
+        const aborted = message.toLowerCase().indexOf('abort') >= 0
+        const wrapped = new Error(aborted ? '已取消上传' : message)
+        wrapped.aborted = aborted
+        reject(wrapped)
       },
     })
+    if (onProgress && task && typeof task.onProgressUpdate === 'function') {
+      task.onProgressUpdate(onProgress)
+    }
   })
+  // 把取消能力挂在 Promise 上：调用方拿到返回值就能中断这一份
+  promise.abort = () => {
+    if (task && typeof task.abort === 'function') task.abort()
+  }
+  return promise
 }
 
 /**

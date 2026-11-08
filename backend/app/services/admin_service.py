@@ -43,7 +43,7 @@ from app.services.order_state import (
 )
 from app.services.pricing import ensure_amount_allowed
 from app.services.printer import get_printer_provider
-from app.services.queue_service import batch_wait_info, order_wait_info, queue_order_by
+from app.services.queue_service import batch_wait_info, order_wait_info
 from app.services.session_service import get_or_create_session, release_session_slot
 from app.services.storage import get_storage
 from app.utils.exceptions import BusinessError
@@ -153,7 +153,13 @@ def _escape_like(raw: str) -> str:
 
 def queue_list(db: Session, status: str | None = None, keyword: str | None = None,
                page: int = 1, page_size: int = 50) -> dict:
-    """接单队列：按订单号排序，支持状态筛选与关键字搜索。"""
+    """接单队列：最新创建的在最前，支持状态筛选与关键字搜索。
+
+    列表顺序与打印队列顺序刻意分开：
+    - 老师接单时最关心「刚来的单」，所以按 created_at 倒序排；
+    - 「排队第几位」由 batch_wait_info 单独算，仍按 queue_order_by 的真实队列口径，
+      不受这里的展示顺序影响。改这里不会让队伍语义漂移。
+    """
     condition = []
     if status:
         condition.append(Order.status == status)
@@ -172,7 +178,7 @@ def queue_list(db: Session, status: str | None = None, keyword: str | None = Non
         db.execute(
             select(Order)
             .where(*condition)
-            .order_by(*queue_order_by())
+            .order_by(Order.created_at.desc(), Order.id.desc())
             .offset((page - 1) * page_size)
             .limit(page_size)
         ).scalars()

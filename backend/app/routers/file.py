@@ -6,13 +6,14 @@
 
 from __future__ import annotations
 
+import logging
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Query, UploadFile
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
-from app.database import get_db
+from app.database import SessionLocal, get_db
 from app.models.user import User
 from app.schemas.ai import PageCountRequest
 from app.schemas.file import FileDeleteRequest
@@ -29,6 +30,30 @@ from app.utils.response import ok
 from app.utils.security import get_current_user
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
+
+
+def _warm_parse_cache(file_key: str) -> None:
+    """上传成功后立刻在后台把解析结果算出来。
+
+    为什么值得这么做：Office 文档要数页数必须先用 LibreOffice 转 PDF，而它每次
+    都要冷启动一个进程，实测 10 秒起步、机器冷的时候能到 30 秒。学生上传完还要
+    挑双面还是单面、黑白还是彩色，这段操作时间通常有十几秒——正好够把转换跑完。
+    等他点「读页数」或「报价」时，缓存已经命中，接口几乎瞬间返回。
+
+    注意这里必须自己开一个会话：请求的会话在响应返回后就关了，后台线程再拿它查库
+    会报 "This session is closed"。失败只记日志——预热是优化，不该让上传报错。
+    """
+    db = SessionLocal()
+    try:
+        parse_document(db, file_key)
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.warning("后台预解析失败（不影响上传）：%s", file_key, exc_info=True)
+    finally:
+        db.close()
 
 
 @router.get("/download", summary="下载文件（需登录，手机端用）", response_model=None)
@@ -68,12 +93,21 @@ def download(
 
 @router.post("/upload", summary="上传文件（需登录）", response_model=None)
 def upload(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="待体检的文档或图片"),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    """校验类型与大小后存入私有桶，返回对象 key 与限时签名 URL。"""
-    return ok(store_upload(user, file, db))
+    """校验类型与大小后存入私有桶，返回对象 key 与限时签名 URL。
+
+    返回后立刻在后台解析一次：学生接下来挑打印参数的时间，正好把 LibreOffice
+    那段十几秒的转换覆盖掉，等他点「读页数」时结果已经在缓存里。
+    图片不做这一步——图片走 OCR，不做文档解析。
+    """
+    result = store_upload(user, file, db)
+    if normalize_ext(result["file_key"]) not in {"jpg", "jpeg", "png"}:
+        background_tasks.add_task(_warm_parse_cache, result["file_key"])
+    return ok(result)
 
 
 @router.post("/delete", summary="撤回未下单的上传文件（需登录）", response_model=None)
@@ -88,11 +122,17 @@ def delete_file(
 
 @router.post("/demo", summary="载入服务端示例论文（演示兜底）", response_model=None)
 def upload_demo(
+    background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    """App 端选文件不可用时，用它保证「上传 → AI 体检」链路可演示。"""
-    return ok(load_demo_document(user, db))
+    """App 端选文件不可用时，用它保证「上传 → AI 体检」链路可演示。
+
+    示例论文是 docx，同样要转 PDF 才能数页数，所以一并预热。
+    """
+    result = load_demo_document(user, db)
+    background_tasks.add_task(_warm_parse_cache, result["file_key"])
+    return ok(result)
 
 
 @router.post("/page-count", summary="读取页数（不调用 AI）", response_model=None)

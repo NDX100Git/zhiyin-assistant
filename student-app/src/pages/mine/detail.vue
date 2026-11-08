@@ -57,6 +57,11 @@
         </view>
         <view class="row"><text class="k">金额</text><text class="v money">{{ formatMoney(order.amount_cents) }}{{ order.paid ? '（已支付）' : '（未支付）' }}</text></view>
         <view class="row"><text class="k">下单时间</text><text class="v">{{ formatTime(order.created_at) }}</text></view>
+        <!-- 老师标异常时填的原因：学生以前只能看到「异常」两个字，不知道哪里出了问题 -->
+        <view v-if="order.abnormal_reason" class="row">
+          <text class="k">异常原因</text>
+          <text class="v warn">{{ order.abnormal_reason }}</text>
+        </view>
         <view v-if="order.cancel_reason" class="row"><text class="k">取消原因</text><text class="v">{{ order.cancel_reason }}</text></view>
       </view>
 
@@ -303,6 +308,10 @@ function onReplace() {
 }
 
 function goOrder() {
+  // order 是 tabBar 页，switchTab 复用已有实例、不会重新初始化。
+  // 上一单的 created 还留在那边，下单按钮的禁用条件里有 !!created，
+  // 不过去打标记的话，「再来一单」进去看到的就是一个点不动的灰按钮。
+  uni.setStorageSync('zhiyin_start_new_order', 1)
   uni.switchTab({ url: '/pages/order/order' })
 }
 </script>
@@ -498,6 +507,10 @@ function goOrder() {
   font-weight: 700;
   line-height: 1.6;
   word-break: break-all;
+}
+/* 异常原因是老师要学生看到的信息，用警示色，不要混在普通字段里 */
+.v.warn {
+  color: var(--zi-warn);
 }
 .money {
   color: var(--zi-accent);

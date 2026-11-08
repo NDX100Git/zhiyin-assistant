@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from app.config import get_order_rules, settings
 from app.models.order import Order
 from app.models.payment_log import PaymentLog
+from app.models.print_log import PrintLog
 from app.models.queue_session import QueueSession
 from app.models.user import User
 from app.services import queue_snapshot
@@ -37,6 +38,7 @@ from app.services.order_file_service import (
     validate_print_params,
 )
 from app.services.order_state import (
+    STATUS_ABNORMAL,
     STATUS_CANCELLED,
     STATUS_PENDING_PAY,
     STUDENT_CANCELLABLE,
@@ -353,6 +355,22 @@ def list_orders(db: Session, user: User, status: str | None = None,
     }
 
 
+def _abnormal_reason(db: Session, order: Order) -> str | None:
+    """老师最后一次把这个订单标为异常时填的原因。
+
+    原因存在状态日志里，没有进 orders.remark：remark 是学生下单时自己填的备注
+    （加急、装订之类），两者语义不同，塞进同一个字段会互相覆盖。
+    只查最近一条，老师多次标记时以最后一次为准。
+    """
+    note = db.execute(
+        select(PrintLog.note)
+        .where(PrintLog.order_id == order.id, PrintLog.to_status == STATUS_ABNORMAL)
+        .order_by(PrintLog.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    return (note or "").strip() or None
+
+
 def order_to_dict(db: Session, order: Order, wait: dict | None = None,
                   file_change: dict | object | None = _UNSET,
                   files: list[dict] | object | None = _UNSET) -> dict:
@@ -391,6 +409,10 @@ def order_to_dict(db: Session, order: Order, wait: dict | None = None,
         "printed_at": order.printed_at.isoformat() if order.printed_at else None,
         "picked_at": order.picked_at.isoformat() if order.picked_at else None,
         "remark": order.remark,
+        # 老师标异常时写的原因，学生端据此知道「哪里不对」而不只是看到「异常」两个字
+        "abnormal_reason": _abnormal_reason(db, order)
+        if order.status == STATUS_ABNORMAL
+        else None,
         "cancel_reason": order.cancel_reason,
         "queue_position": wait["queue_position"],
         "estimated_minutes": wait["estimated_minutes"],
