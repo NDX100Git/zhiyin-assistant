@@ -57,6 +57,12 @@
         <text class="order-no">{{ order.order_no }}</text>
         <text class="status" :class="order.status">{{ order.status_label }}</text>
       </view>
+      <!-- 老师标异常时写的原因：以前列表里只有「异常」两个字，学生还得点进详情
+           才可能看到，多数人根本不会点进去。直接摆在列表上才解决得了问题。 -->
+      <view v-if="order.abnormal_reason" class="abnormal-reason">
+        <text class="abnormal-label">老师说明</text>
+        <text class="abnormal-text">{{ order.abnormal_reason }}</text>
+      </view>
       <view class="order-body">
         <text class="file">{{ fileLine(order) }}</text>
         <text class="amount">{{ formatMoney(order.amount_cents) }}</text>
@@ -868,6 +874,30 @@ function openDetail(id) {
   display: flex;
   justify-content: space-between;
   margin-top: 14rpx;
+}
+/* 异常单的老师说明：用警示底色单独成块，不跟文件名金额挤在一起 */
+.abnormal-reason {
+  margin-top: 14rpx;
+  padding: 14rpx 18rpx;
+  border-left: 6rpx solid var(--zi-warn);
+  border-radius: 0 var(--zi-radius) var(--zi-radius) 0;
+  background: var(--zi-warn-bg);
+}
+.abnormal-label {
+  display: block;
+  color: var(--zi-warn);
+  font-size: 22rpx;
+  font-weight: 800;
+  letter-spacing: 1rpx;
+}
+.abnormal-text {
+  display: block;
+  margin-top: 4rpx;
+  color: var(--zi-warn);
+  font-size: 26rpx;
+  font-weight: 700;
+  line-height: 1.6;
+  word-break: break-all;
 }
 .file {
   flex: 1;

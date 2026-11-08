@@ -295,6 +295,62 @@ def quote_order(db: Session, user: User, payload) -> dict:
     return quote_items(items)
 
 
+def reorder_draft(db: Session, user: User, order: Order) -> dict:
+    """生成「再来一单」的预填数据：复刻原订单的文件清单与全部打印参数。
+
+    文件不重新上传，直接复用原 file_key。但在返回之前，用**下单同一套规则**
+    把归属与新鲜度先验一遍：否则学生跳到下单页、参数都带好了，一点报价才被告知
+    文件几天前就被清理了，白折腾一趟。
+
+    任一份不可用就整体拒绝，不给残缺清单——半份订单的金额没有意义。
+    """
+    rows = files_view(db, order)
+    if not rows:
+        raise BusinessError("该订单没有可复用的文件，请重新上传文件后再下单", code=40054)
+
+    keys = [str(row["file_key"]) for row in rows if row.get("file_key")]
+    if len(keys) != len(rows):
+        raise BusinessError("订单文件记录不完整，无法再来一单，请重新上传文件", code=40054)
+
+    # 文件被清理时，上传记录可能也一并删掉了，归属校验会先抛 40404；
+    # 对「再来一单」来说这和过期是同一件事，统一给同一句明确的提示。
+    try:
+        ensure_files_owned_by(db, user, keys)
+    except BusinessError as exc:
+        raise BusinessError(
+            "订单文件已过期或已被清理，再来一单无效，请重新上传文件后再下单",
+            code=exc.code,
+        ) from exc
+    for key in keys:
+        try:
+            _validate_file_freshness(key)
+        except BusinessError as exc:
+            raise BusinessError(
+                "订单文件已过期或已被清理，再来一单无效，请重新上传文件后再下单",
+                code=exc.code,
+            ) from exc
+
+    return {
+        "files": [
+            {
+                "file_key": str(row["file_key"]),
+                "file_name": row.get("file_name") or "文档",
+                "page_count": int(row.get("page_count") or 0),
+                # 逐份参数在 files_view 里已经按「未设则继承订单级」归一过
+                "print_side": int(row.get("print_side") or 2),
+                "color_mode": int(row.get("color_mode") or 0),
+                "paper_size": row.get("paper_size") or "A4",
+                "copies": int(row.get("copies") or 1),
+            }
+            for row in rows
+        ],
+        "print_side": int(order.print_side or 2),
+        "color_mode": int(order.color_mode or 0),
+        "paper_size": order.paper_size or "A4",
+        "copies": int(order.copies or 1),
+    }
+
+
 def get_owned_order(db: Session, user: User, order_id: int) -> Order:
     """取订单并校验归属，避免越权查看他人订单。"""
     order = db.get(Order, order_id)

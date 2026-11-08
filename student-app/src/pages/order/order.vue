@@ -106,18 +106,13 @@
         支持 PDF / Word / PPT / Excel，单个文件不超过 50MB；一次可选多份，合成一单只付一次
       </view>
 
+      <!-- 图片识别已收敛到首页「文档转换」，下单页只保留文档入口，避免两个地方做同一件事 -->
       <view class="actions">
         <button class="action" :disabled="busy" @click="pickDocuments">
           {{ files.length ? '继续添加文件' : '选择文档' }}
         </button>
-        <button class="action" :disabled="busy" @click="pickImage">拍照 / 相册</button>
       </view>
       <button class="action demo" :disabled="busy" @click="useDemo">载入示例论文</button>
-      <view v-if="ocrText" class="ocr-box">
-        <text class="ocr-title">图片识别结果</text>
-        <text class="ocr-text">{{ ocrText }}</text>
-        <text class="ocr-tip">如需体检与打印，请上传 PDF / Word 文档。</text>
-      </view>
     </view>
 
     <view v-if="files.length && singleFile" class="card ai-entry">
@@ -331,7 +326,7 @@ import { computed, onUnmounted, ref } from 'vue'
 import { onShow } from '@dcloudio/uni-app'
 import { deleteUploadedFile, quoteOrder, request, uploadFile } from '@/services/api'
 import { ensureLogin } from '@/services/auth'
-import { MAX_FILES_PER_PICK, chooseDocuments, chooseImage, loadDemoDocument } from '@/services/filePicker'
+import { MAX_FILES_PER_PICK, chooseDocuments, loadDemoDocument } from '@/services/filePicker'
 import { isLlmKeyFailure, llmKeyFailureText, llmKeyUsageLabel } from '@/services/llmKey'
 import { PAPER_SIZES } from '@/services/orderFiles'
 import { notify, notifyError } from '@/services/notify'
@@ -427,7 +422,6 @@ const layouts = [
   { value: 'handout_4in1', label: '4合1' },
 ]
 const created = ref(null)
-const ocrText = ref('')
 
 /** 只有一份文件时才有 AI 体检与修复：多文件的体检口径产品还没定。 */
 const singleFile = computed(() => files.value.length === 1)
@@ -453,6 +447,8 @@ const planError = computed(() => formatAiErrorList(plan.value && plan.value.erro
 
 /** 「再来一单」跨页传的标记：tabBar 页不会重建实例，得靠它通知本页清状态。 */
 const NEW_ORDER_FLAG = 'zhiyin_start_new_order'
+/** 订单详情页预先备好的复刻清单（文件 + 打印参数）。 */
+const REORDER_DRAFT_FLAG = 'zhiyin_reorder_draft'
 
 /**
  * 清空上一单的全部状态，回到刚进页面的样子。
@@ -476,6 +472,50 @@ function startNewOrder() {
   printSide.value = null
   colorMode.value = null
   layout.value = ''
+
+  // 有预填数据就复刻上一单，没有就保持空白新单
+  const draft = uni.getStorageSync(REORDER_DRAFT_FLAG)
+  if (draft) {
+    uni.removeStorageSync(REORDER_DRAFT_FLAG)
+    applyReorderDraft(draft)
+  }
+}
+
+/**
+ * 把上一单的文件清单和打印参数原样带进来。
+ *
+ * 页数直接沿用上一单的实测值，不再跑 page-count 解析——服务端文件没变，
+ * 重跑一次 LibreOffice 只是白等几十秒。只有旧记录缺页数时才补读一次。
+ */
+function applyReorderDraft(draft) {
+  const list = Array.isArray(draft && draft.files) ? draft.files : []
+  if (!list.length) return
+
+  files.value = list.map((item, index) => ({
+    uid: `re${index + 1}`,
+    file_key: item.file_key,
+    file_name: item.file_name || '文档',
+    size: 0,
+    page_count: Number(item.page_count) || 0,
+    print_side: Number(item.print_side) || 2,
+    color_mode: Number(item.color_mode) || 0,
+    paper_size: item.paper_size || 'A4',
+    copies: Number(item.copies) || 1,
+  }))
+  printSide.value = Number(draft.print_side) || 2
+  colorMode.value = Number(draft.color_mode) || 0
+  copies.value = Number(draft.copies) || 1
+  layout.value = ''
+  stepIndex.value = 1
+  notify('已带入上一单的文件与打印参数', 'success')
+
+  // plan 是下单按钮的门槛，quote 是金额，两个都补齐才算「完整再来一单」
+  loadPlan(false, false)
+  if (files.value.some((item) => !(Number(item.page_count) >= 1))) {
+    fillPageCounts().then(scheduleQuote)
+  } else {
+    scheduleQuote()
+  }
 }
 
 // 学生可能在「我的」页刚换过钥匙，每次回到本页重读
@@ -777,12 +817,16 @@ async function fillPageCounts() {
           method: 'POST',
           data: { file_key: item.file_key },
         })
+        // 解析要几十秒，这期间这份文件可能已经被移除：
+        // 结果直接丢弃，既不写回清单，也不弹一条让人莫名其妙的错误
+        if (!files.value.some((row) => row.uid === item.uid)) return
         const pages = Number(result.page_count)
         // 不用「1 页」兜底：解析失败时假装 1 页，报价就按 1 页算，
         // 学生以为很便宜、下单后被后端按真实页数驳回。留 0 让报价停在
         // 「正在读取页数」的提示上，用户能看出是文件的问题
         item.page_count = pages >= 1 ? Math.floor(pages) : 0
       } catch (error) {
+        if (!files.value.some((row) => row.uid === item.uid)) return
         // 单份失败不影响其它份，这条保持 0，报价会把它指出来
         notifyError(error)
       }
@@ -903,6 +947,7 @@ async function removeFile(index) {
 
 async function useDemo() {
   if (busy.value) return
+  let loaded = false
   try {
     await ensureLogin()
     busy.value = true
@@ -911,33 +956,20 @@ async function useDemo() {
       notify('示例论文已经在本单里了')
       return
     }
+    loaded = true
     notify('已载入示例论文', 'success')
-    await afterFilesChanged()
   } catch (error) {
     notifyError(error)
   } finally {
+    // 载入动作一结束就解锁。
+    // 以前把 afterFilesChanged（解析页数要跑 LibreOffice，几十秒）也 await 在
+    // busy 里面，这段时间「选择文档」一直是灰的；学生中途移除文件也不会提前
+    // 释放，看起来就像死机。
     busy.value = false
   }
-}
-
-async function pickImage() {
-  if (busy.value) return
-  try {
-    await ensureLogin()
-    const picked = await chooseImage()
-    busy.value = true
-    const uploaded = await uploadFile(picked.path, picked.name)
-    const ocr = await request('/api/ai/ocr', {
-      method: 'POST',
-      data: { file_key: uploaded.file_key },
-    })
-    ocrText.value = ocr.text
-    keyError.value = ''
-    notify('识别完成', 'success')
-  } catch (error) {
-    reportAiError(error)
-  } finally {
-    busy.value = false
+  if (loaded) {
+    // 解析与报价放后台跑，界面先还给学生
+    afterFilesChanged().catch(notifyError)
   }
 }
 
@@ -974,8 +1006,20 @@ async function runCheck() {
   }
 }
 
-async function loadPlan(useAi = false) {
+/** 方案请求的序号：只认最后一次的结果，快速切参数时旧响应不能覆盖新选择。 */
+let planSeq = 0
+
+/**
+ * 取打印方案。
+ *
+ * applyRecommend 控制是否把后端推荐值写回界面：
+ * - 刚加完文件、体检完成后用推荐值初始化，传 true
+ * - 用户手动点了单面/双面再取方案时传 false —— 否则 recommend 会把用户
+ *   刚选的值改回去（默认推荐双面），看起来像「点了没生效」，金额也不对
+ */
+async function loadPlan(useAi = false, applyRecommend = true) {
   if (!primaryFile.value) return
+  const seq = ++planSeq
   preparing.value = true
   try {
     const options = { copies: copies.value, use_ai: useAi }
@@ -983,30 +1027,52 @@ async function loadPlan(useAi = false) {
     if (colorMode.value === 0 || colorMode.value === 1) options.color_mode = colorMode.value
     if (layout.value) options.layout = layout.value
 
-    plan.value = await request('/api/ai/print-plan', {
+    const data = await request('/api/ai/print-plan', {
       method: 'POST',
       data: { file_key: primaryFile.value.file_key, options },
     })
+    // 用户连着点了几次，慢的那个响应最后才回来：丢弃，别把旧参数的结果盖上去
+    if (seq !== planSeq) return
+    plan.value = data
     planUsesAi.value = useAi
     // 方案拿到了 = 这把密钥这次没被拒，之前那条失效横幅已经过期
     keyError.value = ''
-    printSide.value = plan.value.recommend.print_side
-    colorMode.value = plan.value.recommend.color_mode
-    layout.value = plan.value.recommend.layout
+    if (applyRecommend) {
+      printSide.value = plan.value.recommend.print_side
+      colorMode.value = plan.value.recommend.color_mode
+      layout.value = plan.value.recommend.layout
+    }
     stepIndex.value = 2
   } catch (error) {
-    reportAiError(error)
+    if (seq === planSeq) reportAiError(error)
   } finally {
-    preparing.value = false
+    if (seq === planSeq) preparing.value = false
   }
 }
 
-async function choose(field, value) {
+/**
+ * 用户连着切参数时把方案请求合并成一次。
+ *
+ * 之前每点一下单/双面就发一组 print-plan + quote，实测日志里出现过 20 组连发，
+ * 界面反复刷新、还会抢占转换名额。报价本身已有 300ms 防抖，这里给方案补一个。
+ * planSeq 是第二道保险：就算两个请求都发出去了，旧响应也不会覆盖新选择。
+ */
+let planDebounceTimer = null
+function schedulePlan(useAi) {
+  if (planDebounceTimer) clearTimeout(planDebounceTimer)
+  planDebounceTimer = setTimeout(() => {
+    planDebounceTimer = null
+    loadPlan(useAi, false)
+  }, 220)
+}
+
+function choose(field, value) {
   if (field === 'print_side') printSide.value = value
   if (field === 'color_mode') colorMode.value = value
   if (field === 'layout') layout.value = value
-  await loadPlan(planUsesAi.value)
-  // 单文件的金额靠订单级参数算，改完重算报价
+  // 用户已经明确选过了，方案回来时不能再拿推荐值覆盖他的选择
+  schedulePlan(planUsesAi.value)
+  // 单文件的金额靠订单级参数算，改完立刻重算报价，不等方案
   scheduleQuote()
 }
 
@@ -1083,7 +1149,8 @@ async function changeCopies(delta) {
   const next = Math.max(1, Math.min(50, copies.value + delta))
   if (next === copies.value) return
   copies.value = next
-  await loadPlan(planUsesAi.value)
+  // 同样是用户主动改的参数，别让推荐值把它覆盖；连续点 +/- 也合并成一次请求
+  schedulePlan(planUsesAi.value)
   scheduleQuote()
 }
 
@@ -1147,6 +1214,8 @@ function goMine() {
 onUnmounted(() => {
   if (quoteTimer) clearTimeout(quoteTimer)
   quoteTimer = null
+  if (planDebounceTimer) clearTimeout(planDebounceTimer)
+  planDebounceTimer = null
   stopCheckTimer()
 })
 </script>
@@ -1481,6 +1550,11 @@ onUnmounted(() => {
   display: flex;
   margin-top: 20rpx;
 }
+/* 拍照/相册入口移到首页「文档转换」后，这组只剩一颗按钮：
+   清掉两颗并排时的左右 8rpx 间距，让它和下方「载入示例论文」左右对齐 */
+.actions .action {
+  margin: 0;
+}
 .action {
   flex: 1;
   height: 84rpx;
@@ -1511,10 +1585,18 @@ onUnmounted(() => {
   background: var(--zi-warn-bg);
   color: var(--zi-warn);
 }
-/* 明示的「跳过体检，直接下单」：与体检按钮并排但用实心主色，不能再靠读者意会 */
+/* 下单页「开始 AI 体检」：上下高度再翻一倍，256rpx → 512rpx。
+   字号只小幅增加：高度到半屏量级时字号同比例放大会变成横幅大字，反而破坏协调。
+   文字仍垂直居中，配色、圆角、文案一律不动。 */
 .ai-actions {
   display: flex;
   flex-direction: column;
+}
+.ai-actions .action {
+  height: 512rpx;
+  margin: 28rpx 0 4rpx;
+  font-size: 52rpx;
+  letter-spacing: 4rpx;
 }
 .primary {
   width: 100%;
@@ -1831,34 +1913,6 @@ onUnmounted(() => {
   font-size: 28rpx;
   font-weight: 900;
 }
-.ocr-box {
-  margin-top: 20rpx;
-  padding: 18rpx;
-  border: 2rpx solid var(--zi-line);
-  border-radius: var(--zi-radius);
-  background: var(--zi-soft);
-}
-.ocr-title {
-  display: block;
-  color: var(--zi-ink);
-  font-size: 24rpx;
-  font-weight: 800;
-}
-.ocr-text {
-  display: block;
-  margin-top: 8rpx;
-  color: var(--zi-ink);
-  font-size: 24rpx;
-  line-height: 1.6;
-  white-space: pre-wrap;
-}
-.ocr-tip {
-  display: block;
-  margin-top: 8rpx;
-  color: var(--zi-muted);
-  font-size: 22rpx;
-}
-
 /* 旧蓝白皮肤：恢复原有轻量圆角与填充标签 */
 .zi-theme-classic .steps {
   border-bottom: none;
@@ -1891,8 +1945,7 @@ onUnmounted(() => {
 }
 .zi-theme-classic .ai-fix-row,
 .zi-theme-classic .file-row,
-.zi-theme-classic .savings,
-.zi-theme-classic .ocr-box {
+.zi-theme-classic .savings {
   border: none;
   border-radius: 16rpx;
 }

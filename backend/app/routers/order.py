@@ -97,6 +97,21 @@ def pay_order(
     return ok(order_service.pay_order(db, user, order_id))
 
 
+@router.post("/{order_id}/reorder-draft", summary="再来一单预填数据（需登录）", response_model=None)
+def reorder_draft(
+    order_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """复刻原订单的文件与打印参数给下单页预填。
+
+    文件仍可用才返回；已过期或已清理时直接拒绝，学生当场就知道要重新上传，
+    不用跳到下单页填完一半再失败。
+    """
+    order = order_service.get_owned_order(db, user, order_id)
+    return ok(order_service.reorder_draft(db, user, order))
+
+
 @router.post("/{order_id}/replace-file", summary="换文件（需登录）", response_model=None)
 def replace_file(
     order_id: int,

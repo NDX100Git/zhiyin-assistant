@@ -161,7 +161,13 @@ async function start() {
     result.value = data
     notify('转换完成', 'success')
   } catch (error) {
-    notifyError(error)
+    // 把失败阶段带出来：拍照后到底卡在选择、上传还是识别，用户能直接说清楚
+    if (error && (error.canceled || error.aborted)) {
+      notifyError(error)
+      return
+    }
+    const stage = converting.value ? '识别/转换' : uploading.value ? '上传图片' : '选择图片'
+    notify(`${stage}失败：${(error && error.message) || '未知错误'}`, 'error')
   } finally {
     busy.value = false
     uploading.value = false

@@ -105,7 +105,9 @@
         <button v-if="order.status === 'pending_pay'" class="primary" @click="pay">模拟支付</button>
         <button v-if="canSelfCancel" class="ghost" @click="cancel">取消订单</button>
         <button class="ghost" :class="{ locked: !canReplace }" @click="onReplace">换文件</button>
-        <button class="ghost" @click="goOrder">再来一单</button>
+        <button class="ghost" :disabled="reordering" @click="goOrder">
+          {{ reordering ? '正在准备…' : '再来一单' }}
+        </button>
       </view>
       <!-- 已付款的排队单不能自助取消（后端 40905），把出口写成“找老师” -->
       <text v-if="teacherCancelOnly" class="cancel-hint">
@@ -307,12 +309,35 @@ function onReplace() {
   })
 }
 
-function goOrder() {
-  // order 是 tabBar 页，switchTab 复用已有实例、不会重新初始化。
-  // 上一单的 created 还留在那边，下单按钮的禁用条件里有 !!created，
-  // 不过去打标记的话，「再来一单」进去看到的就是一个点不动的灰按钮。
-  uni.setStorageSync('zhiyin_start_new_order', 1)
-  uni.switchTab({ url: '/pages/order/order' })
+/** 正在准备「再来一单」的预填数据，防连点，也给按钮一个等待态。 */
+const reordering = ref(false)
+
+/**
+ * 再来一单：把原订单的文件与打印参数完整复刻到下单页。
+ *
+ * 先问后端要一份预填数据，后端会用**下单同一套规则**检查每个文件是否还在、
+ * 是否超过宽限期。文件过期就直接在这里拦住并提示，不让学生跳到下单页、
+ * 参数都带好了才被告知白跑一趟。
+ *
+ * 通过后把清单存进本地，再打标记让 order 页（tabBar 页不重建实例）读取预填。
+ */
+async function goOrder() {
+  if (reordering.value || !orderId.value) return
+  reordering.value = true
+  try {
+    const draft = await request(`/api/order/${orderId.value}/reorder-draft`, {
+      method: 'POST',
+    })
+    uni.setStorageSync('zhiyin_reorder_draft', draft)
+    uni.setStorageSync('zhiyin_start_new_order', 1)
+    uni.switchTab({ url: '/pages/order/order' })
+  } catch (error) {
+    // 40052/40053 在前端没有映射，会原样显示后端那句
+    // 「订单文件已过期或已被清理，再来一单无效，请重新上传文件后再下单」
+    notifyError(error)
+  } finally {
+    reordering.value = false
+  }
 }
 </script>
 

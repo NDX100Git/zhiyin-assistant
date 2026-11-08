@@ -83,24 +83,71 @@ function chooseWithWeixinMessage(count) {
   })
 }
 
+/**
+ * App 端把图片临时路径收敛成「一定能被 uni.uploadFile 读到」的路径。
+ *
+ * 安卓已知兼容问题：uni.chooseImage 用相机拍照时，部分机型返回的是相机私有目录下的
+ * 绝对路径或尚未建立映射的临时路径，uni.uploadFile 直接拿它去传会失败
+ * （常见报错 uploadFile:fail undefined，或者干脆没反应）；相册走系统媒体库反而正常。
+ *
+ * 三层兜底：另存到应用私有目录 → 5+ 路径转换 → 原始路径，任何一步失败都不比现状更差。
+ */
+function normalizeAppImagePath(path) {
+  return new Promise((resolve) => {
+    if (typeof uni.saveFile !== 'function') {
+      resolve(path)
+      return
+    }
+    uni.saveFile({
+      tempFilePath: path,
+      success(file) {
+        resolve((file && file.savedFilePath) || path)
+      },
+      fail() {
+        try {
+          const converted =
+            typeof plus !== 'undefined' && plus.io && plus.io.convertLocalFileSystemURL
+              ? plus.io.convertLocalFileSystemURL(path)
+              : null
+          resolve(converted || path)
+        } catch (error) {
+          resolve(path)
+        }
+      },
+    })
+  })
+}
+
 export function chooseImage() {
   return new Promise((resolve, reject) => {
     uni.chooseImage({
       count: 1,
       sizeType: ['compressed', 'original'],
       sourceType: ['album', 'camera'],
-      success(result) {
-        const path = (result.tempFilePaths || [])[0]
+      async success(result) {
+        // 拍照时优先看 tempFiles[0].path，部分基座只在这里给真实路径
+        const first = (result.tempFiles || [])[0]
+        const path = (first && first.path) || (result.tempFilePaths || [])[0]
         if (!path) {
           reject(new Error('没有选择图片'))
           return
         }
-        const rawName = path.split('/').pop() || 'photo.jpg'
+
+        // 文件名必须在另存之前按原始路径定好：uni.saveFile 返回的 savedFilePath
+        // 常常不带扩展名，拿它去推断会把 PNG 补成 .jpg，
+        // 后端有「文件内容与扩展名不符」校验，会直接拒收。
+        const rawName = (first && first.name) || path.split('/').pop() || 'photo.jpg'
         const name = /\.[a-zA-Z0-9]+$/.test(rawName) ? rawName : `${rawName}.jpg`
-        resolve({ path, name })
+
+        let uploadPath = path
+        // #ifdef APP-PLUS
+        uploadPath = await normalizeAppImagePath(path)
+        // #endif
+
+        resolve({ path: uploadPath, name })
       },
       fail(error) {
-        reject(new Error(error.errMsg || '选择图片失败'))
+        reject(new Error((error && error.errMsg) || '选择图片失败'))
       },
     })
   })
