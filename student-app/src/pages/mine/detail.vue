@@ -19,6 +19,7 @@
           <text class="code">{{ order.pickup_code }}</text>
         </view>
         <text class="code-tip">取件码 · 凭此码到文印室取件</text>
+        <button class="copy-code" @click="copyPickupCode">复制取件码</button>
         <view v-if="isActive || order.status === 'ready' || order.status === 'completed'" class="queue-row">
           <text v-if="isActive" class="queue">前面 {{ order.queue_position }} 单 · 预计 {{ order.estimated_minutes }} 分钟</text>
           <text v-else-if="order.status === 'ready'" class="queue">已打印完成，请到文印室取件</text>
@@ -57,10 +58,11 @@
         </view>
         <view class="row"><text class="k">金额</text><text class="v money">{{ formatMoney(order.amount_cents) }}{{ order.paid ? '（已支付）' : '（未支付）' }}</text></view>
         <view class="row"><text class="k">下单时间</text><text class="v">{{ formatTime(order.created_at) }}</text></view>
-        <!-- 老师标异常时填的原因：学生以前只能看到「异常」两个字，不知道哪里出了问题 -->
+        <!-- 老师标异常时填的原因要摆在订单信息里，学生才知道该改哪里 -->
         <view v-if="order.abnormal_reason" class="row">
           <text class="k">异常原因</text>
           <text class="v warn">{{ order.abnormal_reason }}</text>
+          <button class="copy-note" @click="copyTeacherNote">复制</button>
         </view>
         <view v-if="order.cancel_reason" class="row"><text class="k">取消原因</text><text class="v">{{ order.cancel_reason }}</text></view>
       </view>
@@ -123,6 +125,7 @@ import { computed, onUnmounted, ref } from 'vue'
 import { POLL_INTERVAL } from '@/config'
 import { request } from '@/services/api'
 import { ensureLogin } from '@/services/auth'
+import { copyText } from '@/services/clipboard'
 import { createPoller, notify, notifyError } from '@/services/notify'
 import { changeTarget, orderFiles, paramSummary, teacherUnconfirmed, totalPages, totalPrintPages } from '@/services/orderFiles'
 import { usePullRefresh } from '@/ui/pullRefresh'
@@ -191,6 +194,16 @@ const timeline = computed(() => {
 
 function formatMoney(cents) {
   return `¥${((Number(cents) || 0) / 100).toFixed(2)}`
+}
+
+/* 取件码和老师的说明是学生要转给同学代取的信息，各给一个按得动的复制按钮。 */
+
+function copyPickupCode() {
+  copyText(order.value && order.value.pickup_code, '取件码')
+}
+
+function copyTeacherNote() {
+  copyText(order.value && order.value.abnormal_reason, '老师说明')
 }
 
 /** 后端返回的是 ISO 时间串，直接显示会带一个 T，这里换成 年-月-日 时:分。 */
@@ -463,6 +476,28 @@ async function goOrder() {
   border-top: 2rpx solid var(--zi-hero-line);
 }
 
+/* 取件码要能发给同学代取：满宽按钮，高度 88rpx（约 44 像素），指头点得到 */
+.copy-code {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-self: stretch;
+  align-items: center;
+  justify-content: center;
+  height: 88rpx;
+  margin: 20rpx 0 0;
+  padding: 0 24rpx;
+  box-sizing: border-box;
+  border: 4rpx solid transparent;
+  border-radius: var(--zi-button-radius);
+  background: var(--zi-accent);
+  color: var(--zi-accent-ink);
+  font-size: 28rpx;
+  font-weight: 800;
+  line-height: 1.2;
+  letter-spacing: 2rpx;
+}
+
 /* 有换文件申请待确认时，在取件码上方挂一个告示，避免学生以为已经生效 */
 .pending-flag {
   position: relative;
@@ -536,6 +571,26 @@ async function goOrder() {
 /* 异常原因是老师要学生看到的信息，用警示色，不要混在普通字段里 */
 .v.warn {
   color: var(--zi-warn);
+}
+
+/* 老师的话逐字转述容易抄错，行尾给一个复制按钮，高度按指头大小 */
+.copy-note {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  min-width: 104rpx;
+  min-height: 88rpx;
+  margin: 0 0 0 12rpx;
+  padding: 0 20rpx;
+  box-sizing: border-box;
+  border: 2rpx solid var(--zi-warn);
+  border-radius: var(--zi-pill-radius);
+  background: transparent;
+  color: var(--zi-warn);
+  font-size: 28rpx;
+  font-weight: 800;
+  line-height: 1.2;
 }
 .money {
   color: var(--zi-accent);

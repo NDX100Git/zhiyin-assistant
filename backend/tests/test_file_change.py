@@ -221,7 +221,8 @@ def paid_order(client, headers: dict[str, str], page_count: int = 10) -> dict:
 def test_待支付换文件立即生效且订单号与取件码不变(client, db_session):
     headers = student_headers(client)
     order = create_order(client, headers, page_count=10)
-    assert order["amount_cents"] == 150
+    # 10 页双面 = 5 张 × 15 分 = 75 分
+    assert order["amount_cents"] == 75
 
     body = replace_file(client, headers, order["id"], page_count=20)
     assert body["code"] == 0, body
@@ -229,7 +230,8 @@ def test_待支付换文件立即生效且订单号与取件码不变(client, db
     assert data["applied"] is True
     assert data["status"] == "pending_pay"
     assert data["page_count"] == 20
-    assert data["amount_cents"] == 300
+    # 20 页双面 = 10 张 × 15 分 = 150 分
+    assert data["amount_cents"] == 150
     assert data["file_name"] == "新稿.pdf"
     assert data["file_change"] is None
     assert data["order_no"] == order["order_no"]
@@ -247,7 +249,7 @@ def test_待支付换文件立即生效且订单号与取件码不变(client, db
         (1, 10, 0),
         (2, 20, 1),
     ]
-    assert versions[1].amount_cents == 300
+    assert versions[1].amount_cents == 150
 
     logs = list(
         db_session.execute(select(PrintLog).where(PrintLog.order_id == order["id"])).scalars()
@@ -270,15 +272,16 @@ def test_排队中换文件只创建待确认请求_订单保持原样(client, d
     assert data["applied"] is False
     assert data["status"] == "queuing"
     assert data["page_count"] == 10
-    assert data["amount_cents"] == 150
+    assert data["amount_cents"] == 75
 
     change = data["file_change"]
     assert change is not None
     assert change["change_id"] == change["id"]
     assert change["new_page_count"] == 30
-    assert change["new_amount_cents"] == 450
+    # 30 页双面 = 15 张 × 15 分 = 225 分；原 10 页 = 5 张 × 15 分 = 75 分
+    assert change["new_amount_cents"] == 225
     assert change["old_page_count"] == 10
-    assert change["old_amount_cents"] == 150
+    assert change["old_amount_cents"] == 75
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T.+", change["submitted_at"])
 
     detail = client.get(f"/api/order/{order['id']}", headers=headers).json()["data"]
@@ -292,7 +295,7 @@ def test_排队中换文件只创建待确认请求_订单保持原样(client, d
         select(OrderFileChange).where(OrderFileChange.order_id == order["id"])
     ).scalar_one()
     assert stored.status == CHANGE_PENDING
-    assert stored.new_amount_cents == 450
+    assert stored.new_amount_cents == 225
 
 
 def test_重复提交待确认请求被拒(client):
@@ -490,7 +493,7 @@ def test_老师驳回后保留原文件且可以再次申请(client, db_session)
     assert data["approved"] is False
     assert data["order"]["file_key"] == original_key
     assert data["order"]["page_count"] == 10
-    assert data["order"]["amount_cents"] == 150
+    assert data["order"]["amount_cents"] == 75
     assert data["order"]["file_change"] is None
 
     change = db_session.execute(
@@ -574,15 +577,15 @@ def test_非法状态拒绝换文件并给出中文提示(client, status, expect
 def test_新价更高时差额在核销时现场补收(client, db_session):
     headers = student_headers(client)
     admin = admin_headers(client)
-    order = paid_order(client, headers, page_count=10)  # 已付 150 分
+    order = paid_order(client, headers, page_count=10)  # 已付 75 分
 
     assert replace_file(client, headers, order["id"], page_count=30)["code"] == 0
     approved = confirm(client, admin, order["id"], approve=True)
     assert approved["code"] == 0, approved
-    assert approved["data"]["amount_cents"] == 450
-    assert approved["data"]["supplement_cents"] == 300
+    assert approved["data"]["amount_cents"] == 225
+    assert approved["data"]["supplement_cents"] == 150
 
-    # 打印完成时系统按新价 450 计价，已付 150，核销时补 300
+    # 打印完成时系统按新价 225 计价，已付 75，核销时补 150
     assert client.post(f"/api/admin/order/{order['id']}/start", headers=admin).json()["code"] == 0
     completed = client.post(
         f"/api/admin/order/{order['id']}/complete", headers=admin
@@ -595,23 +598,24 @@ def test_新价更高时差额在核销时现场补收(client, db_session):
     ).json()
     assert verified["code"] == 0, verified
     assert verified["data"]["collected_onsite"] is True
-    assert verified["data"]["collected_cents"] == 300
+    assert verified["data"]["collected_cents"] == 150
 
     total_paid = db_session.execute(
         select(PaymentLog.amount_cents).where(PaymentLog.order_id == order["id"])
     ).scalars()
-    assert sum(total_paid) == 450
+    assert sum(total_paid) == 225
 
 
 def test_新价更低时多付部分不退(client, db_session):
     headers = student_headers(client)
     admin = admin_headers(client)
-    order = paid_order(client, headers, page_count=10)  # 已付 150 分
+    order = paid_order(client, headers, page_count=10)  # 已付 75 分
 
     assert replace_file(client, headers, order["id"], page_count=5)["code"] == 0
     approved = confirm(client, admin, order["id"], approve=True)
     assert approved["code"] == 0, approved
-    assert approved["data"]["amount_cents"] == 75
+    # 5 页双面 = 3 张 × 15 分 = 45 分
+    assert approved["data"]["amount_cents"] == 45
     assert approved["data"]["supplement_cents"] == 0
 
     assert client.post(f"/api/admin/order/{order['id']}/start", headers=admin).json()["code"] == 0
@@ -628,8 +632,8 @@ def test_新价更低时多付部分不退(client, db_session):
     total_paid = db_session.execute(
         select(PaymentLog.amount_cents).where(PaymentLog.order_id == order["id"])
     ).scalars()
-    # 不建退款通道：多付的 75 分不退
-    assert sum(total_paid) == 150
+    # 不建退款通道：多付的 30 分不退
+    assert sum(total_paid) == 75
 
 
 def test_没有待确认请求时确认接口返回明确提示(client):

@@ -4,7 +4,7 @@
  * 锁住产品三条硬要求里能自动验的部分：
  * 1. 密钥只进本地存储 —— 保存、读取、清除、脱敏展示；
  * 2. 密钥只挂请求头 —— 只在 AI 接口上出现，且不出现在 URL 与请求体里；
- * 3. 失效不静默回退 —— 密钥失败要能认出来并给出「清除后改用学校共享」的原话。
+ * 3. 失效不静默回退 —— 密钥失败要能认出来并给出「清除后改用学校提供的检查额度」的原话。
  *
  * 这里的 `uni` 是一个假的全局对象：api.js / llmKey.js 都在**调用时**才读 `uni`，
  * 所以测试里先装桩、再调函数就够了，不需要真的跑起小程序。
@@ -110,9 +110,9 @@ test('状态行：没填是学校共享，填了是我的密钥，清除后立�
     mode: 'school',
     own: false,
     masked: '',
-    label: '使用学校共享密钥',
+    label: '使用学校提供的检查额度',
   })
-  assert.equal(llmKeyUsageLabel(), '学校共享')
+  assert.equal(llmKeyUsageLabel(), '学校提供的检查额度')
 
   saveLlmKey(KEY)
   const own = llmKeyStatus()
@@ -124,7 +124,7 @@ test('状态行：没填是学校共享，填了是我的密钥，清除后立�
   assert.equal(clearLlmKey(), true)
   assert.equal(getLlmKey(), '')
   assert.equal(llmKeyStatus().mode, 'school', '清除后没有回到学校共享')
-  assert.equal(llmKeyUsageLabel(), '学校共享')
+  assert.equal(llmKeyUsageLabel(), '学校提供的检查额度')
 })
 
 test('请求头只在本地有密钥时出现，且只挂在 AI 接口上', () => {
@@ -227,7 +227,7 @@ test('中文措辞不再决定判定：光有「密钥/鉴权/额度」字样但
   assert.equal(isLlmKeyFailure({ code: 50043, message: '密钥 invalid', llmKeySent: true }), false)
 })
 
-test('密钥失效能认出来，并给出「清除后改用学校共享」的原话', async () => {
+test('密钥失效能认出来，并给出「清除后改用学校提供的检查额度」的原话', async () => {
   // 后端对 50035 的措辞随时可能改，这里故意给一句和码表完全不同的话：
   // 判定必须仍然命中（按码），学生看到的文案是本端码表译出来的那句。
   const { calls } = installUniStub(() => ({
@@ -248,7 +248,7 @@ test('密钥失效能认出来，并给出「清除后改用学校共享」的�
   assert.equal(isLlmKeyFailure(error), true, '密钥失效没被认出来')
   const text = llmKeyFailureText(error)
   assert.match(text, /你的密钥不可用/)
-  assert.match(text, /清除后改用学校共享/)
+  assert.match(text, /清除后改用学校提供的检查额度/)
   assert.equal(text.includes(KEY), false, '提示文案里出现了密钥原文')
   // 不静默回退：本地密钥还在，等学生自己决定清不清
   assert.equal(getLlmKey(), KEY)
@@ -268,7 +268,7 @@ test('「测试连通」遇到 50036（没填/格式不对）与 50037（学校�
     assert.equal(calls[0].header[LLM_KEY_HEADER], KEY)
     assert.equal(error && error.message, ERROR_MESSAGES[code], `${code} 没被译成本端文案`)
     assert.equal(isLlmKeyFailure(error), true, `${code} 没被认成密钥问题`)
-    assert.equal(llmKeyFailureText(error).includes('清除后改用学校共享'), true)
+    assert.equal(llmKeyFailureText(error).includes('清除后改用学校提供的检查额度'), true)
   }
 })
 
@@ -360,5 +360,5 @@ test('面板说明提到「本地存储」「不上传服务器」「换设备�
   assert.match(LLM_KEY_NOTICE, /换设备或清理缓存/)
   // 横幅那句话只有一个出处：errors.js 码表里 50035 的翻译
   assert.equal(LLM_KEY_INVALID_TEXT, ERROR_MESSAGES[50035])
-  assert.match(LLM_KEY_INVALID_TEXT, /清除后改用学校共享/)
+  assert.match(LLM_KEY_INVALID_TEXT, /清除后改用学校提供的检查额度/)
 })

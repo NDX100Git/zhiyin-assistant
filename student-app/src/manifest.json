@@ -1,6 +1,6 @@
 {
     "name" : "智印助手",
-    "appid" : "__UNI__A9689FA",
+    "appid" : "__UNI__54F40DB",
     "mpWeixinAppidNote" : "小程序身份码不写在这个文件里：构建时由 UNI_MP_WEIXIN_APPID（或未入库的 .env.local 里的 VITE_MP_WEIXIN_APPID）注入到 mp-weixin.appid；缺省留空并告警（产物为游客身份包）。说明见 student-app/README.md 与 backend/scripts/DEVICE-DEBUG.md",
     "description" : "AI 论文格式体检与自助打印平台",
     "versionName" : "1.0.0",
@@ -16,7 +16,9 @@
             "autoclose" : true,
             "delay" : 0
         },
-        "modules" : {},
+        "modules" : {
+            "Camera" : {}
+        },
         "distribute" : {
             "icons" : {
                 "android" : {

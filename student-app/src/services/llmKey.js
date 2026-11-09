@@ -9,8 +9,8 @@
  *
  * 另外两条纪律：
  * - 不许 console.log 密钥，也不许把它拼进错误文案（脱敏一律走 maskLlmKey）；
- * - 密钥不可用时**不静默回退**到学校共享密钥：isLlmKeyFailure() 让页面把原因说清楚，
- *   换不换钥匙由学生自己点「清除并改用学校共享」决定。
+ * - 密钥不可用时**不静默回退**到学校提供的检查额度：isLlmKeyFailure() 让页面把原因说清楚，
+ *   换不换钥匙由学生自己点「清除并改用学校提供的检查额度」决定。
  */
 
 import { STORAGE_KEYS } from '../config/index.js'
@@ -25,7 +25,7 @@ export const LLM_KEY_CHECK_PATH = '/api/ai/key-check'
 /** 面板里那段说明，全端只此一份。 */
 export const LLM_KEY_NOTICE =
   '密钥只保存在这台设备的本地存储里，不会上传服务器；换设备或清理缓存后需要重新填写。' +
-  '清除后立刻改用学校共享密钥，下次 AI 请求只带学校那把。'
+  '清除后立刻改用学校提供的检查额度，下次 AI 请求只带学校那把。'
 
 /** 密钥不可用时的标准提示（页面横幅、测试失败都用这一句打头）。
  *
@@ -35,7 +35,7 @@ export const LLM_KEY_NOTICE =
 export { LLM_KEY_INVALID_TEXT }
 
 /** 没有自己的密钥时，状态行显示的文案。 */
-export const SCHOOL_KEY_LABEL = '使用学校共享密钥'
+export const SCHOOL_KEY_LABEL = '使用学校提供的检查额度'
 
 /** 密钥长度下限：明显短于这个长度只可能是没复制全。 */
 const MIN_KEY_LENGTH = 8
@@ -82,7 +82,7 @@ export function getLlmKey() {
     const raw = uni.getStorageSync(STORAGE_KEYS.llmKey)
     return normalizeLlmKey(typeof raw === 'string' ? raw : '')
   } catch (error) {
-    // 小程序存储偶发不可用：当作「没有自己的密钥」，走学校共享
+    // 小程序存储偶发不可用：当作「没有自己的密钥」，走学校提供的检查额度
     return ''
   }
 }
@@ -108,7 +108,7 @@ export function saveLlmKey(raw) {
   }
 }
 
-/** 清除本机密钥，之后自动回到学校共享密钥。 */
+/** 清除本机密钥，之后自动回到学校提供的检查额度。 */
 export function clearLlmKey() {
   try {
     uni.removeStorageSync(STORAGE_KEYS.llmKey)
@@ -148,9 +148,9 @@ export function llmKeyStatus() {
   return { mode: 'own', own: true, masked, label: `使用我自己的密钥（${masked}）` }
 }
 
-/** 下单页那行小字用的短标签：「学校共享」或「我的密钥」。 */
+/** 下单页那行小字用的短标签：「学校提供的检查额度」或「我的密钥」。 */
 export function llmKeyUsageLabel() {
-  return getLlmKey() ? '我的密钥' : '学校共享'
+  return getLlmKey() ? '我的密钥' : '学校提供的检查额度'
 }
 
 /**

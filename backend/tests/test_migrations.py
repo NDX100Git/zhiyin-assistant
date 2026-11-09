@@ -25,7 +25,14 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 
-from app.migrations import MIGRATION_COLUMNS, MIGRATION_INDEXES, run_migrations
+from app.migrations import (
+    MIGRATION_COLUMNS,
+    MIGRATION_INDEXES,
+    MigrationLockTimeout,
+    migration_lock,
+    migration_lock_name,
+    run_migrations,
+)
 from app.models.base import Base
 from app.models.order import Order
 from app.models.payment_log import PaymentLog
@@ -751,3 +758,74 @@ def test_只用建表脚本建的库体检与页数接口都能正常返回(
         owners = conn.execute(text(f"SELECT `{REPORT_OWNER_COLUMN}` FROM `{AI_REPORTS}`")).all()
     assert owners, "体检结果没有写进 ai_reports"
     assert all(owner[0] == user_id for owner in owners), owners
+
+
+# ---------------------------------------------------------------- 多进程同时启动：迁移锁
+
+
+def _other_engine(engine):
+    """另起一个引擎拿独立连接，等价于另一个进程：GET_LOCK 是 MySQL 按连接记账的，
+    不同进程、不同连接没有区别，所以它的行为就是「第二个进程」在这里的表现。"""
+    return create_engine(engine.url, pool_pre_ping=True)
+
+
+def _try_get_lock(connection, name: str) -> int:
+    """不等待地试着取一次锁：1=拿到，0=已被别人持有。"""
+    return int(connection.execute(text("SELECT GET_LOCK(:n, 0)"), {"n": name}).scalar() or 0)
+
+
+def _return_lock(connection, name: str) -> None:
+    connection.execute(text("SELECT RELEASE_LOCK(:n)"), {"n": name})
+
+
+def test_迁移锁同一时刻只能被一条连接持有且异常路径也会释放(engine):
+    """四个进程同时跑建表与迁移时，DDL 互抢元数据锁，日志里是连续的
+    `Deadlock found when trying to get lock`，结果是每个进程都启动失败。
+
+    修复靠的是「同一库同一时刻只有一条连接持有迁移锁」这个性质，这里就钉它：
+    锁被持有时第二条连接再取就拿到 0（它不会一边等一边把 DDL 发下去，因此不可能与
+    持锁者抢锁）；离开作用域、以及块内抛异常后，锁都回到可用状态。
+    异常路径必须一起验：漏了释放，下一次启动就会一直等到超时，等于又把启动搞死。
+    """
+    name = migration_lock_name(engine)
+    other = _other_engine(engine)
+    try:
+        with other.connect() as probe:
+            assert _try_get_lock(probe, name) == 1, "前置条件：此刻没有别人持锁"
+            _return_lock(probe, name)
+
+        with migration_lock(engine):
+            with other.connect() as probe:
+                assert _try_get_lock(probe, name) == 0, "锁被持有期间第二个进程必须拿不到"
+
+        with other.connect() as probe:
+            assert _try_get_lock(probe, name) == 1, "正常退出后锁必须已释放"
+            _return_lock(probe, name)
+
+        with pytest.raises(RuntimeError, match="故意失败"):
+            with migration_lock(engine):
+                raise RuntimeError("故意失败")
+
+        with other.connect() as probe:
+            assert _try_get_lock(probe, name) == 1, "块内抛异常也必须把锁释放"
+            _return_lock(probe, name)
+    finally:
+        other.dispose()
+
+
+def test_别的进程占着迁移锁时run_migrations超时报错而不是硬上(engine):
+    """锁在别人手里时，run_migrations 等一会儿就抛明确的超时错误，
+    不会跳过锁直接把 DDL 发下去（那样又回到抢锁 / Deadlock 的老路）。"""
+    name = migration_lock_name(engine)
+    other = _other_engine(engine)
+    try:
+        with other.connect() as holder:
+            assert _try_get_lock(holder, name) == 1
+            with pytest.raises(MigrationLockTimeout, match="另一个进程正在建表或迁移"):
+                run_migrations(engine, lock_timeout_seconds=1)
+            _return_lock(holder, name)
+
+        # 锁一放开，同样的调用就能进到迁移逻辑里（返回值取决于库当前状态，不断言具体内容）
+        assert isinstance(run_migrations(engine, lock_timeout_seconds=1), list)
+    finally:
+        other.dispose()

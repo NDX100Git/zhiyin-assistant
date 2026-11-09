@@ -1,4 +1,4 @@
-# 构建上下文黑名单：镜像里只需要 app/ 与 config/，其余噪声与密钥一律不进上下文
+# 构建上下文黑名单：镜像里只需要 app/、config/ 与 scripts/，其余噪声与密钥一律不进上下文
 .env
 .env.*
 !.env.example
@@ -12,9 +12,11 @@ __pycache__/
 # 运行时临时目录由宿主机卷提供，不打进镜像
 runtime/
 
-# 测试、脚本、开发依赖不参与镜像构建
+# scripts/ 必须留在构建上下文里：「载入示例论文」接口会 import scripts.make_demo_docx，
+# 少了这个目录接口就是 500。
+
+# 测试与开发依赖不参与镜像构建
 tests/
-scripts/
 requirements-dev.txt
 ruff.toml
 test_llm.py

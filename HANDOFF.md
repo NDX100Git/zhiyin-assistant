@@ -383,7 +383,7 @@ cd D:\zhiyin-handoff\backend
 
 | 想改什么 | 改哪里 |
 |---|---|
-| 打印价格 | `backend/config/pricing.json`（单位：分/页） |
+| 打印价格 | `backend/config/pricing.json`（单位：分/张） |
 | 论文格式规则（页边距/字体/字号/结构/参考文献） | `backend/config/format_rules.json` |
 | 上传大小上限/白名单 | `backend/config/upload_rules.json` |
 | 收单时段/容量/等待时间/取件码 | `backend/config/order_rules.json` |

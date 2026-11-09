@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.database import init_db
-from app.routers import admin, ai, auth, file, home, notice, order
+from app.routers import admin, ai, auth, file, home, notice, order, trace_debug
 from app.services.ai_pool import shutdown_ai_pool
 from app.services.cleanup import cleanup_loop
 from app.utils.exceptions import register_exception_handlers
@@ -103,3 +103,7 @@ app.include_router(order.router, prefix="/api/order", tags=["学生端-订单"])
 app.include_router(home.router, prefix="/api/home", tags=["学生端-首页"])
 app.include_router(notice.router, prefix="/api/notice", tags=["学生端-公告"])
 app.include_router(admin.router, prefix="/api/admin", tags=["老师端-后台"])
+
+# 测试用的轨迹接收端：只有开关打开时才挂上，平时这个接口不存在
+if settings.debug_trace_enabled:
+    app.include_router(trace_debug.router)

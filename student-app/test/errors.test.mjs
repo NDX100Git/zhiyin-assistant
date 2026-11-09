@@ -61,14 +61,14 @@ test('金额不合法与金额超限分开说（40061 / 40062）', () => {
 })
 
 test('学生自带密钥三个码各自说清怎么办（50035 / 50036 / 50037）', () => {
-  // 50035：密钥不可用 —— 必须给出「清除后改用学校共享」这个出口
+  // 50035：密钥不可用 —— 必须给出「清除后改用学校提供的检查额度」这个出口
   assert.match(explainApiCode(50035), /密钥不可用/)
-  assert.match(explainApiCode(50035), /清除后改用学校共享/)
+  assert.match(explainApiCode(50035), /清除后改用学校提供的检查额度/)
   // 50036：没填或格式不对
   assert.match(explainApiCode(50036), /密钥/)
   assert.match(explainApiCode(50036), /粘贴|清除/)
   // 50037：学校关闭了自带密钥，填了也不生效
-  assert.match(explainApiCode(50037), /关闭|学校共享/)
+  assert.match(explainApiCode(50037), /关闭|学校提供的检查额度/)
   // 三句互不相同，学生能分辨自己是哪一种
   const keyTexts = [50035, 50036, 50037].map((code) => explainApiCode(code))
   assert.equal(new Set(keyTexts).size, 3)

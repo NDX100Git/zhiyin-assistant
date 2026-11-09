@@ -39,9 +39,10 @@ VITE_API_BASE_URL=http://电脑局域网IP:8000
 | 权限 | 网络、相机、读写存储、相册 | 已按最小必要配置 |
 | 图标 | `src/static/app-icon.png` | 1024×1024；HBuilderX 图标配置里可直接选它 |
 
-**DCloud 应用 appid 必须换掉**：当前是 `__UNI__A9689FA`（`manifest.json` 第 3 行的 `appid`），
-是别人账号下的值。在 HBuilderX 里打开 `manifest.json` →「基础配置」→ 点击「重新获取」/ 选择你账号下的
-uni-app 应用，把 appid 换成 DCloud 分配给你的真实值，否则云打包会失败。
+**DCloud 应用 appid 必须先对上账号**：`manifest.json` 里现在是 `__UNI__54F40DB`。
+云打包只认「登录 HBuilderX 的那个 DCloud 账号名下的应用」，对不上就打包失败。
+在 HBuilderX 里打开 `manifest.json` →「基础配置」，确认这个 appid 属于当前登录的账号；
+换账号或换电脑时，点「重新获取」选择本账号下的 uni-app 应用，把 appid 换成新的真实值。
 
 > 别跟**微信小程序身份码**搞混：那是另一个值（`mp-weixin.appid`），**不写在 manifest 里**，
 > 构建时由 `UNI_MP_WEIXIN_APPID` / `student-app/.env.local` 注入，见第 5 节。

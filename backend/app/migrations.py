@@ -5,6 +5,9 @@
 会自动补上。同一份逻辑也可以单独执行（`python -m app.migrations` 或
 `python scripts/migrate_schema.py`），重复执行不会报错。
 
+建表与迁移都在 `migration_lock` 里执行：同一库同一时刻只让一个进程改结构，
+多进程启动时其余进程等它做完再进来。
+
 只做加法：不删列、不改已有列类型。需要破坏性变更时另写迁移脚本。
 """
 
@@ -12,11 +15,27 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 logger = logging.getLogger(__name__)
+
+# 结构迁移锁。GET_LOCK 的名字在同一个 MySQL 实例内全局生效，所以名字里必须带库名：
+# 不带的话，同实例上的开发库、测试库、临时小库会互相挡着。
+MIGRATION_LOCK_PREFIX = "zhiyin:migrate:"
+# MySQL 8 对锁名长度的上限
+MIGRATION_LOCK_MAX_NAME = 64
+# 等别的进程做完建表与迁移的秒数。建表、回填与加索引可能跑几十秒，等不到这个时间
+# 才判失败。
+MIGRATION_LOCK_TIMEOUT_SECONDS = 120
+
+# 当前线程是否已经在锁内（值为重入深度）。init_db 先拿锁再调 run_migrations，
+# 靠它避免同一线程里的第二次取锁把自己挡在门外。
+_lock_depth = threading.local()
 
 # 表名与列名要拼进 ALTER 语句（标识符无法用参数绑定），拼之前必须过白名单。
 # 当前取值全部是模块常量，属加固：将来若有人把库名/表名改成从配置或请求里读，
@@ -26,6 +45,67 @@ IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 
 class UnsafeIdentifierError(ValueError):
     """表名或列名不是合法标识符（可能被拿来拼注入语句）。"""
+
+
+class MigrationLockTimeout(RuntimeError):
+    """等不到结构迁移锁：另一个进程还在建表或迁移。"""
+
+
+def migration_lock_name(engine: Engine) -> str:
+    """锁名按库区分：同一库共用一把锁，不同库互不影响。"""
+    database = engine.url.database or "default"
+    return f"{MIGRATION_LOCK_PREFIX}{database}"[:MIGRATION_LOCK_MAX_NAME]
+
+
+@contextmanager
+def migration_lock(engine: Engine, timeout_seconds: float | None = None) -> Iterator[None]:
+    """在同一个库上取命名锁，同一时刻只允许一个进程建表与迁移。
+
+    多个 worker 同时启动时会一起建表、加列、加索引，DDL 之间互相抢锁，结果是每个
+    进程都拿到 `Deadlock found when trying to get lock`，谁也起不来。有这把锁以后，
+    晚到的进程等前一个做完再进来，进来时结构已是最新，什么也不用做。
+
+    GET_LOCK 是连接级的：锁跟着取锁的那条连接走，别的连接释放不掉，连接一断锁就
+    自动没了。所以取锁和释放必须固定在同一条连接上：这里单独开一条，用完就关，
+    不能从业务会话池里随手取一条来加锁、再换一条去释放。
+
+    超时或拿不到锁抛 MigrationLockTimeout；正常与异常两条路径都会释放锁。
+    """
+    depth = getattr(_lock_depth, "depth", 0)
+    if depth:
+        _lock_depth.depth = depth + 1
+        try:
+            yield
+        finally:
+            _lock_depth.depth -= 1
+        return
+
+    timeout = MIGRATION_LOCK_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    name = migration_lock_name(engine)
+    connection = engine.connect()
+    try:
+        granted = connection.execute(
+            text("SELECT GET_LOCK(:name, :timeout)"),
+            {"name": name, "timeout": timeout},
+        ).scalar()
+        if granted != 1:
+            raise MigrationLockTimeout(
+                f"等数据库结构迁移锁超时（{timeout:g} 秒）：另一个进程正在建表或迁移，"
+                "请稍后重试"
+            )
+        _lock_depth.depth = 1
+        try:
+            yield
+        finally:
+            _lock_depth.depth = 0
+            try:
+                connection.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": name})
+            except Exception:
+                # 释放失败就作废这条连接：带着锁回到连接池，等于把后面所有进程都挡死
+                connection.invalidate()
+                raise
+    finally:
+        connection.close()
 
 
 def quote_identifier(name: str) -> str:
@@ -315,8 +395,19 @@ def _table_exists(conn, table: str) -> bool:
     return int(count) > 0
 
 
-def run_migrations(engine: Engine) -> list[str]:
-    """补齐结构并回填老数据，返回本次实际执行的动作（空列表表示已是最新）。"""
+def run_migrations(
+    engine: Engine, *, lock_timeout_seconds: float | None = None
+) -> list[str]:
+    """补齐结构并回填老数据，返回本次实际执行的动作（空列表表示已是最新）。
+
+    整段在结构迁移锁内执行，同一库同一时刻只有一个进程在改结构。
+    """
+    with migration_lock(engine, timeout_seconds=lock_timeout_seconds):
+        return _apply_migrations(engine)
+
+
+def _apply_migrations(engine: Engine) -> list[str]:
+    """真正做迁移的部分，调用方负责已经在迁移锁内。"""
     applied: list[str] = []
 
     with engine.begin() as conn:
@@ -410,6 +501,8 @@ if __name__ == "__main__":  # pragma: no cover - 手工执行入口
     from app.database import engine
     from app.models.base import Base
 
-    Base.metadata.create_all(bind=engine)
-    actions = run_migrations(engine)
+    # 手工执行也走同一把锁，与正在启动的进程互不干扰
+    with migration_lock(engine):
+        Base.metadata.create_all(bind=engine)
+        actions = run_migrations(engine)
     print("迁移完成：", "、".join(actions) if actions else "结构已是最新")

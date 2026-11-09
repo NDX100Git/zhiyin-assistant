@@ -37,17 +37,20 @@
     </view>
 
     <view class="footnote">
-      PDF 转 Word 与 Word 转 PDF 由服务端本地转换，不消耗 AI 额度；图片转 Word 需要识别文字，会用到模型。
+      PDF 转 Word 与 Word 转 PDF 由系统直接转换，不占用检查额度；图片转 Word 需要识别文字，会用到模型。
     </view>
   </view>
 </template>
 
 <script setup>
+import { onShow } from '@dcloudio/uni-app'
 import { computed, ref } from 'vue'
 import { API_BASE_URL } from '@/config'
 import { getToken, request, uploadFile } from '@/services/api'
 import { chooseDocuments, chooseImage } from '@/services/filePicker'
+import { checkPickFile, clearLastPick, loadLastPick, PICK_INVALID, saveLastPick } from '@/services/lastPick'
 import { notify, notifyError } from '@/services/notify'
+import { describePickError } from '@/services/pickError'
 import { useUiTheme } from '@/ui/theme'
 
 /**
@@ -114,7 +117,12 @@ function formatSize(bytes) {
   return `${size} B`
 }
 
-/** 选文件。用户中途取消时返回 null，让调用方安静退出，不当成错误。 */
+/**
+ * 选文件。学生中途取消时返回 null，让调用方安静退出，不当成错误。
+ *
+ * 平台给的失败消息一律先交给 describePickError 翻译：权限被拒说清去哪儿开，
+ * `chooseImage:fail` 这类内部串不往学生面前摆。
+ */
 async function pickFile(tool) {
   try {
     if (tool.picker === 'image') {
@@ -132,8 +140,7 @@ async function pickFile(tool) {
     }
     return file
   } catch (error) {
-    if (error && error.canceled) return null
-    throw error
+    throw describePickError(error, tool.picker)
   }
 }
 
@@ -142,10 +149,25 @@ async function start() {
   const tool = current.value
   busy.value = true
   result.value = null
-  try {
-    const picked = await pickFile(tool)
-    if (!picked) return
 
+  let picked = null
+  try {
+    picked = await pickFile(tool)
+  } catch (error) {
+    busy.value = false
+    // 自己点了取消什么都不说；其余（含权限被拒）用翻译好的那句话
+    if (!(error && error.canceled)) notify(error.message, 'error')
+    return
+  }
+  if (!picked) {
+    busy.value = false
+    return
+  }
+
+  // 选好了就把这份文件记进本机：应用被回收后回到页面靠它认回本次选择
+  saveLastPick({ toolKey: tool.key, name: picked.name, path: picked.path, size: picked.size, result: null })
+
+  try {
     uploading.value = true
     const uploaded = await uploadFile(picked.path, picked.name)
     uploading.value = false
@@ -159,14 +181,15 @@ async function start() {
       timeout: 240000,
     })
     result.value = data
+    saveLastPick({ toolKey: tool.key, name: picked.name, path: picked.path, size: picked.size, result: data })
     notify('转换完成', 'success')
   } catch (error) {
-    // 把失败阶段带出来：拍照后到底卡在选择、上传还是识别，用户能直接说清楚
+    // 把失败阶段带出来：拍照后到底卡在选择、上传还是识别，学生能直接说清楚
     if (error && (error.canceled || error.aborted)) {
       notifyError(error)
       return
     }
-    const stage = converting.value ? '识别/转换' : uploading.value ? '上传图片' : '选择图片'
+    const stage = converting.value ? '识别/转换' : '上传文件'
     notify(`${stage}失败：${(error && error.message) || '未知错误'}`, 'error')
   } finally {
     busy.value = false
@@ -206,7 +229,42 @@ function openResult() {
 
 function reset() {
   result.value = null
+  // 学生主动再转一份，上次那份用不上了，存档一并删掉
+  clearLastPick()
 }
+
+/**
+ * 页面重新进入时把上次的记录认回来。
+ *
+ * 应用被系统回收后页面是新的，内存里的结果全没了。这里分三种情况：
+ * - 本机没有存档：正常第一次进来，什么都不做；
+ * - 存档里的文件确实不在了：提示重选，并删掉存档；
+ * - 文件还在或没法判断：把「转换完成」卡片恢复出来，不弹任何提示。
+ *
+ * 只判一次：同一次停留里学生自己选过文件后，不再回头翻存档。
+ */
+let restored = false
+onShow(async () => {
+  if (restored) return
+  restored = true
+  if (busy.value || result.value) return
+
+  const draft = loadLastPick()
+  if (!draft) return
+
+  const state = await checkPickFile(draft.path)
+  if (state === PICK_INVALID) {
+    clearLastPick()
+    notify('上次选的文件已失效，请重新选择')
+    return
+  }
+  if (!draft.result) return
+
+  if (draft.toolKey && TOOLS.some((tool) => tool.key === draft.toolKey)) {
+    activeKey.value = draft.toolKey
+  }
+  result.value = draft.result
+})
 </script>
 
 <style scoped>

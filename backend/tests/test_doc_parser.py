@@ -396,3 +396,29 @@ def test_表格渲染超时的降级说明出现在解析结果里(db_session, t
     assert "因超时按前一次结果出纸" in spreadsheet_stats["render_note"]
     assert spreadsheet_stats["render_attempts"] == 1
     assert report["page_count"] == 1
+
+
+def test_加密PDF给明确业务码而不是一直转(tmp_path):
+    """设了密码的 PDF 必须当场说清，不能让学生对着「读取页数中…」一直等。
+
+    不拦的话，PyMuPDF 在读页面时抛 ValueError: document closed or encrypted，
+    对外只剩一句「服务端开小差了」，学生不知道是文件带密码。
+    """
+    from app.utils.exceptions import BusinessError
+
+    pdf_path = tmp_path / "locked.pdf"
+    doc = fitz.open()
+    doc.new_page()
+    doc.save(
+        pdf_path,
+        encryption=fitz.PDF_ENCRYPT_AES_256,
+        owner_pw="owner-secret",
+        user_pw="user-secret",
+    )
+    doc.close()
+
+    with pytest.raises(BusinessError) as exc:
+        parse_pdf(pdf_path)
+
+    assert exc.value.code == 40074
+    assert "密码" in exc.value.message

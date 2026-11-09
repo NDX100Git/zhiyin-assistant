@@ -6,6 +6,7 @@
 // 相对路径导入：单测在 Node 里直接 import 本文件，'@/' 别名只有 uni/vite 构建期能解析
 import { API_BASE_URL, STORAGE_KEYS } from '../config/index.js'
 import { explainApiCode } from '../utils/errors.js'
+import { traceApi } from '../utils/trace.js'
 import { LLM_KEY_CHECK_PATH, LLM_KEY_HEADER, llmKeyHeader } from './llmKey.js'
 
 export function getToken() {
@@ -108,6 +109,7 @@ export function request(path, options = {}) {
   const sentLlmKey = Boolean(keyHeader[LLM_KEY_HEADER])
 
   return new Promise((resolve, reject) => {
+    const startedAt = Date.now()
     uni.request({
       url: `${API_BASE_URL}${path}`,
       method,
@@ -116,7 +118,17 @@ export function request(path, options = {}) {
       timeout,
       success(response) {
         const body = parseBody(response.data)
-        if (body && body.code === 0) {
+        const ok = Boolean(body && body.code === 0)
+        traceApi({
+          how: 'request',
+          method,
+          path,
+          status: response.statusCode,
+          code: body && typeof body.code !== 'undefined' ? body.code : null,
+          ok,
+          ms: Date.now() - startedAt,
+        })
+        if (ok) {
           resolve(body.data)
           return
         }
@@ -155,6 +167,16 @@ export function request(path, options = {}) {
         )
       },
       fail(error) {
+        traceApi({
+          how: 'request',
+          method,
+          path,
+          status: null,
+          code: null,
+          ok: false,
+          ms: Date.now() - startedAt,
+          err: (error && error.errMsg) || 'unknown',
+        })
         reject(new Error(error.errMsg || '网络连接失败，请检查 API 地址与网络'))
       },
     })
@@ -166,6 +188,7 @@ export function uploadFile(filePath, fileName, options = {}) {
   const { onProgress } = options
   let task = null
   const promise = new Promise((resolve, reject) => {
+    const startedAt = Date.now()
     task = uni.uploadFile({
       url: `${API_BASE_URL}/api/file/upload`,
       filePath,
@@ -175,6 +198,16 @@ export function uploadFile(filePath, fileName, options = {}) {
       timeout: 120000,
       success(response) {
         const body = parseBody(response.data)
+        traceApi({
+          how: 'upload',
+          method: 'POST',
+          path: '/api/file/upload',
+          status: response.statusCode,
+          code: body && typeof body.code !== 'undefined' ? body.code : null,
+          ok: Boolean(body && body.code === 0),
+          ms: Date.now() - startedAt,
+          file: fileName || '',
+        })
         if (body && body.code === 0) {
           resolve(body.data)
           return
@@ -196,6 +229,18 @@ export function uploadFile(filePath, fileName, options = {}) {
         // 打上标记让上层区分「主动取消」和「真的失败」：取消不该弹错误提示。
         const message = (error && error.errMsg) || '上传失败'
         const aborted = message.toLowerCase().indexOf('abort') >= 0
+        traceApi({
+          how: 'upload',
+          method: 'POST',
+          path: '/api/file/upload',
+          status: null,
+          code: null,
+          ok: false,
+          ms: Date.now() - startedAt,
+          file: fileName || '',
+          err: message,
+          aborted,
+        })
         const wrapped = new Error(aborted ? '已取消上传' : message)
         wrapped.aborted = aborted
         reject(wrapped)

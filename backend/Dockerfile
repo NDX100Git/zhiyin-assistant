@@ -55,15 +55,20 @@ RUN if [ "$APT_MIRROR" != "deb.debian.org" ]; then \
 # 容器内直接用镜像里的 soffice；宿主机模式改用 .env 里的 SOFFICE_CONTAINER
 ENV SOFFICE_PATH=/usr/bin/soffice
 
-# 应用代码：只拷运行期需要的 app/ 与 config/。
+# 应用代码：只拷运行期需要的 app/、config/ 与 scripts/。
 # config/ 下的 JSON 是价格、格式规则、功能开关的唯一来源，缺了业务接口会报错。
+# scripts/ 里的示例论文生成脚本会被运行时 import（service 层用 `from scripts.make_demo_docx
+# import build`），缺了这个目录，「载入示例论文」接口直接 500（ModuleNotFoundError）。
+# 它必须落在 /app/scripts：容器里的工作目录是 /app，导入靠这个位置找到包。
 COPY app ./app
 COPY config ./config
+COPY scripts ./scripts
 
 # 降权运行：这个容器专职解析学生上传的 docx/xlsx/pptx，还装着 LibreOffice，
 # 以 root 跑等于把「格式解析漏洞」和「整台宿主机」绑在一起。
 # 固定 uid/gid 10001，方便挂载卷与 docker exec 共用同一个身份。
-# 运行时临时目录也在这里建好并交给 app 用户。
+# 运行时临时目录也在这里建好并交给 app 用户；上面拷进来的 app/、config/、scripts/
+# 一并归 app 所有，运行时以 10001 读它们。
 RUN groupadd --system --gid 10001 app \
     && useradd --system --uid 10001 --gid app --home-dir /app --shell /usr/sbin/nologin app \
     && mkdir -p /app/runtime/tmp \
