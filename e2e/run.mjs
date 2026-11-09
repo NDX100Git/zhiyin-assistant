@@ -2568,7 +2568,8 @@ async function runPriceAndRefundPhase({ student, teacher, viewport, step }) {
     await clickByText(student, '单面')
     await sleep(2000)
     await waitBody(student, '确认下单', 60000)
-    await clickByText(student, '确认下单')
+    // 换单面会触发一次重新报价，报价期间主按钮是灰的：点不动就再点一次
+    await clickByTextRetry(student, '确认下单')
     await waitBody(student, '下单成功', 60000)
     Object.assign(order, await readOrderResult(student))
     order.id = await orderIdFromApi(student, order.orderNo)
