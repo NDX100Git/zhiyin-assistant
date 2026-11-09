@@ -59,6 +59,8 @@ class Settings(BaseSettings):
     app_name: str = "智印助手"
     app_version: str = "0.1.0"
     debug: bool = True
+    # 测试用：把真机上的页面、点击、请求轨迹回传到后端日志。生产必须关
+    debug_trace_enabled: bool = False
     cors_origins: str = "*"  # 逗号分隔，* 表示开发期允许全部
     auto_create_tables: bool = True  # 启动时自动建表（V1 简化实现）
     db_echo: bool = False

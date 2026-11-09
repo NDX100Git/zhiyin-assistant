@@ -670,9 +670,22 @@ def extract_references(full_text: str) -> list[dict]:
     return items
 
 
+def _reject_encrypted(pdf_path: Path) -> None:
+    """设了密码的 PDF 一律拦在解析之前，给一句学生看得懂的话。
+
+    不拦的话，后面每次读页面都会抛 ValueError: document closed or encrypted，
+    学生看到的是「读取页数中…」一直转，没有任何提示。
+    """
+    with fitz.open(pdf_path) as doc:
+        if not doc.needs_pass:
+            return
+    raise BusinessError("这个文件设了密码，请先去掉密码再上传", code=40074)
+
+
 def parse_pdf(pdf_path: Path) -> dict:
     """PDF → 统一结构 JSON。"""
     pages: list[dict] = []
+    _reject_encrypted(pdf_path)
     typography = typography_stats(pdf_path)
     with fitz.open(pdf_path) as doc:
         if doc.page_count == 0:

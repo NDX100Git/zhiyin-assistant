@@ -46,10 +46,13 @@ def init_db() -> None:
     """
     # 先导入全部模型，保证 Base.metadata 中已注册所有表
     from app import models  # noqa: F401
-    from app.migrations import run_migrations
+    from app.migrations import migration_lock, run_migrations
 
-    Base.metadata.create_all(bind=engine)
-    applied = run_migrations(engine)
+    # 建表与迁移必须都在这把锁里：多进程同时启动时一起执行 DDL，互相抢锁，
+    # 结果是每个进程都报 Deadlock found when trying to get lock，一个也起不来。
+    with migration_lock(engine):
+        Base.metadata.create_all(bind=engine)
+        applied = run_migrations(engine)
     if applied:
         logger.info("数据库结构已补齐：%s", "、".join(applied))
     logger.info("数据库表已就绪，共 %d 张表", len(Base.metadata.tables))
