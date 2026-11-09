@@ -13,7 +13,7 @@
 1. 读本文件第 1-4 节，知道现在做到哪、哪些决策不能随便改。
 2. 按第 2 节启动 MySQL、MinIO、后端、学生端 H5。
 3. 打开 <http://127.0.0.1:8000/docs> 看接口，打开 <http://127.0.0.1:5173> 看学生端。
-4. 跑 `cd backend && python -m pytest -q`，确认 **453 passed / 1 skipped**（跳过的是需要
+4. 跑 `cd backend && python -m pytest -q`，确认 **458 passed / 1 skipped**（跳过的是需要
    LibreOffice 的那一条 Office 转换用例；其余全绿）。
 5. 要改哪个模块，先查 [ARCHITECTURE.md](ARCHITECTURE.md) 第 6 节的"关键文件职责"。
 6. 改完一个阶段：更新本文件 + 跑测试 + `git commit`（message 写清楚阶段和内容）。
@@ -29,7 +29,7 @@
 
 最近一次验证（2026-10-25，本轮重跑了后端）：
 
-- 后端 `pytest -q`：**453 passed / 1 skipped**（跳过的是 `tests/test_doc_parser.py` 里需要
+- 后端 `pytest -q`：**458 passed / 1 skipped**（跳过的是 `tests/test_doc_parser.py` 里需要
   LibreOffice 的 Office 转换用例）
 - 同一套用例在三套时钟下数字一致：真实墙钟、`CLOCK_SHIFT_TIME=18:43`、`CLOCK_SHIFT_TIME=06:00`
   （后两者用 `tests/clock_shift_plugin.py` 把应用侧时钟拨早，验证排队与过期判定不靠应用时钟）
@@ -105,7 +105,7 @@ npm.cmd run dev:h5
    3.11 下 import 就 SyntaxError；`backend/requirements.txt` 注释与 `backend/Dockerfile` 同样是 3.12 下界。
 2. **数据库建表双轨**：启动时 `create_all`（`AUTO_CREATE_TABLES=true`）+ 可执行 `schema.sql`，不引入 Alembic（V1 轻量）。
 3. **统一响应约定**：业务错误与参数校验错误返回 **HTTP 200 + 非 0 code**；未预期异常返回 HTTP 500 但响应体仍是 `{code,message,data}`。前端只解析 code。
-4. **金额一律「分」整数**：单价读 `config/pricing.json`；打印方案里模型只给推荐与理由，**纸张数/金额由服务端算**，不让模型算钱。
+4. **金额一律「分」整数，按纸张数计价**：`config/pricing.json` 里只有两个数——黑白 15 分/张、彩色 80 分/张，**与单双面无关**；双面把两页折成一张纸，省下来的纸就是省下来的钱，学校会计可以拿纸张数跟收费一一对上。打印方案里模型只给推荐与理由，**纸张数/金额由服务端算**，不让模型算钱。
 5. **截单语义（用户确认）**：老师关闭时段 / 容量满 / 不在时段内，**都不拒绝下单**，新订单排到下一个打印时段并在首页与下单响应里提示；已在队列的订单不受影响。
 6. **四个抽象模块**：auth / payment / notifier / printer 全部「抽象接口 + 配置切换 + 工厂函数」，业务代码不 import 具体实现；V2 新增实现只改一行配置。
 7. **AI 只给建议**：体检与修复都只出结构化建议/指令；修复必须勾选问题后执行，且改的是副本，原文件保留。
@@ -127,6 +127,16 @@ npm.cmd run dev:h5
 
 | 日期 | 问题 | 原因 | 修复 |
 |---|---|---|---|
+| 2026-11-09 | 设了密码的 PDF 上传后永远停在「读取页数中…」 | 解析前没判断是否需要密码，PyMuPDF 抛 `document closed or encrypted` 被当成未知异常 | `doc_parser` 开文件先判 `needs_pass`，返回业务码 `40074`「这个文件设了密码，请先去掉密码再上传」；学生端按这个码在文件卡片上显示原话并允许移除重传 |
+| 2026-11-09 | 下单成功后再选文件，「确认下单」永远是灰的，上一单的成功卡片还留着 | `created` 只在「从订单详情点再来一单」那条跨页入口重置，同页继续选文件、改参数从不碰它 | 清单或任一打印参数一变就清 `created`（选文件、移除、单双面、颜色、版式、份数、逐份参数六条路径），按钮禁用条件不动 |
+| 2026-11-09 | 双面 13 张纸与单面 25 张纸同价，界面却强调省纸 | 按页计价、双面另配一套打折单价，脏参数还会静默落到最低价 | 改为**按纸张数计价**：单价只分黑白/彩色（分/张），双面把两页折成一张，奇数页最后一面照样占一张；报价、行金额、打印方案、改价上限全部走同一套公式 |
+| 2026-11-09 | 后端加进程后启动必死锁，日志连片 `Deadlock found when trying to get lock` | 每个进程启动都跑建表与迁移，互相抢 DDL 锁 | 建表与迁移放进 MySQL 命名锁（`GET_LOCK`，锁名带库名），独立连接取放、超时报明确错误；补两条用例锁住获取与释放 |
+| 2026-11-09 | 容器里点「载入示例论文」报 500，找不到 `scripts` 包 | `Dockerfile` 没拷脚本目录，`.dockerignore` 还把 `scripts/` 排除了 | 两处一起补，镜像里落到 `/app/scripts`，非 root 用户可读 |
+| 2026-11-09 | 取件码与老师说明长按没反应，想转给同学代取只能照着念 | 全工程没有一处调用剪贴板 | 订单卡片与详情页各加复制按钮（高 88rpx），复制成功给一句短提示 |
+| 2026-11-09 | 异常单只在「全部」里出现，学生有异常单得自己翻 | 「我的订单」分类缺异常这一类 | 补「异常」分类，传后端已有的 `abnormal` 状态值 |
+| 2026-11-09 | 点拍照弹出英文开发者对话框 `camera module was not added when packaging` | `manifest.json` 的 `app-plus.modules` 是空对象，包里没有相机能力 | 声明 `Camera` 模块；权限被拒时改说「需要相机权限才能拍照，请到系统设置里允许」。**声明要重新打包才生效，本轮无法真机验证** |
+| 2026-11-09 | 界面混进「服务端报价」「当前使用：学校共享」「仅使用设备标识与取件码」这类开发话 | 文案照实现术语直译 | 统一改成结果导向的说法：系统报价、学校提供的检查额度、只记录设备标识与取件码 |
+| 2026-11-09 | 仓库自带 25 条红灯（`pytest` 报 25 failed） | 金额类的期望值写的是旧计费模型；队列排序的用例写的是旧展示口径 | 金额类按纸张数计价重算期望值；队列用例改成「最新创建在前」（代码与函数说明本来就是这么定的）。现为 **458 passed / 1 skipped** |
 | 2026-10-25 | 换过文件的单在应用机慢于数据库时排到队首，而不是队尾 | 订单创建时间 `created_at` 取数据库 `CURRENT_TIMESTAMP`，重排队时间 `requeue_at` 取应用进程的 `datetime.now()`，两套时钟不同源 | `file_change_service.db_now()`：本模块写时间列一律读数据库时钟，队列排序只依赖一个时钟；补 `tests/test_file_change.py::test_应用时钟慢于数据库_换文件后仍排到队尾` 锁住语义 |
 | 2026-10-25 | 老师改价只挡负数，30 元误输成 300 元照样落库 | 只判断 `< 0` | `pricing.ensure_amount_allowed()`：单笔上限 1000 元 + 相对系统价 10 倍，且至少给 20 元浮动空间（小额单不至于被拦）；`complete_print` 与换文件确认价都接上，错误码 `40062` |
 | 2026-10-25 | 核销覆盖线上支付时间，对账口径错位 | `verify_pickup` 无条件写 `paid_at` | 只在 `paid_at` 为空时写入；补款金额照旧记 `PaymentLog` |
@@ -166,7 +176,7 @@ npm.cmd run dev:h5
 | 已支付订单学生仍可一键取消（无退款、无反向流水） | `STUDENT_CANCELLABLE` 含 `queuing` | **待产品口径**：收紧为「付了不能自取消」，或允许取消但走退款 + 反向流水 |
 | 并发支付时真实扣款在状态保护之外 | mock 支付看不出 | **待产品口径**：`SELECT ... FOR UPDATE` 行锁 或 客户端幂等键 |
 | `ai_reports` 缓存没有 `user_id` 维度 | 路由层 `ensure_files_owned_by` 已拦住跨用户路径 | 属纵深防御；改动面约 8 个文件（加列 + 幂等迁移 + 5 个 service 签名） |
-| `layout` 版式参数不进 `Order` 也不参与计费 | 前端会展示「省 21 张纸」，但付款按页数算 | **答辩易被追问**；改动要动计费模型，属口径问题 |
+| `layout` 版式参数不落 `Order` | 老师端看不到学生选的是不是 2 合 1 讲义 | 金额已按实际纸张数算，「省 21 张纸」与少付的钱对得上；要不要把版式落库供老师核对，属后续口径 |
 
 ---
 
@@ -197,7 +207,7 @@ npm.cmd run dev:h5
 ```powershell
 # 后端测试 + 静态检查（用虚拟环境里的 python；直接跑系统 python 也一样）
 cd backend
-.venv\Scripts\python.exe -m pytest -q      # 期望 453 passed, 1 skipped
+.venv\Scripts\python.exe -m pytest -q      # 期望 458 passed, 1 skipped
 .venv\Scripts\python.exe -m ruff check .   # 期望 All checks passed
 
 # 模型连通性
