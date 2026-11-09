@@ -23,7 +23,7 @@
       <view class="avatar">{{ initial }}</view>
       <view class="profile-main">
         <input v-model="nickname" class="nickname" maxlength="64" placeholder="设置昵称（非真实姓名）" />
-        <text class="device">仅使用设备标识与取件码，不收集学号信息</text>
+        <text class="device">只记录设备标识与取件码，不收集学号</text>
       </view>
       <button class="save" :disabled="saving" @click="saveNickname">保存</button>
     </view>
@@ -50,17 +50,19 @@
     </scroll-view>
 
     <view v-if="loading && orders.length === 0" class="card center">加载中…</view>
-    <view v-else-if="orders.length === 0" class="card center empty">还没有订单，去「下单」页上传论文试试</view>
+    <view v-else-if="orders.length === 0" class="card center empty">{{ emptyText }}</view>
 
     <view v-for="order in orders" :key="order.id" class="card order" @click="openDetail(order.id)">
       <view class="order-head">
         <text class="order-no">{{ order.order_no }}</text>
         <text class="status" :class="order.status">{{ order.status_label }}</text>
       </view>
-      <!-- 老师标异常时写的原因：以前列表里只有「异常」两个字，学生还得点进详情
-           才可能看到，多数人根本不会点进去。直接摆在列表上才解决得了问题。 -->
+      <!-- 老师标异常时写的原因直接摆在列表上：学生不点进详情也能看到问题出在哪 -->
       <view v-if="order.abnormal_reason" class="abnormal-reason">
-        <text class="abnormal-label">老师说明</text>
+        <view class="abnormal-head">
+          <text class="abnormal-label">老师说明</text>
+          <button class="copy-mini" @click.stop="copyTeacherNote(order.abnormal_reason)">复制</button>
+        </view>
         <text class="abnormal-text">{{ order.abnormal_reason }}</text>
       </view>
       <view class="order-body">
@@ -68,7 +70,10 @@
         <text class="amount">{{ formatMoney(order.amount_cents) }}</text>
       </view>
       <view class="order-meta">
-        <text class="pickup">取件码 {{ order.pickup_code }}</text>
+        <view class="pickup-line">
+          <text class="pickup">取件码 {{ order.pickup_code }}</text>
+          <button class="copy-mini" @click.stop="copyPickupCode(order.pickup_code)">复制</button>
+        </view>
         <text v-if="isActive(order)">前面 {{ order.queue_position }} 单 · 约 {{ order.estimated_minutes }} 分钟</text>
         <text v-else>{{ order.created_at }}</text>
       </view>
@@ -105,7 +110,7 @@
     </view>
 
     <!--
-      AI 密钥面板：保存 / 测试连通 / 清除并改用学校共享三个动作。
+      AI 密钥面板：保存 / 测试连通 / 清除并改用学校提供的检查额度三个动作。
       密钥只写本机存储，面板里任何地方都不回显完整密钥（只显示前 4 后 4）。
     -->
     <view v-if="keyPanelOpen" class="theme-mask" @click="closeKeyPanel">
@@ -132,7 +137,7 @@
             {{ keyBusy ? '处理中…' : '保存' }}
           </button>
           <button class="key-btn" :disabled="keyBusy" @click="testKey">测试连通</button>
-          <button class="key-btn ghost" :disabled="keyBusy" @click="clearKey">清除并改用学校共享</button>
+          <button class="key-btn ghost" :disabled="keyBusy" @click="clearKey">清除并改用学校提供的检查额度</button>
         </view>
       </view>
     </view>
@@ -145,6 +150,7 @@ import { computed, onUnmounted, ref } from 'vue'
 import { POLL_INTERVAL, STORAGE_KEYS } from '@/config'
 import { checkLlmKey, request } from '@/services/api'
 import { ensureLogin, getCurrentUser } from '@/services/auth'
+import { copyText } from '@/services/clipboard'
 import {
   LLM_KEY_NOTICE,
   clearLlmKey,
@@ -166,6 +172,7 @@ const tabs = [
   { label: '待支付', value: 'pending_pay' },
   { label: '排队中', value: 'queuing' },
   { label: '待取件', value: 'ready' },
+  { label: '异常', value: 'abnormal' },
   { label: '已完成', value: 'completed' },
 ]
 
@@ -176,6 +183,13 @@ const saving = ref(false)
 const nickname = ref('')
 
 const initial = computed(() => (nickname.value || '同').slice(0, 1))
+
+/** 空列表的提示：按当前分类说，别在「异常」里说「还没有订单」。 */
+const emptyText = computed(() => {
+  if (status.value === 'abnormal') return '当前没有异常订单'
+  if (status.value) return '这个分类下还没有订单，切到「全部」看看'
+  return '还没有订单，去「下单」页上传论文试试'
+})
 const { uiTheme, uiThemeClass, uiSchemeClass, changeUiTheme } = useUiTheme()
 
 /** 皮肤面板的三选一选项，选中项在面板里会标出来。 */
@@ -203,6 +217,16 @@ function chooseTheme(theme) {
 
 function isActive(order) {
   return order.status === 'queuing' || order.status === 'printing'
+}
+
+/* ---------- 复制：取件码与老师说明 ---------- */
+
+function copyPickupCode(code) {
+  copyText(code, '取件码')
+}
+
+function copyTeacherNote(reason) {
+  copyText(reason, '老师说明')
 }
 
 function formatMoney(cents) {
@@ -261,7 +285,7 @@ function saveKey() {
 
 /**
  * 测试连通：把输入框里的密钥（没输入就用存着的那把）发给 /api/ai/key-check。
- * 失败时把服务端给的原因原样告诉学生，并提示可以清除后改用学校共享。
+ * 失败时把服务端给的原因原样告诉学生，并提示可以清除后改用学校提供的检查额度。
  */
 async function testKey() {
   const typed = keyInput.value.trim()
@@ -288,14 +312,14 @@ async function testKey() {
   }
 }
 
-/** 清除：立刻回到学校共享密钥（状态行下一帧就变，不用退出重进）。 */
+/** 清除：立刻回到学校提供的检查额度（状态行下一帧就变，不用退出重进）。 */
 function clearKey() {
   const done = clearLlmKey()
   keyInput.value = ''
   refreshKeyState()
-  keyMessage.value = done ? '已清除，现在改用学校共享密钥' : '本地存储删除失败，请稍后重试'
+  keyMessage.value = done ? '已清除，现在改用学校提供的检查额度' : '本地存储删除失败，请稍后重试'
   keyMessageKind.value = done ? 'ok' : 'error'
-  notify(done ? '已改用学校共享密钥' : '清除失败，请稍后重试', done ? 'success' : 'info')
+  notify(done ? '已改用学校提供的检查额度' : '清除失败，请稍后重试', done ? 'success' : 'info')
 }
 
 /** 列表一行说清这份单要打什么：单文件给文件名，多文件给「N 个文件 · 共 X 页」。 */
@@ -883,12 +907,43 @@ function openDetail(id) {
   border-radius: 0 var(--zi-radius) var(--zi-radius) 0;
   background: var(--zi-warn-bg);
 }
+.abnormal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12rpx;
+}
 .abnormal-label {
   display: block;
   color: var(--zi-warn);
   font-size: 22rpx;
   font-weight: 800;
   letter-spacing: 1rpx;
+}
+
+/* 取件码和老师说明都要能复制给同学代取：按钮按指头大小做，别做成一行小字 */
+.copy-mini {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  min-width: 104rpx;
+  min-height: 88rpx;
+  margin: 0;
+  padding: 0 20rpx;
+  box-sizing: border-box;
+  border: 2rpx solid var(--zi-line-strong);
+  border-radius: var(--zi-pill-radius);
+  background: var(--zi-paper);
+  color: var(--zi-ink);
+  font-size: 28rpx;
+  font-weight: 800;
+  line-height: 1.2;
+}
+.abnormal-reason .copy-mini {
+  border-color: var(--zi-warn);
+  color: var(--zi-warn);
+  background: transparent;
 }
 .abnormal-text {
   display: block;
@@ -926,6 +981,11 @@ function openDetail(id) {
   color: var(--zi-ink);
   font-size: 26rpx;
   font-weight: 700;
+}
+.pickup-line {
+  display: flex;
+  align-items: center;
+  gap: 12rpx;
 }
 .order-actions {
   display: flex;

@@ -106,7 +106,7 @@
             <text class="k">换后页数</text>
             <text class="v">文档 {{ quoted.page_count }} 页 · 打印 {{ quoted.print_page_count }} 页</text>
           </view>
-          <text v-if="quoteError" class="quote-error">{{ quoteError }}（以老师确认后服务端重算为准）</text>
+          <text v-if="quoteError" class="quote-error">{{ quoteError }}（以老师确认后系统重算为准）</text>
           <view class="row"><text class="k">订单号</text><text class="v">{{ order.order_no }}（不变）</text></view>
 
           <textarea
@@ -239,7 +239,7 @@ async function refreshQuote() {
     if (seq !== quoteSeq) return
     // 拿不到报价时不给数字，只把服务端的话原样告诉学生
     quoted.value = null
-    quoteError.value = error.message || '服务端报价失败'
+    quoteError.value = error.message || '系统报价失败'
   }
 }
 

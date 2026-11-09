@@ -10,7 +10,10 @@ export function notify(message, type = 'info') {
     return
   }
   uni.showToast({
-    title: String(message).slice(0, 30),
+    // 60 字上限只是防止异常长的文案把提示条撑满整屏；原来的 30 字会把正常的
+    // 提示拦腰截断（例如「只支持 PDF、Word、PPT、Excel，当前选的是 .md」会丢掉最后的格式），
+    // 用户看到半句话反而不知道出了什么事。提示条本身会自动换行。
+    title: String(message).slice(0, 60),
     icon: type === 'success' ? 'success' : 'none',
     duration: 2200,
   })

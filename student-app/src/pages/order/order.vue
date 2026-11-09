@@ -9,12 +9,12 @@
 
     <!--
       学生自己的密钥不可用：把原因和出口说清楚。
-      不静默退回学校密钥——在学生自己点「清除并改用学校共享」之前，AI 请求仍带这把钥匙。
+      不静默退回学校提供的检查额度——在学生自己点「清除并改用学校提供的检查额度」之前，AI 请求仍带这把钥匙。
     -->
     <view v-if="keyError" class="card key-error-card">
       <text class="key-error-title">你的 AI 密钥不可用</text>
       <text class="key-error-text">{{ keyError }}</text>
-      <text class="key-error-hint">去「我的」→「AI 密钥」可以清除后改用学校共享密钥。</text>
+      <text class="key-error-hint">去「我的」→「AI 密钥」可以清除后改用学校提供的检查额度。</text>
     </view>
 
     <view class="card">
@@ -37,7 +37,14 @@
               <text class="file-name">
                 {{ files.length > 1 ? `${index + 1}. ` : '' }}{{ item.file_name }}
               </text>
-              <text class="file-meta">
+              <!--
+                读不出页数的原因直接写在卡片上：设了密码的文件，重试也不会好，
+                学生得知道下一步是「移除」它、去掉密码再传。
+              -->
+              <text v-if="item.pageError" class="file-error">
+                {{ item.pageError }}；点右侧「移除」，去掉密码后重新上传
+              </text>
+              <text v-else class="file-meta">
                 {{ item.page_count ? `${item.page_count} 页` : '读取页数中…' }}
                 <text v-if="item.size"> · {{ formatSize(item.size) }}</text>
               </text>
@@ -49,7 +56,7 @@
           </view>
           <!--
             多文件时每份文件单独设单双面、颜色、纸张、份数；
-            行金额与打印页数只从服务端报价取，页面不乘单价。
+            行金额与打印页数只从系统报价取，页面不乘单价。
           -->
           <view v-if="!singleFile" class="file-params">
             <view class="file-param">
@@ -87,11 +94,12 @@
               </view>
             </view>
             <view class="file-quote">
+              <!-- 读不出页数的那一份不会再出金额，这里不能一直挂着「读取中」 -->
               <text class="file-print-pages">
-                {{ lineOf(index) ? `打印 ${lineOf(index).print_pages} 页` : '打印页数读取中…' }}
+                {{ lineOf(index) ? `打印 ${lineOf(index).print_pages} 页` : (item.pageError ? '无法读取页数' : '打印页数读取中…') }}
               </text>
               <text class="file-amount">
-                {{ lineOf(index) ? formatMoney(lineOf(index).amount_cents) : '金额读取中…' }}
+                {{ lineOf(index) ? formatMoney(lineOf(index).amount_cents) : (item.pageError ? '—' : '金额读取中…') }}
               </text>
             </view>
           </view>
@@ -103,7 +111,7 @@
         <text class="preparing-cancel" @click="cancelUpload">取消上传</text>
       </view>
       <view v-else-if="!files.length" class="empty">
-        支持 PDF / Word / PPT / Excel，单个文件不超过 50MB；一次可选多份，合成一单只付一次
+        支持 PDF / Word / PPT / Excel，单个文件不超过 50MB；可连续添加多份，合成一单只付一次
       </view>
 
       <!-- 图片识别已收敛到首页「文档转换」，下单页只保留文档入口，避免两个地方做同一件事 -->
@@ -123,8 +131,8 @@
       <text class="ai-entry-desc">
         {{ aiChecked ? '已按体检结果更新打印方案，也可以重新体检。' : '检查结构、参考文献与版式，并可选择生成修复副本。不做体检也能直接下单。' }}
       </text>
-      <!-- 学生要知道自己在用哪把钥匙：学校共享还是自己填的那把 -->
-      <text class="ai-key-line" :class="{ own: keyOwn }">当前使用：{{ keyUsage }}</text>
+      <!-- 学生要知道自己在用哪把钥匙：学校提供的检查额度还是自己填的那把 -->
+      <text class="ai-key-line" :class="{ own: keyOwn }">当前使用：{{ keyUsageText }}</text>
       <!-- 原来这里还有一个「跳过体检，直接下单」，与底部的确认下单重复：
            两个入口做同一件事，而且这个还带 !plan 的禁用条件，
            方案没加载出来时按钮是灰的，更容易让人以为坏了。
@@ -238,7 +246,7 @@
         </view>
       </template>
       <view v-else class="multi-tip">
-        <text class="multi-tip-text">多文件逐份设置：每份的单双面、颜色、纸张、份数在上面文件清单里单独改，行金额与整单金额按服务端报价。</text>
+        <text class="multi-tip-text">多文件逐份设置：每份的单双面、颜色、纸张、份数在上面文件清单里单独改，行金额与整单金额按系统报价。</text>
         <view class="opt-row">
           <text class="opt-label">版式</text>
           <view class="seg">
@@ -267,7 +275,7 @@
         </view>
       </view>
       <text v-if="quoteError" class="quote-error">
-        服务端报价失败：{{ quoteError }}；上面显示的是上一次服务端算出的金额，点下面「重新报价」或改参数都会重新请求。
+        系统报价失败：{{ quoteError }}；上面显示的是上一次系统算出的金额，点下面「重新报价」或改参数都会重新请求。
       </text>
       <!--
         自动重试用完后的手动出口：不加这个按钮，用户只能改参数才能重新报价，
@@ -292,11 +300,11 @@
       <!--
         收费按文档页数算，这里只是「预计张数」，不能写成「省多少张」当收费承诺：
         学生把省张数当成该收的钱，实际收费按页数算，对不上就会投诉。
-        金额仍只取服务端报价（quoteAmount），页面不乘单价。
+        金额仍只取系统报价（quoteAmount），页面不乘单价。
       -->
       <view v-if="singleFile" class="savings">
         <text class="savings-tip">纸张 {{ plan.original_sheets }} → {{ plan.sheets_needed }} 张是预计张数，实际以老师确认为准</text>
-        <text class="money">服务端报价 {{ formatMoney(quoteAmount) }}</text>
+        <text class="money">系统报价 {{ formatMoney(quoteAmount) }}</text>
       </view>
       <view v-else class="savings">
         <text>{{ files.length }} 个文件 · 文档 {{ docPages }} 页 · 打印 {{ printPages === null ? '—' : printPages }} 页</text>
@@ -423,15 +431,28 @@ const layouts = [
 ]
 const created = ref(null)
 
+/**
+ * 收掉上一单的「下单成功」卡片。
+ *
+ * 成功卡片里带着取件码，同时它也是「确认下单」的禁用条件。
+ * 学生接着选文件、改打印参数，就是在开新的一单：卡片留着，按钮就是灰的。
+ * 上一单的取件码在「我的」里随时能看到，这里不留副本。
+ */
+function dropCreatedOrder() {
+  created.value = null
+}
+
 /** 只有一份文件时才有 AI 体检与修复：多文件的体检口径产品还没定。 */
 const singleFile = computed(() => files.value.length === 1)
 
 /* ---------- 学生自己的密钥：只影响提示，不影响请求（请求头由 services/api.js 统一带） ---------- */
 
-/** 「当前使用：学校共享 / 我的密钥」那一行。 */
+/** 状态行读的那一行：「学校提供的检查额度」或「我的密钥」。 */
 const keyUsage = ref(llmKeyUsageLabel())
 const keyOwn = computed(() => keyUsage.value === '我的密钥')
-/** 密钥不可用的原因：非空时页面顶部给一条横幅，不静默退回学校密钥。 */
+/** 状态行后面那句话：学校那把钥匙用的是学校提供的检查额度。 */
+const keyUsageText = computed(() => (keyOwn.value ? '我的密钥' : '学校提供的检查额度'))
+/** 密钥不可用的原因：非空时页面顶部给一条横幅，不静默退回学校提供的检查额度。 */
 const keyError = ref('')
 
 /**
@@ -497,6 +518,7 @@ function applyReorderDraft(draft) {
     file_name: item.file_name || '文档',
     size: 0,
     page_count: Number(item.page_count) || 0,
+    pageError: '',
     print_side: Number(item.print_side) || 2,
     color_mode: Number(item.color_mode) || 0,
     paper_size: item.paper_size || 'A4',
@@ -536,7 +558,7 @@ onShow(() => {
 function reportAiError(error) {
   if (isLlmKeyFailure(error)) {
     keyError.value = llmKeyFailureText(error)
-    notify('你的密钥不可用，请到「我的」→「AI 密钥」清除后改用学校共享')
+    notify('你的密钥不可用，请到「我的」→「AI 密钥」清除后改用学校提供的检查额度')
     return
   }
   notifyError(error)
@@ -554,7 +576,7 @@ const primaryFile = computed(() => files.value[0] || null)
 const paperSizes = PAPER_SIZES
 
 /**
- * 服务端报价结果（`{files, page_count, print_page_count, amount_cents}`）。
+ * 系统报价结果（`{files, page_count, print_page_count, amount_cents}`）。
  *
  * 行金额、文档页数、打印页数、整单总额全部取这里的数，页面不做任何乘法。
  */
@@ -602,7 +624,7 @@ const pageCountHint = computed(() => {
   const name = (target && target.file_name) || ''
   const ext = name.split('.').pop().toLowerCase()
   if (ext === 'xls') {
-    return '这是 .xls 老格式，要先转成新格式才能算页数，通常要一分半；另存为 .xlsx 可省约 30 秒'
+    return '这是 .xls 老格式，要先转成新格式才能算页数，老格式可能要多等一会儿；另存为 .xlsx 会快一些'
   }
   if (ext === 'xlsx') {
     return '表格要先渲染成 PDF 才能数清页数，宽表格可能要一两分钟，请不要删掉文件'
@@ -671,7 +693,7 @@ function scheduleQuote() {
   }, 300)
 }
 
-/** 调服务端报价；失败时保留上一次结果并记下原因，不静默显示错误金额。 */
+/** 调系统报价；失败时保留上一次结果并记下原因，不静默显示错误金额。 */
 async function refreshQuote(retry = 0) {
   if (!files.value.length) {
     quote.value = null
@@ -682,8 +704,9 @@ async function refreshQuote(retry = 0) {
   // 按钮会一直是灰的，用户完全不知道在等什么。也要补一句后端还会按真实页数核对，
   // 前端这个 1 页兜底不会真的少付钱。
   if (files.value.some((item) => !(Number(item.page_count) >= 1))) {
+    const blocked = files.value.find((item) => item.pageError)
     quote.value = null
-    quoteError.value = pageCountHint.value
+    quoteError.value = blocked ? blocked.pageError : pageCountHint.value
     quoting.value = false
     return
   }
@@ -797,14 +820,27 @@ function pushFile(data) {
     file_name: data.file_name || '文档',
     size: Number(data.size) || 0,
     page_count: 0,
+    pageError: '',
     ...defaultFileParams(),
   })
+  // 清单里多了新的一份，就是新的一单：上一单的成功卡片不能留在这里
+  dropCreatedOrder()
   return true
 }
 
+/**
+ * 后端遇到设了密码的文件时，页数接口与方案接口都回这个业务码。
+ *
+ * 判断只认码：文案是后端写的，改一个错别字前端就认不出来了。
+ */
+const ENCRYPTED_FILE_CODE = 40074
+/** 码 40074 的默认说法：后端没带 message 时才用它。 */
+const ENCRYPTED_FILE_MESSAGE = '这个文件设了密码，请先去掉密码再上传'
+
 /** 逐份补页数：页数来自 page-count 接口，不调模型。 */
 async function fillPageCounts() {
-  const pending = files.value.filter((item) => !item.page_count)
+  // 已经读出「为什么读不到页数」的那一份不再重请求：设了密码的文件重跑也是同一个结果
+  const pending = files.value.filter((item) => !item.page_count && !item.pageError)
   if (!pending.length) return
 
   // 并行而不是逐个 await：每个文件第一次解析都要几十秒（LibreOffice 转换），
@@ -827,6 +863,10 @@ async function fillPageCounts() {
         item.page_count = pages >= 1 ? Math.floor(pages) : 0
       } catch (error) {
         if (!files.value.some((row) => row.uid === item.uid)) return
+        if (Number(error.code) === ENCRYPTED_FILE_CODE) {
+          item.pageError = error.message || ENCRYPTED_FILE_MESSAGE
+          return
+        }
         // 单份失败不影响其它份，这条保持 0，报价会把它指出来
         notifyError(error)
       }
@@ -836,6 +876,8 @@ async function fillPageCounts() {
 
 /** 清单变了：体检结果作废，重新按当前参数出基础方案，并重新报价。 */
 async function afterFilesChanged() {
+  // 清单变了就是新的一单，上一单的成功卡片先收掉
+  dropCreatedOrder()
   resetCheck()
   if (files.value.length === 0) {
     plan.value = null
@@ -846,6 +888,14 @@ async function afterFilesChanged() {
   }
   await fillPageCounts()
   stepIndex.value = 1
+  // 有文件读不出页数（设了密码）：方案与报价都算不出来，不必再发请求，
+  // 卡片上那句原话就是学生现在要处理的事
+  if (files.value.some((item) => item.pageError)) {
+    plan.value = null
+    quote.value = null
+    quoteError.value = ''
+    return
+  }
   await loadPlan(false)
   scheduleQuote()
 }
@@ -862,10 +912,10 @@ async function pickDocuments() {
       return
     }
     picked = await chooseDocuments(Math.min(MAX_FILES_PER_PICK, remaining))
-    // .xls 老格式要多跑一次 LibreOffice 转换（实测约 30 秒），当场说清有更快的做法。
-    // 只提示、不拦：用户手上可能只有 .xls，照样得能传。
+    // .xls 老格式要多跑一次 LibreOffice 转换，实测不到 2 秒；
+    // 提醒一句就够，别说成半分钟。只提示、不拦：用户手上可能只有 .xls。
     if (picked.some((item) => /\.xls$/i.test(String((item && item.name) || '')))) {
-      notify('检测到 .xls 老格式，解析会多花约 30 秒；建议另存为 .xlsx 后再上传')
+      notify('检测到 .xls 文件，老格式可能要多等一会儿；建议另存为 .xlsx 再上传')
     }
   } catch (error) {
     // 用户在系统选择器里按了返回，notifyError 会静默处理
@@ -1070,6 +1120,8 @@ function choose(field, value) {
   if (field === 'print_side') printSide.value = value
   if (field === 'color_mode') colorMode.value = value
   if (field === 'layout') layout.value = value
+  // 改了打印参数就是在开新的一单：上一单的成功卡片与它的下单锁一起收掉
+  dropCreatedOrder()
   // 用户已经明确选过了，方案回来时不能再拿推荐值覆盖他的选择
   schedulePlan(planUsesAi.value)
   // 单文件的金额靠订单级参数算，改完立刻重算报价，不等方案
@@ -1081,6 +1133,7 @@ function setFileParam(index, field, value) {
   const item = files.value[index]
   if (!item || item[field] === value) return
   item[field] = value
+  dropCreatedOrder()
   scheduleQuote()
 }
 
@@ -1091,6 +1144,7 @@ function changeFileCopies(index, delta) {
   const next = Math.max(1, Math.min(50, (Number(item.copies) || 1) + delta))
   if (next === item.copies) return
   item.copies = next
+  dropCreatedOrder()
   scheduleQuote()
 }
 
@@ -1149,6 +1203,7 @@ async function changeCopies(delta) {
   const next = Math.max(1, Math.min(50, copies.value + delta))
   if (next === copies.value) return
   copies.value = next
+  dropCreatedOrder()
   // 同样是用户主动改的参数，别让推荐值把它覆盖；连续点 +/- 也合并成一次请求
   schedulePlan(planUsesAi.value)
   scheduleQuote()
@@ -1327,7 +1382,7 @@ onUnmounted(() => {
 .ai-entry {
   border: 2rpx dashed var(--zi-line-strong);
 }
-/* 「当前使用：学校共享 / 我的密钥」一行小字 */
+/* 「当前使用：学校提供的检查额度 / 我的密钥」一行小字 */
 .ai-key-line {
   display: block;
   margin-top: 10rpx;
@@ -1522,6 +1577,15 @@ onUnmounted(() => {
   margin-top: 4rpx;
   color: var(--zi-muted);
   font-size: 22rpx;
+}
+/* 读不出页数的原因（例如文件设了密码）：用告警色，与「读取中」区分开 */
+.file-error {
+  display: block;
+  margin-top: 4rpx;
+  color: var(--zi-danger);
+  font-size: 22rpx;
+  font-weight: 700;
+  line-height: 1.5;
 }
 .file-remove {
   display: flex;
@@ -1775,7 +1839,7 @@ onUnmounted(() => {
   font-size: 24rpx;
   line-height: 1.6;
 }
-/* 服务端报价汇总：文档页数 / 打印页数 / 应付金额 */
+/* 系统报价汇总：文档页数 / 打印页数 / 应付金额 */
 .quote-summary {
   margin-top: 18rpx;
   padding: 16rpx 18rpx;
