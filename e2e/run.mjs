@@ -2564,7 +2564,8 @@ async function runPriceAndRefundPhase({ student, teacher, viewport, step }) {
     // 不能靠双面来凑这个差：双面把两页折成一张，2 页和 1 页的张数都是 1，价格一样。
     await pickFile(student, '选择文档', FIXTURES.v2)
     await waitBody(student, '3. 打印方案', 90000)
-    await clickFileOption(student, 1, '单面')
+    // 单文件时单双面开关在「打印方案」卡片里，不在文件行上
+    await clickByText(student, '单面')
     await sleep(2000)
     await waitBody(student, '确认下单', 60000)
     await clickByText(student, '确认下单')
