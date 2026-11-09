@@ -2559,9 +2559,13 @@ async function runPriceAndRefundPhase({ student, teacher, viewport, step }) {
       timeout: 60000,
     })
     await waitBody(student, '选择要打印的文件', 90000)
-    // 用 2 页的 v2：换成 1 页的 v1 后系统价会降，确认价才有夹在中间的空间
+    // 用 2 页的 v2 并选单面：2 张纸；换成 1 页的 v1 后只剩 1 张，系统价才会降，
+    // 确认价才有夹在「换后系统价」与「已付」之间的空间。
+    // 不能靠双面来凑这个差：双面把两页折成一张，2 页和 1 页的张数都是 1，价格一样。
     await pickFile(student, '选择文档', FIXTURES.v2)
     await waitBody(student, '3. 打印方案', 90000)
+    await clickFileOption(student, 1, '单面')
+    await sleep(2000)
     await waitBody(student, '确认下单', 60000)
     await clickByText(student, '确认下单')
     await waitBody(student, '下单成功', 60000)
