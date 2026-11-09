@@ -3920,7 +3920,7 @@ async function runCopyAndRetryPhase({ student, teacher, viewport, problems, step
         return (target.textContent || '').trim()
       })
       if (!switched) throw new Error('下单页找不到可切换的颜色选项')
-      await waitBody(student, '服务端报价失败', 90000)
+      await waitBody(student, '系统报价失败', 90000)
       await waitBody(student, '重新报价', 30000)
       if (expected.aborts !== expected.wanted) {
         throw new Error(
@@ -3948,7 +3948,7 @@ async function runCopyAndRetryPhase({ student, teacher, viewport, problems, step
 
     // 点手动重试：立刻重新请求并解锁
     await clickByText(student, '重新报价')
-    await waitGone(student, '服务端报价失败', 30000)
+    await waitGone(student, '系统报价失败', 30000)
     await waitGone(student, '重新报价', 30000)
     await sleep(500)
     retryPayload = quotes.items.length
@@ -4127,7 +4127,7 @@ async function runStudentKeyPhase({ student, step }) {
     clearedToShared: false,
   }
 
-  await step('密钥：「我的」页打开 AI 密钥面板，无效密钥给出可读原因，清除后回到学校共享', async () => {
+  await step('密钥：「我的」页打开 AI 密钥面板，无效密钥给出可读原因，清除后回到学校提供的检查额度', async () => {
     await gotoFresh(student, `${STUDENT_URL}/#/pages/mine/mine`, {
       waitUntil: 'domcontentloaded',
       timeout: 60000,
@@ -4153,9 +4153,9 @@ async function runStudentKeyPhase({ student, step }) {
     }
     result.testReason = failureText.slice(0, 300)
 
-    // 2) 清除后必须回到「学校共享」
+    // 2) 清除后必须回到「学校提供的检查额度」
     await clickByText(student, '清除', KEY_PANEL_CLICKABLE)
-    await waitBody(student, '学校共享', 30000)
+    await waitBody(student, '学校提供的检查额度', 30000)
     result.clearedToShared = true
   })
 
@@ -4278,10 +4278,10 @@ async function runStudentKeyPhase({ student, step }) {
     result.testMessage = (await visibleKeyPanelText(student)).slice(0, 200)
 
     // 5) 收尾：清掉密钥，后面还有步骤，别让它们带着学生密钥跑
-    await clickByText(student, '清除并改用学校共享', KEY_PANEL_CLICKABLE)
-    await waitKeyPanelText(student, '学校共享', 30000)
+    await clickByText(student, '清除并改用学校提供的检查额度', KEY_PANEL_CLICKABLE)
+    await waitKeyPanelText(student, '学校提供的检查额度', 30000)
     if ((await storedLocalText(student)).includes(key)) {
-      throw new Error('点「清除并改用学校共享」后本机存储里还留着这把密钥')
+      throw new Error('点「清除并改用学校提供的检查额度」后本机存储里还留着这把密钥')
     }
     if ((await student.evaluate(() => document.body.innerText || '')).includes(key)) {
       throw new Error('清除后页面上仍然出现了密钥明文')
