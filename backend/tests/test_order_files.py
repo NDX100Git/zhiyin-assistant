@@ -184,7 +184,8 @@ def test_单文件旧写法仍可用且返回一份文件(client):
     assert body["code"] == 0, body
     data = body["data"]
     assert data["page_count"] == 42
-    assert data["amount_cents"] == 630
+    # 42 页双面 = 21 张 × 15 分 = 315 分
+    assert data["amount_cents"] == 315
     assert len(data["files"]) == 1
     assert data["files"][0]["file_index"] == 1
     assert data["files"][0]["file_key"] == key
@@ -203,14 +204,14 @@ def test_多文件下单按总页数计费且一单一码(client, db_session):
     files = [_file_item("正文.pdf", 10), _file_item("附录.pdf", 20), _file_item("图册.pdf", 5)]
     order = create_order(client, headers, files)
 
-    # 35 页 × 15 分 = 525 分；一次下单、一个取件码
+    # 按张计价：10 页→5 张、20 页→10 张、5 页→3 张，共 18 张 × 15 分 = 270 分
     assert order["page_count"] == 35
-    assert order["amount_cents"] == 525
+    assert order["amount_cents"] == 270
     assert order["status"] == "pending_pay"
     assert order["pickup_code"].count("-") == 2
     assert [item["file_index"] for item in order["files"]] == [1, 2, 3]
     assert [item["page_count"] for item in order["files"]] == [10, 20, 5]
-    assert [item["amount_cents"] for item in order["files"]] == [150, 300, 75]
+    assert [item["amount_cents"] for item in order["files"]] == [75, 150, 45]
 
     stored = list(
         db_session.execute(
@@ -256,7 +257,7 @@ def test_逐文件换文件只改对应文件并重算整单(client, db_session)
         headers,
         [_file_item("正文.pdf", 2), _file_item("附录.pdf", 3), _file_item("图册.pdf", 5)],
     )
-    assert order["amount_cents"] == 150
+    assert order["amount_cents"] == 90
     pay_order(client, headers, order["id"])
 
     pending = replace_file(
@@ -266,23 +267,23 @@ def test_逐文件换文件只改对应文件并重算整单(client, db_session)
     assert pending["code"] == 0, pending
     data = pending["data"]
     assert data["applied"] is False
-    # 待确认期间订单本身不变
+    # 待确认期间订单本身不变（2+3+5 页双面 = 1+2+3 张 × 15 分 = 90 分）
     assert data["page_count"] == 10
-    assert data["amount_cents"] == 150
+    assert data["amount_cents"] == 90
     change = data["file_change"]
     assert change["file_index"] == 2
     assert change["old_file_page_count"] == 3
     assert change["new_file_page_count"] == 4
     assert change["old_page_count"] == 10
     assert change["new_page_count"] == 11
-    assert change["new_amount_cents"] == 165
+    assert change["new_amount_cents"] == 90
 
     approved = confirm(client, admin, order["id"])
     assert approved["code"] == 0, approved
     view = approved["data"]["order"]
     assert view["status"] == "queuing"
     assert view["page_count"] == 11
-    assert view["amount_cents"] == 165
+    assert view["amount_cents"] == 90
     assert view["requeue_at"] is not None
     assert view["files"][1]["file_index"] == 2
     assert view["files"][1]["file_name"] == "新附录.pdf"
@@ -319,7 +320,7 @@ def test_逐文件换文件只改对应文件并重算整单(client, db_session)
     ).scalar_one()
     assert change_row.status == CHANGE_APPROVED
     assert change_row.file_index == 2
-    assert change_row.final_amount_cents == 165
+    assert change_row.final_amount_cents == 90
 
 
 def test_多文件订单老师队列显示文件清单与待确认文件(client):
@@ -626,15 +627,15 @@ def test_逐份参数不同时各自算行金额与打印页数(client):
     files = [
         # 2 页 × 单面黑白 15 分 × 3 份 = 90 分，打印 6 页
         _params("正文.pdf", 2, print_side=1, color_mode=0, paper_size="A4", copies=3),
-        # 3 页 × 双面彩色 80 分 × 2 份 = 480 分，打印 6 页
+        # 3 页双面 = 2 张 × 彩色 80 分 × 2 份 = 320 分，打印 6 页
         _params("图册.pdf", 3, print_side=2, color_mode=1, paper_size="A3", copies=2),
-        # 不传逐份参数：继承订单级（双面黑白 A4 × 1 份）= 5 × 15 = 75 分
+        # 不传逐份参数：继承订单级（双面黑白 A4 × 1 份）= 3 张 × 15 = 45 分
         _file_item("附录.pdf", 5),
     ]
     order = create_order(client, headers, files)
 
-    assert [item["amount_cents"] for item in order["files"]] == [90, 480, 75]
-    assert order["amount_cents"] == 645
+    assert [item["amount_cents"] for item in order["files"]] == [90, 320, 45]
+    assert order["amount_cents"] == 455
     assert [item["print_pages"] for item in order["files"]] == [6, 6, 5]
     assert order["print_page_count"] == 17
     # 订单 page_count 仍只是文档页数之和
@@ -647,7 +648,7 @@ def test_逐份参数不同时各自算行金额与打印页数(client):
 
 
 def test_文档页数与打印页数口径分开(client, db_session):
-    """一份文件 4 页 5 份：文档页数 4，打印页数 20，金额按 4 × 5 份算。"""
+    """一份文件 4 页 5 份：文档页数 4，打印页数 20，金额按 4 页双面=2 张 × 5 份算。"""
     headers = student_headers(client, "multi-print-pages")
     order = create_order(
         client, headers, [_params("讲义.pdf", 4, copies=5)]
@@ -658,7 +659,7 @@ def test_文档页数与打印页数口径分开(client, db_session):
     assert order["files"][0]["page_count"] == 4
     assert order["files"][0]["print_pages"] == 20
     assert order["files"][0]["copies"] == 5
-    assert order["amount_cents"] == 300
+    assert order["amount_cents"] == 150
 
     stored = db_session.execute(
         select(OrderFile).where(OrderFile.order_id == order["id"])
@@ -716,8 +717,9 @@ def test_换第二份只改第二份的参数与行金额(client, db_session):
         _params("附录.pdf", 5, print_side=2, color_mode=0, paper_size="B5", copies=1),
     ]
     order = create_order(client, headers, files)
-    assert [item["amount_cents"] for item in order["files"]] == [90, 480, 75]
-    assert order["amount_cents"] == 645
+    # 2 页单面 = 2 张×15×3=90；3 页双面 = 2 张×80×2=320；5 页双面 = 3 张×15×1=45
+    assert [item["amount_cents"] for item in order["files"]] == [90, 320, 45]
+    assert order["amount_cents"] == 455
     assert order["print_page_count"] == 17
     pay_order(client, headers, order["id"])
 
@@ -730,10 +732,10 @@ def test_换第二份只改第二份的参数与行金额(client, db_session):
     assert change["old_file_page_count"] == 3
     assert change["new_file_page_count"] == 4
     assert (change["old_file_print_pages"], change["new_file_print_pages"]) == (6, 8)
-    assert change["old_file_amount_cents"] == 480
-    assert change["new_file_amount_cents"] == 640
-    # 整单：90 + 640 + 75
-    assert change["new_amount_cents"] == 805
+    assert change["old_file_amount_cents"] == 320
+    assert change["new_file_amount_cents"] == 320
+    # 整单：90 + 320 + 45
+    assert change["new_amount_cents"] == 455
 
     approved = confirm(client, admin, order["id"])
     assert approved["code"] == 0, approved
@@ -755,11 +757,11 @@ def test_换第二份只改第二份的参数与行金额(client, db_session):
         "B5",
         1,
     )
-    assert third["amount_cents"] == 75
+    assert third["amount_cents"] == 45
     assert third["print_pages"] == 5
     # 第 2 份只有页数变了，参数继续沿用原值
     assert second["page_count"] == 4
-    assert second["amount_cents"] == 640
+    assert second["amount_cents"] == 320
     assert second["print_pages"] == 8
     assert (second["print_side"], second["color_mode"], second["paper_size"], second["copies"]) == (
         2,
@@ -769,11 +771,11 @@ def test_换第二份只改第二份的参数与行金额(client, db_session):
     )
     assert view["page_count"] == 11
     assert view["print_page_count"] == 6 + 8 + 5
-    assert view["amount_cents"] == 805
+    assert view["amount_cents"] == 455
 
     order_row = db_session.get(Order, order["id"])
     assert (order_row.page_count, order_row.print_page_count) == (11, 19)
-    assert order_row.amount_cents == 805
+    assert order_row.amount_cents == 455
     stored = {
         row.file_index: row
         for row in db_session.execute(
@@ -781,8 +783,8 @@ def test_换第二份只改第二份的参数与行金额(client, db_session):
         ).scalars()
     }
     assert (stored[1].copies, stored[1].print_pages, stored[1].amount_cents) == (3, 6, 90)
-    assert (stored[2].copies, stored[2].print_pages, stored[2].amount_cents) == (2, 8, 640)
-    assert (stored[3].copies, stored[3].print_pages, stored[3].amount_cents) == (1, 5, 75)
+    assert (stored[2].copies, stored[2].print_pages, stored[2].amount_cents) == (2, 8, 320)
+    assert (stored[3].copies, stored[3].print_pages, stored[3].amount_cents) == (1, 5, 45)
 
 
 def test_老师端报价与队列回显逐份参数(client):
@@ -801,10 +803,11 @@ def test_老师端报价与队列回显逐份参数(client):
     assert [item["print_pages"] for item in row["files"]] == [4, 3]
     assert [item["copies"] for item in row["files"]] == [2, 1]
     assert row["print_page_count"] == 7
-    assert row["amount_cents"] == 60 + 240
+    # 2 页单面黑白 = 2 张×15×2 份 = 60；3 页双面彩色 = 2 张×80×1 份 = 160
+    assert row["amount_cents"] == 60 + 160
 
     quote = client.get(f"/api/admin/order/{order['id']}/quote", headers=admin).json()["data"]
-    assert quote["system_amount_cents"] == 300
+    assert quote["system_amount_cents"] == 220
 
 
 def test_迁移补齐逐份参数与打印页数且可重复执行(db_session, engine):
@@ -935,7 +938,7 @@ def test_报价逐份行金额与三种合计(client):
     files = [
         # 2 页 × 单面黑白 15 分 × 3 份 = 90 分，打印 6 页
         _params("正文.pdf", 2, print_side=1, color_mode=0, paper_size="A4", copies=3),
-        # 3 页 × 双面彩色 80 分 × 2 份 = 480 分，打印 6 页
+        # 3 页双面 = 2 张 × 彩色 80 分 × 2 份 = 320 分，打印 6 页
         _params("图册.pdf", 3, print_side=2, color_mode=1, paper_size="B5", copies=2),
     ]
     for item in files:
@@ -946,7 +949,7 @@ def test_报价逐份行金额与三种合计(client):
     data = body["data"]
 
     assert [item["file_index"] for item in data["files"]] == [1, 2]
-    assert [item["amount_cents"] for item in data["files"]] == [90, 480]
+    assert [item["amount_cents"] for item in data["files"]] == [90, 320]
     assert [item["print_pages"] for item in data["files"]] == [6, 6]
     assert [
         (item["page_count"], item["print_side"], item["color_mode"], item["paper_size"],
@@ -955,7 +958,7 @@ def test_报价逐份行金额与三种合计(client):
     ] == [(2, 1, 0, "A4", 3), (3, 2, 1, "B5", 2)]
     assert data["page_count"] == 5
     assert data["print_page_count"] == 12
-    assert data["amount_cents"] == 570
+    assert data["amount_cents"] == 410
     # 报价项与订单文件项是同一套键名，前端用一套归一化逻辑
     from app.services.order_file_service import FILE_VIEW_KEYS
 
@@ -1078,7 +1081,7 @@ def test_报价不落库(client, db_session):
     db_session.expire_all()
     assert counts() == before
     # 报价确实算出了数：不是“什么都没做所以没写”
-    assert body["data"]["amount_cents"] == 570
+    assert body["data"]["amount_cents"] == 410
 
 
 def test_报价需要登录(client):

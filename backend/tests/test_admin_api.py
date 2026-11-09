@@ -51,7 +51,7 @@ def _make_order(db_session, status: str = "queuing", pickup_code: str | None = N
         color_mode=0,
         copies=1,
         paper_size="A4",
-        amount_cents=630,
+        amount_cents=315,
         paid=paid,
         file_key=f"files/2026/10/{index:032x}.pdf",
         file_name="毕业论文.pdf",
@@ -102,16 +102,20 @@ def test_未登录访问管理接口被拒(client):
     assert client.get("/api/admin/queue").json()["code"] == 40100
 
 
-def test_队列按订单号排序且支持筛选与搜索(client, db_session):
+def test_队列按最新创建在前且支持筛选与搜索(client, db_session):
+    """接单列表的顺序是「刚来的单在最前」，与排队位次是两件事。
+
+    老师接单时最关心刚提交的单；「排队第几位」由 batch_wait_info 按真实队列口径
+    单独算，不吃这里的展示顺序。订单号随创建递增，所以按订单号倒序就等于最新在前。
+    """
     token = admin_token(client)
     _make_order(db_session, status="queuing", pickup_code="A-01")
     _make_order(db_session, status="ready", pickup_code="B-12")
 
     all_orders = client.get("/api/admin/queue", headers=auth(token)).json()["data"]
     assert all_orders["total"] == 2
-    assert [item["order_no"] for item in all_orders["items"]] == sorted(
-        item["order_no"] for item in all_orders["items"]
-    )
+    order_nos = [item["order_no"] for item in all_orders["items"]]
+    assert order_nos == sorted(order_nos, reverse=True)
 
     queuing = client.get(
         "/api/admin/queue", params={"status": "queuing"}, headers=auth(token)
@@ -180,7 +184,8 @@ def test_开始打印然后完成打印(client, db_session, test_storage):
     done = client.post(f"/api/admin/order/{order.id}/complete", headers=auth(token)).json()
     assert done["code"] == 0, done
     assert done["data"]["order"]["status"] == "ready"
-    assert done["data"]["system_amount_cents"] == 630
+    # 42 页双面黑白 = 21 张 × 15 分 = 315 分
+    assert done["data"]["system_amount_cents"] == 315
     assert done["data"]["price_changed"] is False
 
     logs = list(
@@ -213,14 +218,14 @@ def test_老师改价写入操作日志(client, db_session):
         db_session.execute(select(PrintLog).where(PrintLog.order_id == order.id)).scalars()
     )
     assert any("老师改价" in (log.note or "") for log in logs)
-    assert any("630" in (log.note or "") and "700" in (log.note or "") for log in logs)
+    assert any("315" in (log.note or "") and "700" in (log.note or "") for log in logs)
 
 
 def test_不传金额时沿用成交价不被系统价覆盖(client, db_session):
     """换文件流程里老师确认的价格，不能被系统重算价无声抹掉。"""
     token = admin_token(client)
     order = _make_order(db_session, status="printing")
-    # 模拟换文件确认后落库的成交价：下单 630，老师确认改到 800
+    # 模拟换文件确认后落库的成交价：下单 315，老师确认改到 800
     order.amount_cents = 800
     db_session.commit()
 
@@ -229,7 +234,7 @@ def test_不传金额时沿用成交价不被系统价覆盖(client, db_session)
     ).json()
 
     assert body["code"] == 0, body
-    assert body["data"]["system_amount_cents"] == 630  # 系统价照常返回，只供参考
+    assert body["data"]["system_amount_cents"] == 315  # 系统价照常返回，只供参考
     assert body["data"]["amount_cents"] == 800  # 实收沿用成交价
     assert body["data"]["price_changed"] is True
 
@@ -291,14 +296,14 @@ def test_核销取件并现场收款(client, db_session):
     )
     assert len(payments) == 1
     assert payments[0].method == "onsite"
-    assert payments[0].amount_cents == 630
+    assert payments[0].amount_cents == 315
 
 
 def test_已在线支付订单核销时不重复记流水(client, db_session):
     token = admin_token(client)
     order = _make_order(db_session, status="ready", paid=1, pickup_code="D-08")
     # 已支付订单应当有一条足额支付流水（核销只补差额，不重复记账）
-    db_session.add(PaymentLog(order_id=order.id, amount_cents=630, method="mock", operator="student"))
+    db_session.add(PaymentLog(order_id=order.id, amount_cents=315, method="mock", operator="student"))
     db_session.commit()
 
     body = client.post(f"/api/admin/order/{order.id}/verify", headers=auth(token)).json()
@@ -308,7 +313,7 @@ def test_已在线支付订单核销时不重复记流水(client, db_session):
         db_session.execute(select(PaymentLog).where(PaymentLog.order_id == order.id)).scalars()
     )
     assert len(payments) == 1
-    assert payments[0].amount_cents == 630
+    assert payments[0].amount_cents == 315
 
 
 def test_按取件码核销(client, db_session):
@@ -515,8 +520,8 @@ def test_系统报价供完成弹窗预填(client, db_session):
 
     body = client.get(f"/api/admin/order/{order.id}/quote", headers=auth(token)).json()
     assert body["code"] == 0
-    assert body["data"]["system_amount_cents"] == 630
-    assert body["data"]["current_amount_cents"] == 630
+    assert body["data"]["system_amount_cents"] == 315
+    assert body["data"]["current_amount_cents"] == 315
 
 
 def test_收单时段总览返回上午下午(client):
@@ -533,7 +538,7 @@ def test_收单时段总览返回上午下午(client):
 def test_收款流水按日期汇总(client, db_session):
     token = admin_token(client)
     order = _make_order(db_session, status="completed", paid=1)
-    db_session.add(PaymentLog(order_id=order.id, amount_cents=630, method="mock", operator="student"))
+    db_session.add(PaymentLog(order_id=order.id, amount_cents=315, method="mock", operator="student"))
     db_session.add(PaymentLog(order_id=order.id, amount_cents=100, method="onsite", operator="admin"))
     db_session.commit()
 
@@ -544,7 +549,7 @@ def test_收款流水按日期汇总(client, db_session):
     ).json()["data"]
 
     assert body["count"] == 2
-    assert body["total_cents"] == 730
+    assert body["total_cents"] == 415
     assert {item["method"] for item in body["items"]} == {"mock", "onsite"}
 
 
@@ -583,7 +588,7 @@ def test_改价上调后核销只补收差额(client, db_session):
 # ---------------------------------------------------------------- 退款（关闭已付款异常单）
 
 
-def _paid_order(db_session, amount_cents: int = 630, **kwargs) -> Order:
+def _paid_order(db_session, amount_cents: int = 315, **kwargs) -> Order:
     """造一张已在线支付的订单，并落一条对应的支付流水。"""
     order = _make_order(db_session, status="queuing", paid=1, **kwargs)
     db_session.add(
@@ -605,7 +610,7 @@ def test_关闭已付款异常单登记退款并冲减当日收入(client, db_se
     order = _paid_order(db_session, pickup_code="R-01")
 
     before = client.get("/api/admin/summary", headers=auth(token)).json()["data"]
-    assert before["income_cents"] == 630
+    assert before["income_cents"] == 315
 
     client.post(
         f"/api/admin/order/{order.id}/abnormal", json={"reason": "缺墨"}, headers=auth(token)
@@ -617,15 +622,15 @@ def test_关闭已付款异常单登记退款并冲减当日收入(client, db_se
     ).json()
     assert closed["code"] == 0, closed
     assert closed["data"]["status"] == "cancelled"
-    assert closed["data"]["refund_cents"] == 630  # 不传金额时按成交价全额退
-    assert closed["data"]["paid_total_cents"] == 630
-    assert "退款 630 分" in closed["data"]["cancel_reason"]
+    assert closed["data"]["refund_cents"] == 315  # 不传金额时按成交价全额退
+    assert closed["data"]["paid_total_cents"] == 315
+    assert "退款 315 分" in closed["data"]["cancel_reason"]
 
     db_session.expire_all()
     payments = list(
         db_session.execute(select(PaymentLog).where(PaymentLog.order_id == order.id)).scalars()
     )
-    assert sorted(p.amount_cents for p in payments) == [-630, 630]
+    assert sorted(p.amount_cents for p in payments) == [-315, 315]
     refund = next(p for p in payments if p.method == "refund")
     assert refund.idempotency_key == f"refund:{order.id}"
     assert refund.operator == settings.admin_username
@@ -644,7 +649,7 @@ def test_关闭已付款异常单登记退款并冲减当日收入(client, db_se
     logs = list(
         db_session.execute(select(PrintLog).where(PrintLog.order_id == order.id)).scalars()
     )
-    assert any(log.action == "refund" and "630" in (log.note or "") for log in logs)
+    assert any(log.action == "refund" and "315" in (log.note or "") for log in logs)
 
 
 def test_可以指定部分退款金额(client, db_session):
@@ -662,7 +667,8 @@ def test_可以指定部分退款金额(client, db_session):
     assert result["refund_cents"] == 200
     assert result["status"] == "cancelled"
     summary = client.get("/api/admin/summary", headers=auth(token)).json()["data"]
-    assert summary["income_cents"] == 430
+    # 已收 315，退 200，当日收入剩 115
+    assert summary["income_cents"] == 115
 
 
 def test_退款金额不能超过已收金额(client, db_session):
@@ -678,7 +684,7 @@ def test_退款金额不能超过已收金额(client, db_session):
             db_session, order, "学生有异议", settings.admin_username, refund_cents=700
         )
     assert exc.value.code == 40062
-    assert "630" in exc.value.message
+    assert "315" in exc.value.message
     db_session.rollback()
 
     db_session.expire_all()
@@ -686,7 +692,7 @@ def test_退款金额不能超过已收金额(client, db_session):
     payments = list(
         db_session.execute(select(PaymentLog).where(PaymentLog.order_id == order.id)).scalars()
     )
-    assert [p.amount_cents for p in payments] == [630]  # 没有退款行落地
+    assert [p.amount_cents for p in payments] == [315]  # 没有退款行落地
 
 
 def test_接口可以指定部分退款金额(client, db_session):
@@ -705,7 +711,7 @@ def test_接口可以指定部分退款金额(client, db_session):
 
     assert closed["code"] == 0, closed
     assert closed["data"]["refund_cents"] == 200
-    assert closed["data"]["paid_total_cents"] == 630
+    assert closed["data"]["paid_total_cents"] == 315
     db_session.expire_all()
     payments = list(
         db_session.execute(select(PaymentLog).where(PaymentLog.order_id == order.id)).scalars()
@@ -713,7 +719,8 @@ def test_接口可以指定部分退款金额(client, db_session):
     refund = next(p for p in payments if p.method == "refund")
     assert refund.amount_cents == -200  # 只冲掉退掉的那部分
     summary = client.get("/api/admin/summary", headers=auth(token)).json()["data"]
-    assert summary["income_cents"] == 430
+    # 已收 315，退 200，当日收入剩 115
+    assert summary["income_cents"] == 115
 
 
 def test_接口拒绝超过已收金额的退款(client, db_session):
@@ -731,13 +738,13 @@ def test_接口拒绝超过已收金额的退款(client, db_session):
     ).json()
 
     assert refused["code"] == 40062, refused
-    assert "630" in refused["message"]
+    assert "315" in refused["message"]
     db_session.expire_all()
     assert db_session.get(Order, order.id).status == "abnormal", "被拒后订单状态不能被改掉"
     payments = list(
         db_session.execute(select(PaymentLog).where(PaymentLog.order_id == order.id)).scalars()
     )
-    assert [p.amount_cents for p in payments] == [630]  # 没有退款行落地
+    assert [p.amount_cents for p in payments] == [315]  # 没有退款行落地
 
 
 def test_接口不传退款金额时按全额退且拒负数(client, db_session):
@@ -761,7 +768,7 @@ def test_接口不传退款金额时按全额退且拒负数(client, db_session)
         f"/api/admin/order/{order.id}/cancel", json={"reason": "缺墨"}, headers=auth(token)
     ).json()
     assert closed["code"] == 0, closed
-    assert closed["data"]["refund_cents"] == 630  # 不传时全额退
+    assert closed["data"]["refund_cents"] == 315  # 不传时全额退
     db_session.expire_all()
     refunds = [
         p
@@ -770,7 +777,7 @@ def test_接口不传退款金额时按全额退且拒负数(client, db_session)
         ).scalars()
         if p.method == "refund"
     ]
-    assert [p.amount_cents for p in refunds] == [-630]
+    assert [p.amount_cents for p in refunds] == [-315]
 
 
 def test_未付款的异常单关单不产生退款流水(client, db_session):
@@ -1056,7 +1063,7 @@ def test_改价为零元被拒且金额不变(client, db_session):
 
     db_session.expire_all()
     refreshed = db_session.get(Order, order.id)
-    assert refreshed.amount_cents == 630, "被拒时不能改动金额"
+    assert refreshed.amount_cents == 315, "被拒时不能改动金额"
     assert refreshed.status == "printing", "被拒时不能推进状态"
 
 

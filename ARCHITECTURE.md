@@ -260,7 +260,7 @@ check 报告 + 用户勾选的 issue_ids
 
 | 文件 | 内容 |
 |---|---|
-| `config/pricing.json` | 单/双面、黑白/彩色单价（分/页） |
+| `config/pricing.json` | 黑白/彩色每张纸单价（分/张，与单双面无关） |
 | `config/format_rules.json` | 结构要求、参考文献规则、页边距、字体字号行距（含 `_source` 强制/通行参考） |
 | `config/upload_rules.json` | 50MB 上限、扩展名白名单（含 PPT/Excel）、文件名长度 |
 | `config/order_rules.json` | 时段窗口、容量、截单提示、等待算法参数、下单限制、取件码字母表 |

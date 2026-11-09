@@ -28,7 +28,7 @@ from app.config import get_ai_rules
 from app.services.doc_parser import get_cached_report, parse_document, save_report
 from app.services.format_rules_engine import sheet_count_info
 from app.services.llm import bind_key, chat_json
-from app.services.pricing import unit_price_cents
+from app.services.pricing import sheet_price_cents
 from app.utils.exceptions import BusinessError
 from app.utils.filetype import normalize_ext
 
@@ -145,8 +145,10 @@ def calc_numbers(features: dict, recommend: dict, copies: int) -> dict:
     sheets_needed = sheets_per_copy * copies
     original_sheets = page_count * copies                    # 单面不缩放所需纸张
 
-    amount_cents = unit_price_cents(recommend["print_side"], recommend["color_mode"]) * impressions * copies
-    original_amount_cents = unit_price_cents(1, recommend["color_mode"]) * page_count * copies
+    # 按纸计价：一张纸的单价与单双面无关，双面省下的张数就是省下的钱
+    price = sheet_price_cents(recommend["color_mode"])
+    amount_cents = price * sheets_needed
+    original_amount_cents = price * original_sheets
 
     return {
         "sheets_needed": sheets_needed,

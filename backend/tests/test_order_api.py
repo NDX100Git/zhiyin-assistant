@@ -159,8 +159,8 @@ def test_下单返回服务端生成的订单号与取件码(client, open_sessio
     assert re.fullmatch(r"\d{6}-[0-9A-Z]-[0-9A-Z]{2}", data["pickup_code"])
     assert data["status"] == "pending_pay"
     assert data["status_label"] == "待支付"
-    # 42 页 × 15 分 × 1 份 = 630 分
-    assert data["amount_cents"] == 630
+    # 42 页双面 = 21 张 × 15 分 × 1 份 = 315 分
+    assert data["amount_cents"] == 315
 
 
 def test_下单页数与实际文件不一致被拒(client, open_session, monkeypatch):
@@ -244,7 +244,7 @@ def test_支付成功后进入队列并写入流水日志(client, open_session, 
     payments = list(
         db_session.execute(select(PaymentLog).where(PaymentLog.order_id == order_id)).scalars()
     )
-    assert len(payments) == 1 and payments[0].amount_cents == 630
+    assert len(payments) == 1 and payments[0].amount_cents == 315
 
     logs = list(
         db_session.execute(select(PrintLog).where(PrintLog.order_id == order_id)).scalars()
@@ -349,7 +349,7 @@ def test_并发支付只落一条流水且状态只推进一次(client, session_
             ).scalars()
         )
         assert len(payments) == 1
-        assert payments[0].amount_cents == 630
+        assert payments[0].amount_cents == 315
         assert payments[0].idempotency_key == f"pay:{order_id}"
 
         order = session.get(Order, order_id)

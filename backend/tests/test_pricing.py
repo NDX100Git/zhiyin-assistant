@@ -4,20 +4,33 @@ from __future__ import annotations
 
 import pytest
 
-from app.services.pricing import calc_amount_cents, unit_price_cents
+from app.services.pricing import calc_amount_cents, sheet_price_cents, sheets_for
 from app.utils.exceptions import BusinessError
 
 
-def test_单价按配置读取():
-    assert unit_price_cents(print_side=1, color_mode=0) == 15
-    assert unit_price_cents(print_side=2, color_mode=0) == 15
-    assert unit_price_cents(print_side=1, color_mode=1) == 80
-    assert unit_price_cents(print_side=2, color_mode=1) == 80
+def test_每张纸的单价只看黑白还是彩色():
+    assert sheet_price_cents(color_mode=0) == 15
+    assert sheet_price_cents(color_mode=1) == 80
 
 
-def test_总价等于页数乘单价乘份数():
-    assert calc_amount_cents(page_count=10, print_side=2, color_mode=0, copies=2) == 300
+def test_双面把两页折成一张纸():
+    assert sheets_for(pages=10, print_side=1) == 10
+    assert sheets_for(pages=10, print_side=2) == 5
+    # 奇数页最后一面只印一面，照样占一张纸
+    assert sheets_for(pages=11, print_side=2) == 6
+
+
+def test_总价等于张数乘单价乘份数():
+    # 10 页双面 = 5 张纸，黑白 15 分/张，2 份
+    assert calc_amount_cents(page_count=10, print_side=2, color_mode=0, copies=2) == 150
+    # 7 页单面 = 7 张纸，彩色 80 分/张，3 份
     assert calc_amount_cents(page_count=7, print_side=1, color_mode=1, copies=3) == 1680
+
+
+def test_同一份稿子双面比单面便宜一半左右():
+    """双面省的是纸，所以省的就是钱：25 页黑白单面 25 张，双面 13 张。"""
+    assert calc_amount_cents(page_count=25, print_side=1, color_mode=0, copies=1) == 375
+    assert calc_amount_cents(page_count=25, print_side=2, color_mode=0, copies=1) == 195
 
 
 def test_份数或页数非法时报错():
@@ -34,7 +47,7 @@ from app.services.pricing import (  # noqa: E402
     max_legal_order_amount_cents,
 )
 
-_PRICE_KEYS = ("bw_single", "bw_duplex", "color_single", "color_duplex")
+_PRICE_KEYS = ("bw", "color")
 
 
 def _legal_max_cents() -> int:

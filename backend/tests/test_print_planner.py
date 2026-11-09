@@ -42,10 +42,10 @@ def test_PPT采用双面讲义2合1时省纸省钱正确():
     assert numbers["sheets_needed"] == 11
     assert numbers["original_sheets"] == 42
     assert numbers["saved_sheets"] == 31
-    # 黑白 15 分/页：原方案 42×15=630，新方案 21×15=315
+    # 黑白 15 分/张：原方案单面 42 张 × 15 = 630；新方案 21 页讲义双面 = 11 张 × 15 = 165
     assert numbers["original_amount_cents"] == 630
-    assert numbers["amount_cents"] == 315
-    assert numbers["saved_cents"] == 315
+    assert numbers["amount_cents"] == 165
+    assert numbers["saved_cents"] == 465
 
 
 def test_彩色文档与多份计算():

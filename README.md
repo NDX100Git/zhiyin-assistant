@@ -56,7 +56,7 @@ zhiyin-assistant/
 │  │  └─ utils/             # 统一响应、异常处理、JWT 鉴权、文件类型识别
 │  ├─ config/
 │  │  ├─ format_rules.json  # 格式校验规则（外置，禁止写死）
-│  │  ├─ pricing.json       # 计费规则，单位：分/页
+│  │  ├─ pricing.json       # 计费规则，单位：分/张
 │  │  ├─ features.json      # 功能开关
 │  │  ├─ upload_rules.json  # 上传大小上限与扩展名白名单
 │  │  ├─ order_rules.json   # 收单时段、容量、等待时间参数、下单限制
